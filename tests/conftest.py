@@ -820,3 +820,61 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+# ── Phase 0: PostgreSQL test fixtures ────────────────────────────────────────
+#
+# Uses the docker-compose postgres (noproc variant) so no pg_ctl.exe is
+# required on Windows. Bring it up with: docker compose up -d postgres
+#
+# Connection defaults match docker-compose.yml:
+#   POSTGRES_USER=hermes  POSTGRES_PASSWORD=hermes  POSTGRES_DB=hermes
+# Override via env vars POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD.
+
+import pytest_asyncio
+import pytest_postgresql.factories as pg_factories
+from alembic import command
+from alembic.config import Config
+
+postgresql_noproc = pg_factories.postgresql_noproc(
+    host="localhost",
+    port=int(os.environ.get("POSTGRES_PORT", "5432")),
+    user=os.environ.get("POSTGRES_USER", "hermes"),
+    password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
+    dbname="hermes",
+)
+postgresql = pg_factories.postgresql("postgresql_noproc", dbname="hermes_test")
+
+
+@pytest.fixture
+def hermes_db_dsn(postgresql):
+    """A freshly-migrated PG DSN for one test.
+
+    Runs Alembic upgrade head against a per-test database created against
+    the docker-compose postgres cluster. Each test gets a clean schema;
+    the cluster keeps running between tests for speed.
+    """
+    info = postgresql.info
+    password_part = f":{info.password}@" if info.password else "@"
+    dsn = f"postgresql://{info.user}{password_part}{info.host}:{info.port}/{info.dbname}"
+    cfg = Config("migrations/alembic.ini")
+    # env.py reads HERMES_PG_DSN to build the SQLAlchemy URL.
+    prev = os.environ.get("HERMES_PG_DSN")
+    os.environ["HERMES_PG_DSN"] = dsn
+    try:
+        command.upgrade(cfg, "head")
+        yield dsn
+    finally:
+        if prev is None:
+            os.environ.pop("HERMES_PG_DSN", None)
+        else:
+            os.environ["HERMES_PG_DSN"] = prev
+
+
+@pytest_asyncio.fixture
+async def hermes_db_initialized(hermes_db_dsn):
+    """Convenience fixture: also calls hermes_db.init() / close()."""
+    import hermes_db
+    await hermes_db.init(hermes_db_dsn)
+    yield hermes_db_dsn
+    await hermes_db.close()

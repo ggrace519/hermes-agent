@@ -94,6 +94,10 @@ dev = [
   "pytest-asyncio==1.3.0",
   "pytest-timeout==2.4.0",
   "pytest-postgresql==8.1.0",
+  # psycopg-binary ships libpq as a bundled wheel — required by pytest-postgresql
+  # on Windows where no system libpq is installed. Pin matches the psycopg version
+  # already pulled in transitively by pytest-postgresql (3.3.4).
+  "psycopg-binary==3.3.4",
   "mcp==1.26.0",
   "ty==0.0.21",
   "ruff==0.15.10",
