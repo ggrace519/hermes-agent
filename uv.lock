@@ -189,15 +189,16 @@ wheels = [
 
 [[package]]
 name = "alembic"
-version = "1.9.4"
+version = "1.18.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "mako" },
     { name = "sqlalchemy" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/00/19/628a08ff5dee597d94682bc3e0e7048462ef5330483173e84b755717e6b7/alembic-1.9.4.tar.gz", hash = "sha256:4d3bd32ecdbb7bbfb48a9fe9e6d6fd6a831a1b59d03e26e292210237373e7db5", size = 1139210, upload-time = "2023-02-16T17:37:48.079Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/13/8b084e0f2efb0275a1d534838844926f798bd766566b1375174e2448cd31/alembic-1.18.4.tar.gz", hash = "sha256:cb6e1fd84b6174ab8dbb2329f86d631ba9559dd78df550b57804d607672cedbc", size = 2056725, upload-time = "2026-02-10T16:00:47.195Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/fc/d63e1d08acba9796f4db62dbe7c3f755e5fd033274198c65c111d47bd942/alembic-1.9.4-py3-none-any.whl", hash = "sha256:6f1c2207369bf4f49f952057a33bb017fbe5c148c2a773b46906b806ea6e825f", size = 210503, upload-time = "2023-02-16T17:37:50.281Z" },
+    { url = "https://files.pythonhosted.org/packages/d2/29/6533c317b74f707ea28f8d633734dbda2119bbadfc61b2f3640ba835d0f7/alembic-1.18.4-py3-none-any.whl", hash = "sha256:a5ed4adcf6d8a4cb575f3d759f071b03cd6e5c7618eb796cb52497be25bfe19a", size = 263893, upload-time = "2026-02-10T16:00:49.997Z" },
 ]
 
 [[package]]
@@ -1865,7 +1866,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'sms'", specifier = "==3.13.3" },
     { name = "aiohttp-socks", marker = "extra == 'matrix'", specifier = "==0.11.0" },
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = "==0.22.1" },
-    { name = "alembic", specifier = "==1.9.4" },
+    { name = "alembic", specifier = "==1.18.4" },
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.86.0" },
     { name = "asyncpg", specifier = "==0.31.0" },

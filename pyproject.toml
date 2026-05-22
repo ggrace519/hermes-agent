@@ -67,7 +67,7 @@ dependencies = [
   # PostgreSQL async driver for Phase 0 migration (Hermes SQLite → PG).
   "asyncpg==0.31.0",
   # Database migrations for PostgreSQL schema management.
-  "alembic==1.9.4",
+  "alembic==1.18.4",
 ]
 
 [project.optional-dependencies]
