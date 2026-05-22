@@ -91,6 +91,437 @@ _log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# PostgreSQL connection layer (Phase 0 port)
+# ---------------------------------------------------------------------------
+# When HERMES_PG_DSN is set, kanban_db uses the shared asyncpg pool via
+# hermes_db instead of per-board SQLite files.  The _PgCursor and
+# _PgConnection shim classes present a sqlite3-compatible interface to the
+# rest of this module so all existing query functions work without changes.
+#
+# Table mapping (all kanban tables are prefixed to avoid collisions):
+#   tasks            -> kanban_tasks         (+ board_slug column)
+#   task_links       -> kanban_task_links    (+ board_slug column)
+#   task_comments    -> kanban_task_comments (+ board_slug column)
+#   task_events      -> kanban_task_events   (+ board_slug column)
+#   task_runs        -> kanban_task_runs     (+ board_slug column)
+#   kanban_notify_subs -> kanban_notify_subs (already prefixed, + board_slug)
+#
+# The _PgConnection always carries a board_slug and injects it into every
+# query as an extra WHERE clause / INSERT column.
+# ---------------------------------------------------------------------------
+
+def _is_pg_mode() -> bool:
+    """Return True when HERMES_PG_DSN is set (PG mode active)."""
+    return bool(os.environ.get("HERMES_PG_DSN", "").strip())
+
+
+# SQLite → PG table name mapping
+_TABLE_MAP: dict[str, str] = {
+    "tasks": "kanban_tasks",
+    "task_links": "kanban_task_links",
+    "task_comments": "kanban_task_comments",
+    "task_events": "kanban_task_events",
+    "task_runs": "kanban_task_runs",
+    "kanban_notify_subs": "kanban_notify_subs",
+}
+
+_PARAM_RE = re.compile(r"\?")
+
+
+def _translate_sql(sql: str, board_slug: str, params: tuple) -> tuple[str, list]:
+    """Translate SQLite SQL to PG SQL for this module.
+
+    * Replaces ? placeholders with $1, $2, ...
+    * Rewrites table names to their pg prefixed versions
+    * Translates SQLite-specific syntax to PG equivalents
+
+    Returns (pg_sql, pg_params).
+    """
+    # Map table names first (word-boundary aware)
+    for old, new in _TABLE_MAP.items():
+        sql = re.sub(rf"\b{re.escape(old)}\b", new, sql)
+
+    # INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    # We strip OR IGNORE here; the ON CONFLICT clause is appended by
+    # _inject_board_slug after board_slug is added to the column list.
+    _had_or_ignore = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\b", sql, re.IGNORECASE))
+    sql = re.sub(
+        r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+        "INSERT INTO",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Replace ? with $N positional parameters
+    out_params = list(params)
+    counter = [0]
+
+    def _replace_param(m):
+        counter[0] += 1
+        return f"${counter[0]}"
+
+    sql = _PARAM_RE.sub(_replace_param, sql)
+
+    # SQLite `IS ?` for NULL-safe equality → PG `IS NOT DISTINCT FROM $N`
+    sql = re.sub(r"\bIS\s+(\$\d+)\b", r"IS NOT DISTINCT FROM \1", sql)
+
+    # Tag for ON CONFLICT handling downstream
+    if _had_or_ignore:
+        # Append a sentinel comment that _inject_board_slug can detect
+        sql = sql.rstrip() + " /*__OR_IGNORE__*/"
+
+    return sql, out_params
+
+
+class _PgCursor:
+    """Minimal sqlite3.Cursor-like wrapper around an asyncpg query result."""
+
+    def __init__(self, rows: list[dict], rowcount: int, lastrowid: Optional[int] = None):
+        self._rows = rows
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> Optional[dict]:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[dict]:
+        return self._rows
+
+    def keys(self) -> list[str]:
+        return list(self._rows[0].keys()) if self._rows else []
+
+
+class _PgRow:
+    """sqlite3.Row-like wrapper around a dict from asyncpg."""
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict):
+        self._d = d
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def keys(self):
+        return list(self._d.keys())
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+
+def _wrap_rows(rows) -> list[_PgRow]:
+    if rows is None:
+        return []
+    return [_PgRow(dict(r)) for r in rows]
+
+
+def _unwrap_row(row) -> Optional[_PgRow]:
+    if row is None:
+        return None
+    return _PgRow(dict(row))
+
+
+class _PgConnection:
+    """Sync sqlite3.Connection-like wrapper backed by asyncpg.
+
+    All operations (execute, begin, commit, rollback) run on a single
+    dedicated event loop that is created once and reused for the lifetime
+    of this connection.  This avoids the asyncpg "connection tied to loop"
+    issue that arises when calling run_until_complete on separate loops.
+
+    Each instance is bound to a board_slug. All query methods inject
+    board_slug into queries automatically.
+    """
+
+    def __init__(self, conn, board_slug: str):
+        self._conn = conn          # asyncpg.Connection
+        self._board_slug = board_slug
+        self._in_txn = False
+        self._txn = None           # asyncpg Transaction object when active
+        self.row_factory = None    # compat; ignored
+
+    # ------------------------------------------------------------------ #
+    # Sync execution bridge                                                #
+    # ------------------------------------------------------------------ #
+
+    def _run(self, coro):
+        """Run a coroutine on the pool's event loop synchronously."""
+        import hermes_db
+        return hermes_db.run_sync(coro)
+
+    # ------------------------------------------------------------------ #
+    # Core execute interface                                               #
+    # ------------------------------------------------------------------ #
+
+    def execute(self, sql: str, params: tuple = ()) -> "_PgCursor":
+        return self._run(self._async_execute(sql, params))
+
+    async def _async_execute(self, sql: str, params: tuple) -> "_PgCursor":
+        sql_pg, pg_params = _translate_sql(sql, self._board_slug, params)
+        sql_upper = sql_pg.lstrip().upper()
+
+        # Auto-add RETURNING id for tables with BIGSERIAL id
+        if sql_upper.startswith("INSERT"):
+            for tbl in _RETURNING_ID_TABLES:
+                if tbl in sql_pg and "RETURNING" not in sql_upper and "/*__OR_IGNORE__*/" not in sql_pg:
+                    sql_pg = sql_pg.rstrip().rstrip(";") + " RETURNING id"
+                    sql_upper = sql_pg.lstrip().upper()
+                    break
+
+        # Inject board_slug into board-aware queries
+        sql_pg, pg_params = _inject_board_slug(
+            sql_pg, sql_upper, pg_params, self._board_slug
+        )
+
+        _log.debug("PG execute: %s | params=%s", sql_pg.strip(), pg_params)
+        try:
+            if sql_upper.startswith("SELECT") or sql_upper.startswith("WITH"):
+                rows = await self._conn.fetch(sql_pg, *pg_params)
+                return _PgCursor(_wrap_rows(rows), len(rows))
+            elif "RETURNING" in sql_upper:
+                rows = await self._conn.fetch(sql_pg, *pg_params)
+                wrapped = _wrap_rows(rows)
+                lastrowid = int(wrapped[0]["id"]) if wrapped and "id" in wrapped[0]._d else None
+                return _PgCursor(wrapped, len(rows), lastrowid)
+            else:
+                result = await self._conn.execute(sql_pg, *pg_params)
+                rowcount = _parse_command_tag(result)
+                return _PgCursor([], rowcount)
+        except Exception as e:
+            _log.debug("PG execute error: %s\nSQL: %s\nParams: %s", e, sql_pg, pg_params)
+            raise
+
+    def executemany(self, sql: str, seq: list) -> None:
+        for params in seq:
+            self.execute(sql, params)
+
+    def executescript(self, script: str) -> None:
+        # In PG mode, schema is managed by Alembic. This is a no-op.
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Transaction helpers (called via write_txn context manager)          #
+    # ------------------------------------------------------------------ #
+
+    def _begin(self) -> None:
+        async def _start():
+            self._txn = self._conn.transaction()
+            await self._txn.start()
+        self._run(_start())
+        self._in_txn = True
+
+    def _commit(self) -> None:
+        async def _do():
+            if self._txn is not None:
+                await self._txn.commit()
+                self._txn = None
+        self._run(_do())
+        self._in_txn = False
+
+    def _rollback(self) -> None:
+        async def _do():
+            if self._txn is not None:
+                await self._txn.rollback()
+                self._txn = None
+        self._run(_do())
+        self._in_txn = False
+
+    def close(self) -> None:
+        # Connection lifecycle managed by _pg_connect; this is a no-op.
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _parse_command_tag(tag: str) -> int:
+    """Parse asyncpg command tag like 'UPDATE 3' or 'INSERT 0 1' -> int."""
+    if not tag:
+        return 0
+    parts = tag.split()
+    if not parts:
+        return 0
+    try:
+        return int(parts[-1])
+    except ValueError:
+        return 0
+
+
+# ------------------------------------------------------------------ #
+# Board-slug injection logic                                           #
+# ------------------------------------------------------------------ #
+
+# Tables that carry board_slug
+_BOARD_SCOPED_TABLES = {
+    "kanban_tasks",
+    "kanban_task_links",
+    "kanban_task_comments",
+    "kanban_task_events",
+    "kanban_task_runs",
+    "kanban_notify_subs",
+}
+
+# Tables that use BIGSERIAL id and support RETURNING id
+_RETURNING_ID_TABLES = {
+    "kanban_task_comments",
+    "kanban_task_events",
+    "kanban_task_runs",
+}
+
+
+def _inject_board_slug(sql: str, sql_upper: str, params: list, board_slug: str) -> tuple[str, list]:
+    """Inject board_slug into INSERT/UPDATE/DELETE/SELECT for board-scoped tables.
+
+    Strategy:
+    - INSERT: shift all $N -> $(N+1), prepend board_slug as $1
+    - SELECT/UPDATE/DELETE: append board_slug as $N+1, add to WHERE clause
+
+    Only acts on tables in _BOARD_SCOPED_TABLES. Skips if board_slug already
+    present in the SQL (idempotent).
+    """
+    # Don't double-inject
+    if "board_slug" in sql.lower():
+        return sql, params
+
+    params = list(params)
+
+    # Find the primary table being operated on
+    table_m = re.search(
+        r"\b(?:FROM|UPDATE|INTO|JOIN)\s+(kanban_\w+)\b",
+        sql,
+        re.IGNORECASE,
+    )
+    if not table_m:
+        return sql, params
+    table = table_m.group(1)
+    if table not in _BOARD_SCOPED_TABLES:
+        return sql, params
+
+    stripped = sql_upper.lstrip()
+
+    if stripped.startswith("INSERT"):
+        # Detect OR IGNORE sentinel
+        had_or_ignore = "/*__OR_IGNORE__*/" in sql
+        sql_clean = sql.replace("/*__OR_IGNORE__*/", "").rstrip()
+
+        # Shift existing $N → $(N+1) then prepend board_slug as $1
+        def _shift(m):
+            return f"${int(m.group(1)) + 1}"
+        shifted_sql = re.sub(r"\$(\d+)", _shift, sql_clean)
+
+        # Find the column list and value list in the (possibly shifted) SQL
+        m = re.match(
+            r"(.*?INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+\w+\s*\()(.*?)(\)\s*VALUES\s*\()(.*?)(\)(?:\s*RETURNING\s+\w+)?.*)",
+            shifted_sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            prefix   = m.group(1)   # "INSERT INTO kanban_tasks ("
+            cols     = m.group(2)   # "id, title, ..."
+            mid      = m.group(3)   # ") VALUES ("
+            vals     = m.group(4)   # "$2, $3, ..."
+            suffix   = m.group(5)   # ") RETURNING id" or ")"
+
+            new_cols = f"board_slug, {cols}"
+            new_vals = f"$1, {vals}"
+            sql = f"{prefix}{new_cols}{mid}{new_vals}{suffix}"
+            # Append ON CONFLICT DO NOTHING after the closing paren if OR IGNORE
+            if had_or_ignore and "ON CONFLICT" not in sql.upper():
+                # Find position after the closing ) of VALUES (...)
+                # suffix contains the closing ) + optional RETURNING
+                if "RETURNING" in suffix.upper():
+                    # Insert ON CONFLICT before RETURNING
+                    sql = re.sub(
+                        r"\)\s*(RETURNING\s+\w+)",
+                        r") ON CONFLICT DO NOTHING \1",
+                        sql,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                else:
+                    sql = sql.rstrip().rstrip(")") + ") ON CONFLICT DO NOTHING"
+            params = [board_slug] + params
+        return sql, params
+
+    # Detect table alias: "FROM kanban_tasks t" → alias is "t"
+    # so we reference "t.board_slug" rather than "kanban_tasks.board_slug"
+    alias_m = re.search(
+        rf"\b{re.escape(table)}\s+(?:AS\s+)?(\w+)\b",
+        sql,
+        re.IGNORECASE,
+    )
+    # Use alias if found AND alias is not a keyword
+    _SQL_KEYWORDS = {"WHERE", "SET", "ON", "JOIN", "INNER", "LEFT", "RIGHT",
+                     "FULL", "OUTER", "CROSS", "GROUP", "ORDER", "LIMIT",
+                     "HAVING", "UNION", "EXCEPT", "INTERSECT", "VALUES",
+                     "SELECT", "FROM", "UPDATE", "DELETE", "INTO"}
+    if alias_m and alias_m.group(1).upper() not in _SQL_KEYWORDS:
+        table_ref = alias_m.group(1)  # use alias
+    else:
+        table_ref = table  # use full table name
+
+    # SELECT / UPDATE / DELETE: append board_slug as last param
+    n = len(params) + 1
+    params.append(board_slug)
+
+    if stripped.startswith("SELECT") or stripped.startswith("WITH"):
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE {table_ref}.board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        elif re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b", sql, re.IGNORECASE):
+            sql = re.sub(
+                r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b",
+                f"WHERE {table_ref}.board_slug = ${n} \\1",
+                sql, count=1, flags=re.IGNORECASE,
+            )
+        else:
+            sql = sql.rstrip() + f" WHERE {table_ref}.board_slug = ${n}"
+
+    elif stripped.startswith("UPDATE"):
+        # UPDATE statements don't use aliases in PostgreSQL the same way
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        else:
+            sql = sql.rstrip() + f" WHERE board_slug = ${n}"
+
+    elif stripped.startswith("DELETE"):
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        else:
+            sql = sql.rstrip() + f" WHERE board_slug = ${n}"
+
+    return sql, params
+
+
+# ------------------------------------------------------------------ #
+# PG connect() entry point                                             #
+# ------------------------------------------------------------------ #
+
+@contextlib.contextmanager
+def _pg_connect(board_slug: str) -> "_PgConnection":
+    """Open a PG connection scoped to board_slug.
+
+    All async operations run via hermes_db.run_sync so they share the same
+    event loop that owns the pool.  This satisfies asyncpg's requirement
+    that connections are only used from the loop they were created on.
+    """
+    import hermes_db
+
+    raw_conn = hermes_db.run_sync(hermes_db.pool().acquire())
+    try:
+        pg_conn = _PgConnection(raw_conn, board_slug)
+        yield pg_conn
+    finally:
+        hermes_db.run_sync(hermes_db.pool().release(raw_conn))
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -301,10 +732,21 @@ def board_exists(board: Optional[str] = None) -> bool:
     ``default`` is considered to always exist — its DB is created
     on first :func:`connect` and there's no way for it to be missing
     in a configuration where the kanban feature is usable at all.
+
+    In PG mode: checks the kanban_boards table.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
+    if _is_pg_mode():
+        import hermes_db
+        async def _check():
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT 1 FROM kanban_boards WHERE slug = $1", slug
+                )
+                return row is not None
+        return hermes_db.run_sync(_check())
     d = board_dir(slug)
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
@@ -485,10 +927,31 @@ def create_board(
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    In PG mode: inserts into kanban_boards table (idempotent via ON CONFLICT).
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    if _is_pg_mode():
+        import hermes_db
+        async def _create():
+            async with hermes_db.connection() as conn:
+                await conn.execute(
+                    "INSERT INTO kanban_boards (slug) VALUES ($1) ON CONFLICT (slug) DO NOTHING",
+                    normed,
+                )
+        hermes_db.run_sync(_create())
+        return {
+            "slug": normed,
+            "name": _default_board_display_name(normed),
+            "description": description or "",
+            "icon": icon or "",
+            "color": color or "",
+            "default_workdir": default_workdir,
+            "created_at": int(time.time()),
+            "archived": False,
+        }
     meta = write_board_metadata(
         normed,
         name=name,
@@ -658,17 +1121,23 @@ class Task:
     session_id: Optional[str] = None
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
+    def from_row(cls, row: "sqlite3.Row | _PgRow") -> "Task":
         keys = set(row.keys())
-        # Parse skills JSON blob if present
+        # Parse skills JSON blob if present.
+        # In PG mode skills is already a list (decoded by JSONB codec).
+        # In SQLite mode skills is a JSON string that needs parsing.
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
-            try:
-                parsed = json.loads(row["skills"])
-                if isinstance(parsed, list):
-                    skills_value = [str(s) for s in parsed if s]
-            except Exception:
-                skills_value = None
+            raw_skills = row["skills"]
+            if isinstance(raw_skills, list):
+                skills_value = [str(s) for s in raw_skills if s]
+            else:
+                try:
+                    parsed = json.loads(raw_skills)
+                    if isinstance(parsed, list):
+                        skills_value = [str(s) for s in parsed if s]
+                except Exception:
+                    skills_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -757,9 +1226,13 @@ class Run:
     error: Optional[str]
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Run":
+    def from_row(cls, row: "sqlite3.Row | _PgRow") -> "Run":
         try:
-            meta = json.loads(row["metadata"]) if row["metadata"] else None
+            raw_meta = row["metadata"] if row["metadata"] else None
+            if isinstance(raw_meta, dict):
+                meta = raw_meta  # PG JSONB already decoded
+            else:
+                meta = json.loads(raw_meta) if raw_meta else None
         except Exception:
             meta = None
         return cls(
@@ -1009,16 +1482,16 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
+) -> "sqlite3.Connection | _PgConnection":
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    In PG mode (HERMES_PG_DSN set): returns a _PgConnection context manager
+    backed by the shared asyncpg pool.  Board selection still uses the same
+    resolution chain; the PG version uses board_slug as a WHERE clause.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
+    In SQLite mode (legacy): WAL mode is enabled on every connection; it's a
+    no-op after the first time but keeps the code robust if the DB file is
+    ever re-created.
 
     Path resolution:
 
@@ -1028,6 +1501,10 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    if _is_pg_mode():
+        slug = _normalize_board_slug(board) or get_current_board()
+        return _pg_connect(slug)
+
     if db_path is not None:
         path = db_path
     else:
@@ -1070,17 +1547,27 @@ def init_db(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> Path:
+) -> "Path | str":
     """Create the schema if it doesn't exist; return the path used.
 
-    Kept as a public entry point so CLI ``hermes kanban init`` and the
-    daemon have something explicit to call. Unlike :func:`connect`'s
-    first-time auto-init (which caches by path), ``init_db`` always
-    re-runs the migration pass. Callers that know the on-disk schema
-    may have drifted — tests that write legacy event kinds directly,
-    external tools that upgrade an old DB file — can call this to
-    force re-migration.
+    In PG mode: ensures the board exists in kanban_boards (idempotent INSERT).
+    Returns the board slug string instead of a Path.
+
+    In SQLite mode: kept as a public entry point so CLI ``hermes kanban init``
+    and the daemon have something explicit to call.
     """
+    if _is_pg_mode():
+        slug = _normalize_board_slug(board) or DEFAULT_BOARD
+        import hermes_db
+        async def _ensure():
+            async with hermes_db.connection() as conn:
+                await conn.execute(
+                    "INSERT INTO kanban_boards (slug) VALUES ($1) ON CONFLICT (slug) DO NOTHING",
+                    slug,
+                )
+        hermes_db.run_sync(_ensure())
+        return slug
+
     if db_path is not None:
         path = db_path
     else:
@@ -1115,11 +1602,14 @@ def _add_column_if_missing(
         raise
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(conn: "sqlite3.Connection | _PgConnection") -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
+    In PG mode: Alembic handles all schema migrations; this is a no-op.
     """
+    if isinstance(conn, _PgConnection):
+        return  # PG schema managed entirely by Alembic
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -1334,13 +1824,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
-    """Context manager for an IMMEDIATE write transaction.
+def write_txn(conn: "sqlite3.Connection | _PgConnection"):
+    """Context manager for a write transaction.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
+    SQLite: uses BEGIN IMMEDIATE for serialized writes.
+    PG: uses BEGIN (PG serializes concurrent writers via MVCC + row locks).
+
+    A claim CAS inside this context is atomic — at most one concurrent
+    writer can succeed (SQLite: WAL lock; PG: row-level locking on UPDATE).
     """
+    if isinstance(conn, _PgConnection):
+        conn._begin()
+        try:
+            yield conn
+        except Exception:
+            conn._rollback()
+            raise
+        else:
+            conn._commit()
+        return
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -1563,6 +2066,12 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # In PG mode, skills is JSONB so pass the list directly.
+                # In SQLite mode, serialize to JSON string.
+                skills_val = (
+                    skills_list if isinstance(conn, _PgConnection)
+                    else (json.dumps(skills_list) if skills_list is not None else None)
+                )
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1587,7 +2096,7 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
+                        skills_val,
                         int(max_retries) if max_retries is not None else None,
                         session_id,
                     ),
@@ -1896,7 +2405,11 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     out = []
     for r in rows:
         try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
+            raw_pl = r["payload"] if r["payload"] else None
+            if isinstance(raw_pl, dict):
+                payload = raw_pl  # PG JSONB already decoded
+            else:
+                payload = json.loads(raw_pl) if raw_pl else None
         except Exception:
             payload = None
         out.append(
@@ -1928,7 +2441,12 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
-    pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    # PG mode: pass dict directly (JSONB codec encodes it).
+    # SQLite mode: serialize to JSON string.
+    if isinstance(conn, _PgConnection):
+        pl = payload  # asyncpg JSONB codec handles dict -> jsonb
+    else:
+        pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -1962,6 +2480,10 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    meta_val = (
+        metadata if isinstance(conn, _PgConnection)
+        else (json.dumps(metadata, ensure_ascii=False) if metadata else None)
+    )
     conn.execute(
         """
         UPDATE task_runs
@@ -1982,7 +2504,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            meta_val,
             now,
             run_id,
         ),
@@ -2031,6 +2553,10 @@ def _synthesize_ended_run(
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    meta_val = (
+        metadata if isinstance(conn, _PgConnection)
+        else (json.dumps(metadata, ensure_ascii=False) if metadata else None)
+    )
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -2044,7 +2570,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            meta_val,
             now, now,
         ),
     )
