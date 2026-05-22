@@ -10579,7 +10579,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "db", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "postinstall", "profile", "proxy",
@@ -13592,6 +13592,43 @@ Examples:
         help="Filter by component: gateway, agent, tools, cli, cron",
     )
     logs_parser.set_defaults(func=cmd_logs)
+
+    # =========================================================================
+    # db command — Phase 0 database utilities
+    # =========================================================================
+    db_parser = subparsers.add_parser(
+        "db",
+        help="Database utilities (migration, maintenance)",
+        description="Low-level database commands for the Hermes PG backend.",
+    )
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+
+    db_migrate_sqlite = db_subparsers.add_parser(
+        "migrate-from-sqlite",
+        help="Copy legacy ~/.hermes/state.db into the configured PostgreSQL database",
+        description=(
+            "One-shot migration: reads sessions and messages from a legacy SQLite "
+            "state.db and copies them into the PG schema. Requires HERMES_PG_DSN "
+            "to be set and alembic upgrade head to have been run."
+        ),
+    )
+    db_migrate_sqlite.add_argument(
+        "--sqlite-path",
+        dest="sqlite_path",
+        default=None,
+        metavar="PATH",
+        help="Path to the source SQLite state.db (default: ~/.hermes/state.db)",
+    )
+    db_migrate_sqlite.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Count rows without writing to PG",
+    )
+    from hermes_cli.db_commands import cmd_db, cmd_db_migrate_from_sqlite  # noqa: E402
+    db_migrate_sqlite.set_defaults(func=cmd_db_migrate_from_sqlite)
+    db_parser.set_defaults(func=cmd_db)
 
     # =========================================================================
     # Parse and execute
