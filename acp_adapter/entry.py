@@ -233,6 +233,13 @@ def main(argv: list[str] | None = None) -> None:
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")
 
+    # Phase 0: initialise PG pool (idempotent; no-op if HERMES_PG_DSN unset).
+    try:
+        from hermes_bootstrap import init_db_sync
+        init_db_sync()
+    except RuntimeError:
+        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+
     # Ensure the project root is on sys.path so ``from run_agent import AIAgent`` works
     project_root = str(Path(__file__).resolve().parent.parent)
     if project_root not in sys.path:

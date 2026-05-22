@@ -780,9 +780,10 @@ def _resolve_last_session(source: str = "cli") -> Optional[str]:
     db = None
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
-        sessions = db.search_sessions(source=source, limit=1)
+        sessions = _hermes_db.run_sync(db.search_sessions(source=source, limit=1))
         return sessions[0]["id"] if sessions else None
     except Exception:
         pass
@@ -919,23 +920,24 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     """
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
 
         # Try as exact session ID first
-        session = db.get_session(name_or_id)
+        session = _hermes_db.run_sync(db.get_session(name_or_id))
         resolved_id: Optional[str] = None
         if session:
             resolved_id = session["id"]
         else:
             # Try as title (with auto-latest for lineage)
-            resolved_id = db.resolve_session_by_title(name_or_id)
+            resolved_id = _hermes_db.run_sync(db.resolve_session_by_title(name_or_id))
 
         if resolved_id:
             # Project forward through compression chain so resumes land on
             # the live tip instead of a dead compressed parent.
             try:
-                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
+                resolved_id = _hermes_db.run_sync(db.get_compression_tip(resolved_id)) or resolved_id
             except Exception:
                 pass
 
@@ -972,13 +974,14 @@ def _print_tui_exit_summary(
     db = None
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
-        session = db.get_session(target)
+        session = _hermes_db.run_sync(db.get_session(target))
         if not session:
             return
 
-        title = db.get_session_title(target)
+        title = _hermes_db.run_sync(db.get_session_title(target))
         message_count = int(session.get("message_count") or 0)
         if message_count == 0:
             return  # No real conversation — don't show resume info
@@ -12850,6 +12853,7 @@ Examples:
 
         try:
             from hermes_state import SessionDB
+            import hermes_db as _hermes_db
 
             db = SessionDB()
         except Exception as e:
@@ -12863,9 +12867,9 @@ Examples:
         _exclude = None if _source else ["tool"]
 
         if action == "list":
-            sessions = db.list_sessions_rich(
+            sessions = _hermes_db.run_sync(db.list_sessions_rich(
                 source=args.source, exclude_sources=_exclude, limit=args.limit
-            )
+            ))
             if not sessions:
                 print("No sessions found.")
                 return
@@ -12893,11 +12897,11 @@ Examples:
 
         elif action == "export":
             if args.session_id:
-                resolved_session_id = db.resolve_session_id(args.session_id)
+                resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
                 if not resolved_session_id:
                     print(f"Session '{args.session_id}' not found.")
                     return
-                data = db.export_session(resolved_session_id)
+                data = _hermes_db.run_sync(db.export_session(resolved_session_id))
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
@@ -12910,7 +12914,7 @@ Examples:
                         f.write(line)
                     print(f"Exported 1 session to {args.output}")
             else:
-                sessions = db.export_all(source=args.source)
+                sessions = _hermes_db.run_sync(db.export_all(source=args.source))
                 if args.output == "-":
 
                     for s in sessions:
@@ -12922,7 +12926,7 @@ Examples:
                     print(f"Exported {len(sessions)} sessions to {args.output}")
 
         elif action == "delete":
-            resolved_session_id = db.resolve_session_id(args.session_id)
+            resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
             if not resolved_session_id:
                 print(f"Session '{args.session_id}' not found.")
                 return
@@ -12933,7 +12937,7 @@ Examples:
                     print("Cancelled.")
                     return
             sessions_dir = get_hermes_home() / "sessions"
-            if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+            if _hermes_db.run_sync(db.delete_session(resolved_session_id, sessions_dir=sessions_dir)):
                 print(f"Deleted session '{resolved_session_id}'.")
             else:
                 print(f"Session '{args.session_id}' not found.")
@@ -12948,19 +12952,19 @@ Examples:
                     print("Cancelled.")
                     return
             sessions_dir = get_hermes_home() / "sessions"
-            count = db.prune_sessions(
+            count = _hermes_db.run_sync(db.prune_sessions(
                 older_than_days=days, source=args.source, sessions_dir=sessions_dir
-            )
+            ))
             print(f"Pruned {count} session(s).")
 
         elif action == "rename":
-            resolved_session_id = db.resolve_session_id(args.session_id)
+            resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
             if not resolved_session_id:
                 print(f"Session '{args.session_id}' not found.")
                 return
             title = " ".join(args.title)
             try:
-                if db.set_session_title(resolved_session_id, title):
+                if _hermes_db.run_sync(db.set_session_title(resolved_session_id, title)):
                     print(f"Session '{resolved_session_id}' renamed to: {title}")
                 else:
                     print(f"Session '{args.session_id}' not found.")
@@ -12971,9 +12975,9 @@ Examples:
             limit = getattr(args, "limit", 500) or 500
             source = getattr(args, "source", None)
             _browse_exclude = None if source else ["tool"]
-            sessions = db.list_sessions_rich(
+            sessions = _hermes_db.run_sync(db.list_sessions_rich(
                 source=source, exclude_sources=_browse_exclude, limit=limit
-            )
+            ))
             db.close()
             if not sessions:
                 print("No sessions found.")

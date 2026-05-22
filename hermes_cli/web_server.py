@@ -609,7 +609,7 @@ async def get_status():
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=50)
+            sessions = await db.list_sessions_rich(limit=50)
             now = time.time()
             active_sessions = sum(
                 1 for s in sessions
@@ -778,8 +778,8 @@ async def get_sessions(limit: int = 20, offset: int = 0):
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            sessions = await db.list_sessions_rich(limit=limit, offset=offset)
+            total = await db.session_count()
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
@@ -814,7 +814,7 @@ async def search_sessions(q: str = "", limit: int = 20):
                 else:
                     terms.append(token + "*")
             prefix_query = " ".join(terms)
-            matches = db.search_messages(query=prefix_query, limit=limit)
+            matches = await db.search_messages(query=prefix_query, limit=limit)
             # Group by session_id — return unique sessions with their best snippet
             seen: dict = {}
             for m in matches:
@@ -2378,12 +2378,15 @@ def _session_latest_descendant(session_id: str):
             except Exception:
                 return None
 
+    import hermes_db as _hermes_db
     db = SessionDB()
     try:
-        sid = db.resolve_session_id(session_id)
-        if not sid or not db.get_session(sid):
+        sid = _hermes_db.run_sync(db.resolve_session_id(session_id))
+        if not sid or not _hermes_db.run_sync(db.get_session(sid)):
             return None, []
 
+        # _conn is SQLite-specific; on PG (_AsyncSessionDB) it won't exist.
+        # Fall through to list_sessions_rich for the PG path.
         conn = (
             getattr(db, "conn", None)
             or getattr(db, "_conn", None)
@@ -2403,7 +2406,7 @@ def _session_latest_descendant(session_id: str):
                     "started_at": row_get(row, "started_at", 2),
                 })
         else:
-            rows = db.list_sessions_rich(limit=10000, offset=0)
+            rows = _hermes_db.run_sync(db.list_sessions_rich(limit=10000, offset=0))
 
         children = {}
         for row in rows:
@@ -2440,8 +2443,8 @@ async def get_session_detail(session_id: str):
     from hermes_state import SessionDB
     db = SessionDB()
     try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
+        sid = await db.resolve_session_id(session_id)
+        session = await db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         return session
@@ -2467,10 +2470,10 @@ async def get_session_messages(session_id: str):
     from hermes_state import SessionDB
     db = SessionDB()
     try:
-        sid = db.resolve_session_id(session_id)
+        sid = await db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
-        messages = db.get_messages(sid)
+        messages = await db.get_messages(sid)
         return {"session_id": sid, "messages": messages}
     finally:
         db.close()
@@ -2481,7 +2484,7 @@ async def delete_session_endpoint(session_id: str):
     from hermes_state import SessionDB
     db = SessionDB()
     try:
-        if not db.delete_session(session_id):
+        if not await db.delete_session(session_id):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
     finally:
@@ -3095,10 +3098,15 @@ async def update_config_raw(body: RawConfigUpdate):
 
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):
+    # NOTE: Phase 0 Task 23 will port these raw SQLite queries to PG.
+    # Until then, return an empty response on PG so the dashboard doesn't 500.
     from hermes_state import SessionDB
     from agent.insights import InsightsEngine
 
     db = SessionDB()
+    if not hasattr(db, "_conn"):
+        # Running against PG (_AsyncSessionDB) — raw SQL path not yet ported.
+        return {"daily": [], "by_model": [], "totals": {}, "period_days": days, "skills": []}
     try:
         cutoff = time.time() - (days * 86400)
         cur = db._conn.execute("""
@@ -3169,9 +3177,14 @@ async def get_models_analytics(days: int = 30):
     Returns token/cost/session breakdown per model plus capability metadata
     from models.dev (context window, vision, tools, reasoning, etc.).
     """
+    # NOTE: Phase 0 Task 23 will port these raw SQLite queries to PG.
+    # Until then, return an empty response on PG so the dashboard doesn't 500.
     from hermes_state import SessionDB
 
     db = SessionDB()
+    if not hasattr(db, "_conn"):
+        # Running against PG (_AsyncSessionDB) — raw SQL path not yet ported.
+        return {"models": [], "period_days": days}
     try:
         cutoff = time.time() - (days * 86400)
 

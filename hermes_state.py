@@ -5351,6 +5351,14 @@ class _AsyncSessionDB:
                 session_id,
             )
 
+    def close(self) -> None:
+        """No-op: _AsyncSessionDB has no per-instance connection to close.
+
+        The process-wide pool is managed by hermes_db.init()/hermes_db.close().
+        This method exists so call sites that used to call db.close() on the
+        legacy SQLite SessionDB continue to work without modification.
+        """
+
 
 # Temporary alias during Phase 0 cutover. Removed in Task 28.
-SessionDB = _LegacySessionDBSqlite
+SessionDB = _AsyncSessionDB

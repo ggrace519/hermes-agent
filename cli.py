@@ -4515,7 +4515,8 @@ class HermesCLI:
         # run() for immediate display).  In that case, conversation_history
         # is non-empty and we skip the DB round-trip.
         if self._resumed and self._session_db and not self.conversation_history:
-            session_meta = self._session_db.get_session(self.session_id)
+            import hermes_db as _hermes_db
+            session_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
             if not session_meta:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
                 _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
@@ -4524,7 +4525,7 @@ class HermesCLI:
             # chain, walk to the descendant that actually holds the messages.
             # See #15000 and SessionDB.resolve_resume_session_id.
             try:
-                resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
+                resolved_id = _hermes_db.run_sync(self._session_db.resolve_resume_session_id(self.session_id))
             except Exception:
                 resolved_id = self.session_id
             if resolved_id and resolved_id != self.session_id:
@@ -4534,10 +4535,10 @@ class HermesCLI:
                     f"transcript.[/]"
                 )
                 self.session_id = resolved_id
-                resolved_meta = self._session_db.get_session(self.session_id)
+                resolved_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
                 if resolved_meta:
                     session_meta = resolved_meta
-            restored = self._session_db.get_messages_as_conversation(self.session_id)
+            restored = _hermes_db.run_sync(self._session_db.get_messages_as_conversation(self.session_id))
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
                 self.conversation_history = restored
@@ -4557,11 +4558,7 @@ class HermesCLI:
                 )
             # Re-open the session (clear ended_at so it's active again)
             try:
-                self._session_db._conn.execute(
-                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                    (self.session_id,),
-                )
-                self._session_db._conn.commit()
+                _hermes_db.run_sync(self._session_db.reopen_session(self.session_id))
             except Exception:
                 pass
         
@@ -4643,7 +4640,8 @@ class HermesCLI:
                 try:
                     self.agent._ensure_db_session()
                     if self.agent._session_db_created:
-                        self._session_db.set_session_title(self.session_id, self._pending_title)
+                        import hermes_db as _hermes_db
+                        _hermes_db.run_sync(self._session_db.set_session_title(self.session_id, self._pending_title))
                         _cprint(f"  Session title applied: {self._pending_title}")
                         self._pending_title = None
                     # else: row creation failed transiently — keep _pending_title for retry
@@ -4774,7 +4772,8 @@ class HermesCLI:
         if not self._resumed or not self._session_db:
             return False
 
-        session_meta = self._session_db.get_session(self.session_id)
+        import hermes_db as _hermes_db
+        session_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
         if not session_meta:
             self._console_print(
                 f"[bold red]Session not found: {self.session_id}[/]"
@@ -4788,7 +4787,7 @@ class HermesCLI:
         # If the requested session is the (empty) head of a compression chain,
         # walk to the descendant that actually holds the messages. See #15000.
         try:
-            resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
+            resolved_id = _hermes_db.run_sync(self._session_db.resolve_resume_session_id(self.session_id))
         except Exception:
             resolved_id = self.session_id
         if resolved_id and resolved_id != self.session_id:
@@ -4797,11 +4796,11 @@ class HermesCLI:
                 f"{resolved_id}; resuming the descendant with your transcript.[/]"
             )
             self.session_id = resolved_id
-            resolved_meta = self._session_db.get_session(self.session_id)
+            resolved_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
             if resolved_meta:
                 session_meta = resolved_meta
 
-        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        restored = _hermes_db.run_sync(self._session_db.get_messages_as_conversation(self.session_id))
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
             self.conversation_history = restored
@@ -4826,12 +4825,7 @@ class HermesCLI:
 
         # Re-open the session (clear ended_at so it's active again)
         try:
-            self._session_db._conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
-                "WHERE id = ?",
-                (self.session_id,),
-            )
-            self._session_db._conn.commit()
+            _hermes_db.run_sync(self._session_db.reopen_session(self.session_id))
         except Exception:
             pass
 
@@ -5534,7 +5528,8 @@ class HermesCLI:
         session_meta = {}
         if self._session_db:
             try:
-                session_meta = self._session_db.get_session(self.session_id) or {}
+                import hermes_db as _hermes_db
+                session_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id)) or {}
             except Exception:
                 session_meta = {}
 
@@ -5892,11 +5887,12 @@ class HermesCLI:
         if not self._session_db:
             return []
         try:
-            sessions = self._session_db.list_sessions_rich(
+            import hermes_db as _hermes_db
+            sessions = _hermes_db.run_sync(self._session_db.list_sessions_rich(
                 source="cli",
                 exclude_sources=["tool"],
                 limit=limit,
-            )
+            ))
         except Exception:
             return []
         return [s for s in sessions if s.get("id") != self.session_id]
@@ -6026,7 +6022,8 @@ class HermesCLI:
         old_session_id = self.session_id
         if self._session_db and old_session_id:
             try:
-                self._session_db.end_session(old_session_id, "new_session")
+                import hermes_db as _hermes_db
+                _hermes_db.run_sync(self._session_db.end_session(old_session_id, "new_session"))
             except Exception:
                 pass
 
@@ -6055,8 +6052,9 @@ class HermesCLI:
 
             if self._session_db:
                 try:
+                    import hermes_db as _hermes_db
                     self.agent._session_db_created = False
-                    self._session_db.create_session(
+                    _hermes_db.run_sync(self._session_db.create_session(
                         session_id=self.session_id,
                         source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=self.model,
@@ -6064,7 +6062,7 @@ class HermesCLI:
                             "max_iterations": self.max_turns,
                             "reasoning_config": self.reasoning_config,
                         },
-                    )
+                    ))
                     self.agent._session_db_created = True
                 except Exception:
                     pass
@@ -6078,7 +6076,8 @@ class HermesCLI:
                         title = None
                     if sanitized:
                         try:
-                            self._session_db.set_session_title(self.session_id, sanitized)
+                            import hermes_db as _hermes_db
+                            _hermes_db.run_sync(self._session_db.set_session_title(self.session_id, sanitized))
                             self._pending_title = None
                             title = sanitized
                         except ValueError as e:
@@ -6193,15 +6192,16 @@ class HermesCLI:
         # are written via _flush_messages_to_session_db on the first turn
         # already, but if the user tries to hand off an empty session we
         # still want a row to mark.
+        import hermes_db as _hermes_db
         try:
-            row = self._session_db.get_session(self.session_id)
+            row = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
             if not row:
                 # Nothing has flushed yet. Create a stub so the gateway has
                 # something to switch_session onto. Inserting via title-set
                 # is the simplest path because set_session_title's INSERT OR
                 # IGNORE creates the row.
                 placeholder_title = f"handoff-{self.session_id[:8]}"
-                self._session_db.set_session_title(self.session_id, placeholder_title)
+                _hermes_db.run_sync(self._session_db.set_session_title(self.session_id, placeholder_title))
         except Exception as exc:
             _cprint(f"  Could not ensure session row in state.db: {exc}")
             return True
@@ -6209,7 +6209,7 @@ class HermesCLI:
         # Display title for messaging.
         session_title = ""
         try:
-            row = self._session_db.get_session(self.session_id)
+            row = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
             if row:
                 session_title = row.get("title") or ""
         except Exception:
@@ -6218,7 +6218,7 @@ class HermesCLI:
             session_title = self.session_id[:8]
 
         # Mark pending — gateway watcher will pick this up.
-        ok = self._session_db.request_handoff(self.session_id, platform_name)
+        ok = _hermes_db.run_sync(self._session_db.request_handoff(self.session_id, platform_name))
         if not ok:
             _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
             return True
@@ -6232,7 +6232,7 @@ class HermesCLI:
         last_state = "pending"
         while _time.time() < deadline:
             try:
-                state_row = self._session_db.get_handoff_state(self.session_id)
+                state_row = _hermes_db.run_sync(self._session_db.get_handoff_state(self.session_id))
             except Exception:
                 state_row = None
             current = (state_row or {}).get("state") or "pending"
@@ -6257,7 +6257,7 @@ class HermesCLI:
 
         # Timed out. Clear the pending flag so the user can retry.
         try:
-            self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
+            _hermes_db.run_sync(self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway"))
         except Exception:
             pass
         _cprint("  Timed out waiting for the gateway. Is `hermes gateway` running?")
@@ -6286,7 +6286,8 @@ class HermesCLI:
         resolved = _resolve_session_by_name_or_id(target)
         target_id = resolved or target
 
-        session_meta = self._session_db.get_session(target_id)
+        import hermes_db as _hermes_db
+        session_meta = _hermes_db.run_sync(self._session_db.get_session(target_id))
         if not session_meta:
             _cprint(f"  Session not found: {target}")
             _cprint("  Use /history or `hermes sessions list` to see available sessions.")
@@ -6295,7 +6296,7 @@ class HermesCLI:
         # If the target is the empty head of a compression chain, redirect to
         # the descendant that actually holds the transcript. See #15000.
         try:
-            resolved_id = self._session_db.resolve_resume_session_id(target_id)
+            resolved_id = _hermes_db.run_sync(self._session_db.resolve_resume_session_id(target_id))
         except Exception:
             resolved_id = target_id
         if resolved_id and resolved_id != target_id:
@@ -6304,7 +6305,7 @@ class HermesCLI:
                 f"resuming the descendant with your transcript."
             )
             target_id = resolved_id
-            resolved_meta = self._session_db.get_session(target_id)
+            resolved_meta = _hermes_db.run_sync(self._session_db.get_session(target_id))
             if resolved_meta:
                 session_meta = resolved_meta
 
@@ -6315,7 +6316,7 @@ class HermesCLI:
         old_session_id = self.session_id
         # End current session
         try:
-            self._session_db.end_session(self.session_id, "resumed_other")
+            _hermes_db.run_sync(self._session_db.end_session(self.session_id, "resumed_other"))
         except Exception:
             pass
 
@@ -6325,13 +6326,13 @@ class HermesCLI:
         self._pending_title = None
 
         # Load conversation history (strip transcript-only metadata entries)
-        restored = self._session_db.get_messages_as_conversation(target_id)
+        restored = _hermes_db.run_sync(self._session_db.get_messages_as_conversation(target_id))
         restored = [m for m in (restored or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
 
         # Re-open the target session so it's not marked as ended
         try:
-            self._session_db.reopen_session(target_id)
+            _hermes_db.run_sync(self._session_db.reopen_session(target_id))
         except Exception:
             pass
 
@@ -6439,24 +6440,26 @@ class HermesCLI:
             branch_title = branch_name
         else:
             # Auto-generate from the current session title
+            import hermes_db as _hermes_db
             current_title = None
             if self._session_db:
-                current_title = self._session_db.get_session_title(self.session_id)
+                current_title = _hermes_db.run_sync(self._session_db.get_session_title(self.session_id))
             base = current_title or "branch"
-            branch_title = self._session_db.get_next_title_in_lineage(base)
+            branch_title = _hermes_db.run_sync(self._session_db.get_next_title_in_lineage(base))
 
         # Save the current session's state before branching
         parent_session_id = self.session_id
 
         # End the old session
+        import hermes_db as _hermes_db
         try:
-            self._session_db.end_session(self.session_id, "branched")
+            _hermes_db.run_sync(self._session_db.end_session(self.session_id, "branched"))
         except Exception:
             pass
 
         # Create the new session with parent link
         try:
-            self._session_db.create_session(
+            _hermes_db.run_sync(self._session_db.create_session(
                 session_id=new_session_id,
                 source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
@@ -6465,7 +6468,7 @@ class HermesCLI:
                     "reasoning_config": self.reasoning_config,
                 },
                 parent_session_id=parent_session_id,
-            )
+            ))
         except Exception as e:
             _cprint(f"  Failed to create branch session: {e}")
             return
@@ -6473,7 +6476,7 @@ class HermesCLI:
         # Copy conversation history to the new session
         for msg in self.conversation_history:
             try:
-                self._session_db.append_message(
+                _hermes_db.run_sync(self._session_db.append_message(
                     session_id=new_session_id,
                     role=msg.get("role", "user"),
                     content=msg.get("content"),
@@ -6481,13 +6484,13 @@ class HermesCLI:
                     tool_calls=msg.get("tool_calls"),
                     tool_call_id=msg.get("tool_call_id"),
                     reasoning=msg.get("reasoning"),
-                )
+                ))
             except Exception:
                 pass  # Best-effort copy
 
         # Set title on the branch
         try:
-            self._session_db.set_session_title(new_session_id, branch_title)
+            _hermes_db.run_sync(self._session_db.set_session_title(new_session_id, branch_title))
         except Exception:
             pass
 
@@ -7941,24 +7944,26 @@ class HermesCLI:
                             new_title = None
                         if not new_title:
                             _cprint("  Title is empty after cleanup. Please use printable characters.")
-                        elif self._session_db.get_session(self.session_id):
-                            # Session exists in DB — set title directly
-                            try:
-                                if self._session_db.set_session_title(self.session_id, new_title):
-                                    _cprint(f"  Session title set: {new_title}")
-                                else:
-                                    _cprint("  Session not found in database.")
-                            except ValueError as e:
-                                _cprint(f"  {e}")
                         else:
-                            # Session not created yet — defer the title
-                            # Check uniqueness proactively with the sanitized title
-                            existing = self._session_db.get_session_by_title(new_title)
-                            if existing:
-                                _cprint(f"  Title '{new_title}' is already in use by session {existing['id']}")
+                            import hermes_db as _hermes_db
+                            if _hermes_db.run_sync(self._session_db.get_session(self.session_id)):
+                                # Session exists in DB — set title directly
+                                try:
+                                    if _hermes_db.run_sync(self._session_db.set_session_title(self.session_id, new_title)):
+                                        _cprint(f"  Session title set: {new_title}")
+                                    else:
+                                        _cprint("  Session not found in database.")
+                                except ValueError as e:
+                                    _cprint(f"  {e}")
                             else:
-                                self._pending_title = new_title
-                                _cprint(f"  Session title queued: {new_title} (will be saved on first message)")
+                                # Session not created yet — defer the title
+                                # Check uniqueness proactively with the sanitized title
+                                existing = _hermes_db.run_sync(self._session_db.get_session_by_title(new_title))
+                                if existing:
+                                    _cprint(f"  Title '{new_title}' is already in use by session {existing['id']}")
+                                else:
+                                    self._pending_title = new_title
+                                    _cprint(f"  Session title queued: {new_title} (will be saved on first message)")
                     else:
                         from hermes_state import format_session_db_unavailable
                         _cprint(f"  {format_session_db_unavailable()}")
@@ -7966,8 +7971,9 @@ class HermesCLI:
                     _cprint("  Usage: /title <your session title>")
             # Show current title and session ID if no argument given
             elif self._session_db:
+                import hermes_db as _hermes_db
                 _cprint(f"  Session ID: {self.session_id}")
-                session = self._session_db.get_session(self.session_id)
+                session = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
                 if session and session.get("title"):
                     _cprint(f"  Title: {session['title']}")
                 elif self._pending_title:
@@ -11597,7 +11603,8 @@ class HermesCLI:
             session_title = None
             if self._session_db:
                 try:
-                    session_title = self._session_db.get_session_title(self.session_id)
+                    import hermes_db as _hermes_db
+                    session_title = _hermes_db.run_sync(self._session_db.get_session_title(self.session_id))
                 except Exception:
                     pass
 
@@ -14147,20 +14154,22 @@ class HermesCLI:
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
-            # Close session in SQLite
+            # Close session in PG
             if hasattr(self, '_session_db') and self._session_db and self.agent:
                 try:
-                    self._session_db.end_session(self.agent.session_id, "cli_close")
+                    import hermes_db as _hermes_db
+                    _hermes_db.run_sync(self._session_db.end_session(self.agent.session_id, "cli_close"))
                 except (Exception, KeyboardInterrupt) as e:
                     logger.debug("Could not close session in DB: %s", e)
                 # /exit --delete: also remove the current session's transcripts
-                # and SQLite history. Ported from google-gemini/gemini-cli#19332.
+                # and DB history. Ported from google-gemini/gemini-cli#19332.
                 if getattr(self, '_delete_session_on_exit', False):
                     try:
+                        import hermes_db as _hermes_db
                         from hermes_constants import get_hermes_home as _ghh
                         _sessions_dir = _ghh() / "sessions"
                         _sid = self.agent.session_id
-                        if self._session_db.delete_session(_sid, sessions_dir=_sessions_dir):
+                        if _hermes_db.run_sync(self._session_db.delete_session(_sid, sessions_dir=_sessions_dir)):
                             _cprint(f"  {_DIM}✓ Session {_escape(_sid)} deleted{_RST}")
                         else:
                             _cprint(f"  {_DIM}✗ Session {_escape(_sid)} not found for deletion{_RST}")
@@ -14259,6 +14268,13 @@ def main(
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
     global _active_worktree
+
+    # Phase 0: initialise PG pool (idempotent; raises if HERMES_PG_DSN unset).
+    try:
+        from hermes_bootstrap import init_db_sync
+        init_db_sync()
+    except RuntimeError:
+        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would

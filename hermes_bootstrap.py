@@ -127,3 +127,38 @@ def apply_windows_utf8_bootstrap() -> bool:
 # the very top of their module, before importing anything else.  The
 # import side effect does the right thing.
 apply_windows_utf8_bootstrap()
+
+
+# ---------------------------------------------------------------------------
+# PG pool bootstrap helper (Phase 0 Task 22)
+# ---------------------------------------------------------------------------
+
+_db_initialized = False
+
+
+def init_db_sync() -> None:
+    """Bootstrap helper: init PG pool from HERMES_PG_DSN; register atexit close.
+
+    Idempotent — subsequent calls after the first are a no-op.  Sync entry
+    points (run_agent.py, cli.py, cron/scheduler.py, acp_adapter/entry.py) call
+    this once at the top of main().  Pure-async entry points (gateway/run.py)
+    call ``await hermes_db.init(dsn)`` directly inside their asyncio.run().
+
+    Raises RuntimeError if HERMES_PG_DSN is not set in the environment.
+    """
+    global _db_initialized
+    if _db_initialized:
+        return
+    import asyncio
+    import atexit
+    import os
+    import hermes_db
+
+    dsn = os.environ.get("HERMES_PG_DSN")
+    if not dsn:
+        raise RuntimeError(
+            "HERMES_PG_DSN must be set; export from .env or configure in environment"
+        )
+    asyncio.run(hermes_db.init(dsn))
+    atexit.register(lambda: asyncio.run(hermes_db.close()) if hermes_db._pool else None)
+    _db_initialized = True

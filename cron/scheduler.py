@@ -1757,13 +1757,14 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _VAR_MAP[_var_name].set("")
         if _session_db:
             try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
+                import hermes_db as _hermes_db
+                _hermes_db.run_sync(_session_db.end_session(_cron_session_id, "cron_complete"))
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
-                _session_db.close()
+                _session_db.close()  # no-op on _AsyncSessionDB
             except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+                logger.debug("Job '%s': failed to close session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -1799,6 +1800,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
+    # Phase 0: initialise PG pool (idempotent; no-op if HERMES_PG_DSN unset).
+    try:
+        from hermes_bootstrap import init_db_sync
+        init_db_sync()
+    except RuntimeError:
+        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 

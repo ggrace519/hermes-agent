@@ -1,4 +1,4 @@
-"""
+﻿"""
 Gateway runner - entry point for messaging platform integrations.
 
 This module provides:
@@ -1570,12 +1570,13 @@ class GatewayRunner:
                 from hermes_cli.config import load_config as _load_full_config
                 _sess_cfg = (_load_full_config().get("sessions") or {})
                 if _sess_cfg.get("auto_prune", False):
-                    self._session_db.maybe_auto_prune_and_vacuum(
+                    import hermes_db as _hermes_db_maint
+                    _hermes_db_maint.run_sync(self._session_db.maybe_auto_prune_and_vacuum(
                         retention_days=int(_sess_cfg.get("retention_days", 90)),
                         min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                         sessions_dir=self.config.sessions_dir,
-                    )
+                    ))
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
@@ -4133,23 +4134,23 @@ class GatewayRunner:
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
-                pending = self._session_db.list_pending_handoffs()
+                pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")
                     if not session_id:
                         continue
-                    if not self._session_db.claim_handoff(session_id):
+                    if not await self._session_db.claim_handoff(session_id):
                         # Another tick or another gateway already claimed it.
                         continue
                     try:
                         await self._process_handoff(row)
-                        self._session_db.complete_handoff(session_id)
+                        await self._session_db.complete_handoff(session_id)
                     except Exception as exc:
                         logger.warning(
                             "Handoff for session %s failed: %s",
                             session_id, exc, exc_info=True,
                         )
-                        self._session_db.fail_handoff(session_id, str(exc))
+                        await self._session_db.fail_handoff(session_id, str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -7855,7 +7856,7 @@ class GatewayRunner:
         self._cache_session_source(session_key, source)
         if self._is_telegram_topic_lane(source):
             try:
-                binding = self._session_db.get_telegram_topic_binding(
+                binding = await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 ) if self._session_db else None
@@ -9093,7 +9094,7 @@ class GatewayRunner:
                 _title_note = t("gateway.reset.title_rejected", error=str(e))
             if sanitized:
                 try:
-                    self._session_db.set_session_title(new_entry.session_id, sanitized)
+                    await self._session_db.set_session_title(new_entry.session_id, sanitized)
                     header = t("gateway.reset.header_titled", title=sanitized)
                 except ValueError as e:
                     _title_note = t("gateway.reset.title_error_untitled", error=str(e))
@@ -9369,11 +9370,11 @@ class GatewayRunner:
         db_total_tokens = 0
         if self._session_db:
             try:
-                title = self._session_db.get_session_title(session_entry.session_id)
+                title = await self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
             try:
-                row = self._session_db.get_session(session_entry.session_id)
+                row = await self._session_db.get_session(session_entry.session_id)
                 if row:
                     db_total_tokens = (
                         (row.get("input_tokens") or 0)
@@ -12286,16 +12287,18 @@ class GatewayRunner:
             return "Could not determine chat ID."
         # No-op if never enabled.
         try:
-            currently_enabled = self._session_db.is_telegram_topic_mode_enabled(
+            import hermes_db as _hermes_db
+            currently_enabled = _hermes_db.run_sync(self._session_db.is_telegram_topic_mode_enabled(
                 chat_id=chat_id,
                 user_id=str(source.user_id or ""),
-            )
+            ))
         except Exception:
             currently_enabled = False
         if not currently_enabled:
             return "Multi-session topic mode is not currently enabled for this chat."
         try:
-            self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
+            import hermes_db as _hermes_db
+            _hermes_db.run_sync(self._session_db.disable_telegram_topic_mode(chat_id=chat_id))
         except Exception as exc:
             logger.exception("Failed to disable Telegram topic mode")
             return f"Failed to disable topic mode: {exc}"
@@ -12362,7 +12365,7 @@ class GatewayRunner:
                 return t("gateway.topic.topics_user_disallowed")
 
         try:
-            self._session_db.enable_telegram_topic_mode(
+            await self._session_db.enable_telegram_topic_mode(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
                 has_topics_enabled=capabilities.get("has_topics_enabled"),
@@ -12377,7 +12380,7 @@ class GatewayRunner:
 
         if source.thread_id:
             try:
-                binding = self._session_db.get_telegram_topic_binding(
+                binding = await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )
@@ -12388,7 +12391,7 @@ class GatewayRunner:
                 session_id = str(binding.get("session_id") or "")
                 title = None
                 try:
-                    title = self._session_db.get_session_title(session_id)
+                    title = await self._session_db.get_session_title(session_id)
                 except Exception:
                     title = None
                 session_label = title or t("gateway.topic.untitled_session")
@@ -12411,11 +12414,12 @@ class GatewayRunner:
             "",
         ]
         try:
-            sessions = self._session_db.list_unlinked_telegram_sessions_for_user(
+            import hermes_db as _hermes_db
+            sessions = _hermes_db.run_sync(self._session_db.list_unlinked_telegram_sessions_for_user(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
                 limit=10,
-            )
+            ))
         except Exception:
             logger.debug("Failed to list unlinked Telegram sessions", exc_info=True)
             sessions = []
@@ -12450,11 +12454,11 @@ class GatewayRunner:
     async def _restore_telegram_topic_session(self, event: MessageEvent, raw_session_id: str) -> str:
         """Restore an existing Telegram-owned Hermes session into this topic."""
         source = event.source
-        session_id = self._session_db.resolve_session_id(raw_session_id.strip())
+        session_id = await self._session_db.resolve_session_id(raw_session_id.strip())
         if not session_id:
             return f"Session not found: {raw_session_id.strip()}"
 
-        session = self._session_db.get_session(session_id)
+        session = await self._session_db.get_session(session_id)
         if not session:
             return f"Session not found: {raw_session_id.strip()}"
         if str(session.get("source") or "") != "telegram":
@@ -12462,8 +12466,8 @@ class GatewayRunner:
         if str(session.get("user_id") or "") != str(source.user_id):
             return "That session does not belong to this Telegram user."
 
-        linked = self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
-        current_binding = self._session_db.get_telegram_topic_binding(
+        linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
+        current_binding = await self._session_db.get_telegram_topic_binding(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
         )
@@ -12473,7 +12477,7 @@ class GatewayRunner:
 
         session_key = self._session_key_for_source(source)
         try:
-            self._session_db.bind_telegram_topic(
+            await self._session_db.bind_telegram_topic(
                 chat_id=str(source.chat_id),
                 thread_id=str(source.thread_id),
                 user_id=str(source.user_id),
@@ -12486,10 +12490,10 @@ class GatewayRunner:
                 return "That session is already linked to another Telegram topic."
             raise
 
-        title = self._session_db.get_session_title(session_id) or session_id
+        title = await self._session_db.get_session_title(session_id) or session_id
         last_assistant = None
         try:
-            for message in reversed(self._session_db.get_messages(session_id)):
+            for message in reversed(await self._session_db.get_messages(session_id)):
                 if message.get("role") == "assistant" and message.get("content"):
                     last_assistant = str(message.get("content"))
                     break
@@ -12513,11 +12517,11 @@ class GatewayRunner:
 
         # Ensure session exists in SQLite DB (it may only exist in session_store
         # if this is the first command in a new session)
-        existing_title = self._session_db.get_session_title(session_id)
+        existing_title = await self._session_db.get_session_title(session_id)
         if existing_title is None:
             # Session doesn't exist in DB yet — create it
             try:
-                self._session_db.create_session(
+                await self._session_db.create_session(
                     session_id=session_id,
                     source=source.platform.value if source.platform else "unknown",
                     user_id=source.user_id,
@@ -12536,7 +12540,7 @@ class GatewayRunner:
                 return t("gateway.title.empty_after_clean")
             # Set the title
             try:
-                if self._session_db.set_session_title(session_id, sanitized):
+                if await self._session_db.set_session_title(session_id, sanitized):
                     return t("gateway.title.set_to", title=sanitized)
                 else:
                     return t("gateway.title.not_found")
@@ -12544,7 +12548,7 @@ class GatewayRunner:
                 return t("gateway.shared.warn_passthrough", error=e)
         else:
             # Show the current title and session ID
-            title = self._session_db.get_session_title(session_id)
+            title = await self._session_db.get_session_title(session_id)
             if title:
                 return t("gateway.title.current_with_title", session_id=session_id, title=title)
             else:
@@ -12564,7 +12568,7 @@ class GatewayRunner:
             # List recent titled sessions for this user/platform
             try:
                 user_source = source.platform.value if source.platform else None
-                sessions = self._session_db.list_sessions_rich(
+                sessions = await self._session_db.list_sessions_rich(
                     source=user_source, limit=10
                 )
                 titled = [s for s in sessions if s.get("title")]
@@ -12583,13 +12587,13 @@ class GatewayRunner:
                 return t("gateway.resume.list_failed", error=e)
 
         # Resolve the name to a session ID.
-        target_id = self._session_db.resolve_session_by_title(name)
+        target_id = await self._session_db.resolve_session_by_title(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
         # Follow that chain so gateway /resume matches CLI behavior (#15000).
         try:
-            target_id = self._session_db.resolve_resume_session_id(target_id)
+            target_id = await self._session_db.resolve_resume_session_id(target_id)
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
 
@@ -12615,7 +12619,7 @@ class GatewayRunner:
         self._evict_cached_agent(session_key)
 
         # Get the title for confirmation
-        title = self._session_db.get_session_title(target_id) or name
+        title = await self._session_db.get_session_title(target_id) or name
 
         # Count messages for context
         history = self.session_store.load_transcript(target_id)
@@ -12661,15 +12665,15 @@ class GatewayRunner:
         if branch_name:
             branch_title = branch_name
         else:
-            current_title = self._session_db.get_session_title(current_entry.session_id)
+            current_title = await self._session_db.get_session_title(current_entry.session_id)
             base = current_title or "branch"
-            branch_title = self._session_db.get_next_title_in_lineage(base)
+            branch_title = await self._session_db.get_next_title_in_lineage(base)
 
         parent_session_id = current_entry.session_id
 
         # Create the new session with parent link
         try:
-            self._session_db.create_session(
+            await self._session_db.create_session(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
@@ -12682,7 +12686,7 @@ class GatewayRunner:
         # Copy conversation history to the new session
         for msg in history:
             try:
-                self._session_db.append_message(
+                await self._session_db.append_message(
                     session_id=new_session_id,
                     role=msg.get("role", "user"),
                     content=msg.get("content"),
@@ -12701,7 +12705,7 @@ class GatewayRunner:
 
         # Set title
         try:
-            self._session_db.set_session_title(new_session_id, branch_title)
+            await self._session_db.set_session_title(new_session_id, branch_title)
         except Exception:
             pass
 
@@ -12749,7 +12753,7 @@ class GatewayRunner:
         if not provider and getattr(self, "_session_db", None) is not None:
             try:
                 _entry_for_billing = self.session_store.get_or_create_session(source)
-                persisted = self._session_db.get_session(_entry_for_billing.session_id) or {}
+                persisted = await self._session_db.get_session(_entry_for_billing.session_id) or {}
             except Exception:
                 persisted = {}
             provider = provider or persisted.get("billing_provider")
@@ -16870,9 +16874,10 @@ class GatewayRunner:
                     and self._session_db is not None
                 ):
                     try:
-                        _binding = self._session_db.get_telegram_topic_binding_by_session(
+                        import hermes_db as _hermes_db
+                        _binding = _hermes_db.run_sync(self._session_db.get_telegram_topic_binding_by_session(
                             session_id=agent.session_id,
-                        )
+                        ))
                         if _binding and _binding.get("thread_id"):
                             source.thread_id = str(_binding["thread_id"])
                             logger.debug(
@@ -17762,6 +17767,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Phase 0: initialise PG pool (pure-async entry point — await directly).
+    import os as _os
+    import hermes_db as _hermes_db
+    _pg_dsn = _os.environ.get("HERMES_PG_DSN")
+    if _pg_dsn:
+        try:
+            await _hermes_db.init(_pg_dsn)
+        except Exception as _e:
+            logger.warning("PG pool init failed, continuing: %s", _e)
+
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
@@ -18167,6 +18182,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "launchd KeepAlive relaunches the gateway."
         )
         raise SystemExit(75)
+
+    # Phase 0: close PG pool at gateway shutdown.
+    try:
+        import hermes_db as _hermes_db_shutdown
+        if _hermes_db_shutdown._pool:
+            await _hermes_db_shutdown.close()
+    except Exception:
+        pass
 
     return True
 

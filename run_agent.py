@@ -507,7 +507,8 @@ class AIAgent:
         if self._session_db_created or not self._session_db:
             return
         try:
-            self._session_db.create_session(
+            import hermes_db as _hermes_db
+            _hermes_db.run_sync(self._session_db.create_session(
                 session_id=self.session_id,
                 source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=self.model,
@@ -515,10 +516,10 @@ class AIAgent:
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
-            )
+            ))
             self._session_db_created = True
         except Exception as e:
-            # Transient failure (e.g. SQLite lock). Keep _session_db alive —
+            # Transient failure (e.g. PG connection). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
@@ -1278,7 +1279,8 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                import hermes_db as _hermes_db
+                _hermes_db.run_sync(self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -1291,7 +1293,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
-                )
+                ))
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
@@ -4063,9 +4065,16 @@ def main(
     Toolset Examples:
         - "research": Web search, extract, crawl + vision tools
     """
+    # Phase 0: initialise PG pool (idempotent; raises if HERMES_PG_DSN unset).
+    try:
+        from hermes_bootstrap import init_db_sync
+        init_db_sync()
+    except RuntimeError:
+        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
-    
+
     # Handle tool listing
     if list_tools:
         from model_tools import get_all_tool_names, get_available_toolsets

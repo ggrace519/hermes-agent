@@ -151,18 +151,19 @@ def _find_session_id(
 
 
 def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+    """Append a message to the PG session database."""
     db = None
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
         db = SessionDB()
-        db.append_message(
+        _hermes_db.run_sync(db.append_message(
             session_id=session_id,
             role=message.get("role", "assistant"),
             content=message.get("content"),
-        )
+        ))
     except Exception as e:
-        logger.debug("Mirror SQLite write failed: %s", e)
+        logger.debug("Mirror DB write failed: %s", e)
     finally:
         if db is not None:
             db.close()

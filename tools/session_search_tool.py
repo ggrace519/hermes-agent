@@ -435,14 +435,10 @@ def session_search(
             from hermes_state import _AsyncSessionDB
             db = _SyncDB(_AsyncSessionDB())
         except RuntimeError:
-            # PG pool not initialised — fall back to legacy SQLite SessionDB.
-            try:
-                from hermes_state import SessionDB
-                db = SessionDB()
-            except Exception:
-                logging.debug("SessionDB unavailable for session_search", exc_info=True)
-                from hermes_state import format_session_db_unavailable
-                return tool_error(format_session_db_unavailable(), success=False)
+            # PG pool not initialised — nothing available.
+            logging.debug("SessionDB unavailable for session_search: PG pool not initialised", exc_info=True)
+            from hermes_state import format_session_db_unavailable
+            return tool_error(format_session_db_unavailable(), success=False)
         except Exception:
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
