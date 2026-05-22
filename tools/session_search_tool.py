@@ -39,6 +39,37 @@ from typing import Any, Dict, List, Optional, Union
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
+class _SyncDB:
+    """Thin synchronous wrapper around _AsyncSessionDB.
+
+    Allows the sync session_search tool code (which calls db.get_session(),
+    db.search_messages(), etc. without await) to work against the async PG
+    backend via hermes_db.run_sync().  Only the methods actually called by
+    this module are delegated; everything else raises AttributeError.
+    """
+
+    _DELEGATED = frozenset({
+        "get_session",
+        "list_sessions_rich",
+        "get_messages_around",
+        "get_anchored_view",
+        "search_messages",
+    })
+
+    def __init__(self, async_db):
+        self._async_db = async_db
+        import hermes_db as _hermes_db
+        self._run_sync = _hermes_db.run_sync
+
+    def __getattr__(self, name):
+        if name in self._DELEGATED:
+            async_method = getattr(self._async_db, name)
+            def _wrapper(*args, **kwargs):
+                return self._run_sync(async_method(*args, **kwargs))
+            return _wrapper
+        raise AttributeError(name)
+
+
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
@@ -399,8 +430,19 @@ def session_search(
     """
     if db is None:
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
+            import hermes_db
+            hermes_db.pool()  # raises RuntimeError if pool not initialised
+            from hermes_state import _AsyncSessionDB
+            db = _SyncDB(_AsyncSessionDB())
+        except RuntimeError:
+            # PG pool not initialised — fall back to legacy SQLite SessionDB.
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+            except Exception:
+                logging.debug("SessionDB unavailable for session_search", exc_info=True)
+                from hermes_state import format_session_db_unavailable
+                return tool_error(format_session_db_unavailable(), success=False)
         except Exception:
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable

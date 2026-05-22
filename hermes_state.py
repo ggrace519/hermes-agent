@@ -4411,10 +4411,302 @@ class _AsyncSessionDB:
         return False
 
     # === Search (Task 13) ===
-    async def search_messages(self, *args, **kwargs):
-        raise NotImplementedError
-    async def search_sessions(self, *args, **kwargs):
-        raise NotImplementedError
+
+    async def search_messages(
+        self,
+        query: str,
+        source_filter: List[str] = None,
+        exclude_sources: List[str] = None,
+        role_filter: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        sort: str = None,
+        mode: str = "keyword",
+    ) -> List[Dict[str, Any]]:
+        """Full-text search across session messages.
+
+        Modes:
+          - ``keyword`` (default): uses ``content_tsv @@ plainto_tsquery`` over
+            the GIN tsvector index. AND-semantics by default; phrase-quotes
+            are preserved by plainto_tsquery. Falls back to an empty list on
+            tsquery syntax errors.
+          - ``fuzzy``: uses ``content % query`` via pg_trgm similarity (GIN
+            trigram index). Useful for typos, partial terms, CJK substring
+            matching that was handled by the SQLite trigram FTS5 table.
+          - ``auto``: tries ``keyword`` first; if fewer than ``limit // 2``
+            hits are returned, re-runs as ``fuzzy`` and merges (deduped) on
+            top. Value-add over FTS5.
+
+        Returns the same columns as the SQLite FTS5 path:
+          id, session_id, role, snippet, content (dropped below), timestamp,
+          tool_name, source, model, session_started.
+        Context (±1 message) is appended as ``context`` on each row; full
+        ``content`` is removed from the result to save tokens.
+
+        ``sort`` controls temporal ordering:
+          - ``None``: rank-only (relevance).
+          - ``"newest"``: timestamp DESC, rank tiebreak.
+          - ``"oldest"``: timestamp ASC, rank tiebreak.
+
+        Upstream signature ported exactly (source_filter, exclude_sources,
+        role_filter, limit, offset, sort). ``mode`` is a PG-only addition.
+        """
+        if not query or not query.strip():
+            return []
+
+        # Normalise sort
+        if isinstance(sort, str):
+            sort_norm = sort.strip().lower()
+            if sort_norm not in ("newest", "oldest"):
+                sort_norm = None
+        else:
+            sort_norm = None
+
+        async def _run_keyword(q: str, lim: int, off: int) -> List[Dict[str, Any]]:
+            params: list = []
+            where: list = []
+
+            params.append(q)
+            where.append(f"m.content_tsv @@ plainto_tsquery('english', ${len(params)})")
+            rank_expr = f"ts_rank(m.content_tsv, plainto_tsquery('english', ${len(params)}))"
+
+            if source_filter is not None:
+                params.append(list(source_filter))
+                where.append(f"s.source = ANY(${len(params)})")
+
+            if exclude_sources is not None:
+                params.append(list(exclude_sources))
+                where.append(f"s.source <> ALL(${len(params)})")
+
+            if role_filter:
+                roles = list(role_filter)
+                params.append(roles)
+                where.append(f"m.role = ANY(${len(params)})")
+
+            if sort_norm == "newest":
+                order_by = f"ORDER BY m.timestamp DESC, {rank_expr} DESC"
+            elif sort_norm == "oldest":
+                order_by = f"ORDER BY m.timestamp ASC, {rank_expr} DESC"
+            else:
+                order_by = f"ORDER BY {rank_expr} DESC"
+
+            params.extend([lim, off])
+            limit_ph = len(params) - 1
+            offset_ph = len(params)
+
+            sql = f"""
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    ts_headline('english', m.content,
+                                plainto_tsquery('english', $1),
+                                'StartSel=>>>,StopSel=<<<,MaxWords=40,MinWords=10') AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {' AND '.join(where)}
+                {order_by}
+                LIMIT ${limit_ph} OFFSET ${offset_ph}
+            """
+            async with hermes_db.connection() as conn:
+                try:
+                    rows = await conn.fetch(sql, *params)
+                except Exception:
+                    return []
+            return [dict(r) for r in rows]
+
+        async def _run_fuzzy(q: str, lim: int, off: int) -> List[Dict[str, Any]]:
+            params: list = []
+            where: list = []
+
+            # Use word_similarity (<%): matches query term against any word in
+            # content. More lenient than whole-string similarity (%) — catches
+            # typos/partial terms like "quanto" → "quantum" where the full-string
+            # similarity is below the default 0.3 threshold.
+            params.append(q)
+            where.append(f"${len(params)} <% m.content")
+            rank_expr = f"word_similarity(${len(params)}, m.content)"
+
+            if source_filter is not None:
+                params.append(list(source_filter))
+                where.append(f"s.source = ANY(${len(params)})")
+
+            if exclude_sources is not None:
+                params.append(list(exclude_sources))
+                where.append(f"s.source <> ALL(${len(params)})")
+
+            if role_filter:
+                roles = list(role_filter)
+                params.append(roles)
+                where.append(f"m.role = ANY(${len(params)})")
+
+            if sort_norm == "newest":
+                order_by = f"ORDER BY m.timestamp DESC, {rank_expr} DESC"
+            elif sort_norm == "oldest":
+                order_by = f"ORDER BY m.timestamp ASC, {rank_expr} DESC"
+            else:
+                order_by = f"ORDER BY {rank_expr} DESC"
+
+            params.extend([lim, off])
+            limit_ph = len(params) - 1
+            offset_ph = len(params)
+
+            sql = f"""
+                SELECT
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    substring(m.content for 200) AS snippet,
+                    m.content,
+                    m.timestamp,
+                    m.tool_name,
+                    s.source,
+                    s.model,
+                    s.started_at AS session_started
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {' AND '.join(where)}
+                {order_by}
+                LIMIT ${limit_ph} OFFSET ${offset_ph}
+            """
+            async with hermes_db.connection() as conn:
+                try:
+                    rows = await conn.fetch(sql, *params)
+                except Exception:
+                    return []
+            return [dict(r) for r in rows]
+
+        if mode == "keyword":
+            matches = await _run_keyword(query, limit, offset)
+        elif mode == "fuzzy":
+            matches = await _run_fuzzy(query, limit, offset)
+        elif mode == "auto":
+            matches = await _run_keyword(query, limit, offset)
+            if len(matches) < limit // 2:
+                fuzzy_matches = await _run_fuzzy(query, limit, offset)
+                seen_ids = {m["id"] for m in matches}
+                for fm in fuzzy_matches:
+                    if fm["id"] not in seen_ids:
+                        matches.append(fm)
+                        seen_ids.add(fm["id"])
+                matches = matches[:limit]
+        else:
+            raise ValueError(f"unknown mode: {mode!r}")
+
+        # Add surrounding context (±1 message) for each match
+        for match in matches:
+            try:
+                msg_id = match["id"]
+                session_id = match["session_id"]
+                async with hermes_db.connection() as conn:
+                    ctx_rows = await conn.fetch(
+                        """
+                        WITH target AS (
+                            SELECT session_id, timestamp, id
+                            FROM messages
+                            WHERE id = $1
+                        )
+                        SELECT role, content FROM (
+                            SELECT m.id, m.timestamp, m.role, m.content
+                            FROM messages m
+                            JOIN target t ON t.session_id = m.session_id
+                            WHERE (m.timestamp < t.timestamp)
+                               OR (m.timestamp = t.timestamp AND m.id < t.id)
+                            ORDER BY m.timestamp DESC, m.id DESC
+                            LIMIT 1
+                        ) _before
+                        UNION ALL
+                        SELECT role, content FROM messages WHERE id = $1
+                        UNION ALL
+                        SELECT role, content FROM (
+                            SELECT m.id, m.timestamp, m.role, m.content
+                            FROM messages m
+                            JOIN target t ON t.session_id = m.session_id
+                            WHERE (m.timestamp > t.timestamp)
+                               OR (m.timestamp = t.timestamp AND m.id > t.id)
+                            ORDER BY m.timestamp ASC, m.id ASC
+                            LIMIT 1
+                        ) _after
+                        """,
+                        msg_id,
+                    )
+                context_msgs = []
+                for r in ctx_rows:
+                    raw = r["content"]
+                    if isinstance(raw, list):
+                        text_parts = [
+                            p.get("text", "") for p in raw
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        preview = " ".join(t for t in text_parts if t).strip() or "[multimodal content]"
+                    elif isinstance(raw, str):
+                        preview = raw
+                    else:
+                        preview = ""
+                    context_msgs.append({"role": r["role"], "content": preview[:200]})
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
+
+        # Drop full content (snippet is enough)
+        for match in matches:
+            match.pop("content", None)
+
+        return matches
+
+    async def search_sessions(
+        self,
+        source: str = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List sessions, optionally filtered by source.
+
+        Returns rows enriched with a computed ``last_active`` column (latest
+        message timestamp, falling back to ``started_at``), ordered by
+        most-recently-used first. Ported faithfully from SQLite upstream.
+        """
+        async with hermes_db.connection() as conn:
+            if source:
+                rows = await conn.fetch(
+                    """
+                    SELECT s.*,
+                           COALESCE(m.last_active, s.started_at) AS last_active
+                    FROM sessions s
+                    LEFT JOIN (
+                        SELECT session_id, MAX(timestamp) AS last_active
+                        FROM messages
+                        GROUP BY session_id
+                    ) m ON m.session_id = s.id
+                    WHERE s.source = $1
+                    ORDER BY last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT $2 OFFSET $3
+                    """,
+                    source, limit, offset,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT s.*,
+                           COALESCE(m.last_active, s.started_at) AS last_active
+                    FROM sessions s
+                    LEFT JOIN (
+                        SELECT session_id, MAX(timestamp) AS last_active
+                        FROM messages
+                        GROUP BY session_id
+                    ) m ON m.session_id = s.id
+                    ORDER BY last_active DESC, s.started_at DESC, s.id DESC
+                    LIMIT $1 OFFSET $2
+                    """,
+                    limit, offset,
+                )
+        return [dict(r) for r in rows]
 
     # === Counts & export (Task 14) ===
     async def session_count(self, source: str = None) -> int:
