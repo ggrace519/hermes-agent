@@ -3578,19 +3578,153 @@ class _AsyncSessionDB:
         return None
 
     # === Titles (Task 9) ===
+
+    # Must match SessionDB.MAX_TITLE_LENGTH (verified against upstream: 100)
+    MAX_TITLE_LENGTH = 100
+
     @staticmethod
-    def sanitize_title(title):
-        raise NotImplementedError
+    def sanitize_title(title: Optional[str]) -> Optional[str]:
+        """Validate and sanitize a session title.
+
+        Mirrors upstream SessionDB.sanitize_title exactly:
+        - Strips leading/trailing whitespace
+        - Removes ASCII control characters (0x00-0x1F, 0x7F) except \\t, \\n, \\r
+        - Removes problematic Unicode control characters
+        - Collapses internal whitespace runs to single spaces
+        - Normalizes empty/whitespace-only strings to None
+        - Raises ValueError if cleaned title exceeds MAX_TITLE_LENGTH
+        """
+        if not title:
+            return None
+
+        # Remove ASCII control characters (keep \\t=0x09, \\n=0x0A, \\r=0x0D for whitespace norm)
+        cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
+
+        # Remove problematic Unicode control characters
+        cleaned = re.sub(
+            r'[​-‏ -‮⁠-⁩﻿￼￹-￻]',
+            '', cleaned,
+        )
+
+        # Collapse internal whitespace runs and strip
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+
+        if not cleaned:
+            return None
+
+        if len(cleaned) > _AsyncSessionDB.MAX_TITLE_LENGTH:
+            raise ValueError(
+                f"Title too long ({len(cleaned)} chars, max {_AsyncSessionDB.MAX_TITLE_LENGTH})"
+            )
+
+        return cleaned
+
     async def set_session_title(self, session_id: str, title: str) -> bool:
-        raise NotImplementedError
-    async def get_session_title(self, session_id: str):
-        raise NotImplementedError
-    async def get_session_by_title(self, title: str):
-        raise NotImplementedError
-    async def resolve_session_by_title(self, title: str):
-        raise NotImplementedError
+        """Set or update a session's title.
+
+        Returns True if session was found and title was set.
+        Raises ValueError if title is already in use by another session,
+        or if the title fails validation (too long, invalid characters).
+        Empty/whitespace-only strings are normalized to None (returns False).
+        """
+        sanitized = self.sanitize_title(title)
+        if sanitized is None:
+            return False
+
+        async with hermes_db.connection() as conn:
+            # Check uniqueness (allow the same session to keep its own title)
+            conflict = await conn.fetchrow(
+                "SELECT id FROM sessions WHERE title = $1 AND id != $2",
+                sanitized, session_id,
+            )
+            if conflict:
+                raise ValueError(
+                    f"Title '{sanitized}' is already in use by session {conflict['id']}"
+                )
+            result = await conn.execute(
+                "UPDATE sessions SET title = $1 WHERE id = $2",
+                sanitized, session_id,
+            )
+        # asyncpg execute() returns e.g. 'UPDATE 1' or 'UPDATE 0'
+        return result.split()[-1] == "1"
+
+    async def get_session_title(self, session_id: str) -> Optional[str]:
+        """Get the title for a session, or None."""
+        async with hermes_db.connection() as conn:
+            return await conn.fetchval(
+                "SELECT title FROM sessions WHERE id = $1", session_id
+            )
+
+    async def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title. Returns session dict or None."""
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE title = $1", title
+            )
+        return dict(row) if row else None
+
+    async def resolve_session_by_title(self, title: str) -> Optional[str]:
+        """Resolve a title to a session ID, preferring the latest in a lineage.
+
+        If the exact title exists, returns that session's ID.
+        If numbered variants ("title #N") also exist, returns the most recent one.
+        If exact exists AND numbered variants exist, returns the most recent numbered.
+        """
+        # Try exact match
+        async with hermes_db.connection() as conn:
+            exact_row = await conn.fetchrow(
+                "SELECT id FROM sessions WHERE title = $1", title
+            )
+
+        # Search for numbered variants: "title #2", "title #3", etc.
+        # Escape LIKE special chars in title to prevent false positives
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        async with hermes_db.connection() as conn:
+            numbered = await conn.fetch(
+                "SELECT id, started_at FROM sessions "
+                "WHERE title LIKE $1 || ' #%' ESCAPE '\\' "
+                "ORDER BY started_at DESC",
+                escaped,
+            )
+
+        if numbered:
+            # Return the most recent numbered variant
+            return numbered[0]["id"]
+        elif exact_row:
+            return exact_row["id"]
+        return None
+
     async def get_next_title_in_lineage(self, base_title: str) -> str:
-        raise NotImplementedError
+        """Generate the next title in a lineage (e.g. "my session" → "my session #2").
+
+        Strips any existing " #N" suffix to find the base name, then finds
+        the highest existing number and increments.
+        """
+        # Strip existing #N suffix to find the true base
+        m = re.match(r'^(.*?) #(\d+)$', base_title)
+        base = m.group(1) if m else base_title
+
+        # Fetch all titles matching base or "base #N"
+        # Escape LIKE special chars to prevent false positives
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT title FROM sessions WHERE title = $1 OR title LIKE $1 || ' #%' ESCAPE '\\'",
+                escaped,
+            )
+
+        if not rows:
+            return base  # No conflict — use the base name as-is
+
+        # Find the highest existing number
+        pat = re.compile(r'^.* #(\d+)$')
+        max_num = 1  # The unnumbered original counts as #1
+        for r in rows:
+            mo = pat.match(r["title"])
+            if mo:
+                max_num = max(max_num, int(mo.group(1)))
+
+        return f"{base} #{max_num + 1}"
 
     # === Compression (Task 10) ===
     async def get_compression_tip(self, session_id: str):
