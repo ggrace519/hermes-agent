@@ -4752,12 +4752,141 @@ class _AsyncSessionDB:
         return results
 
     # === Deletion / pruning (Task 15) ===
+
+    @staticmethod
+    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
+        """Remove on-disk transcript files for a session.
+
+        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
+        ``request_dump_{session_id}_*.json`` files left by the gateway.
+        Silently skips files that don't exist and swallows OSError so a
+        filesystem hiccup never blocks a DB operation.
+        """
+        if sessions_dir is None:
+            return
+        for suffix in (".json", ".jsonl"):
+            p = sessions_dir / f"{session_id}{suffix}"
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # request_dump files use session_id as a prefix component
+        try:
+            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     async def clear_messages(self, session_id: str) -> None:
-        raise NotImplementedError
-    async def delete_session(self, *args, **kwargs):
-        raise NotImplementedError
-    async def prune_sessions(self, *args, **kwargs):
-        raise NotImplementedError
+        """Delete all messages for a session and reset its counters."""
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "DELETE FROM messages WHERE session_id = $1", session_id
+            )
+            await conn.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = $1",
+                session_id,
+            )
+
+    async def delete_session(
+        self,
+        session_id: str,
+        sessions_dir: Optional[Path] = None,
+    ) -> bool:
+        """Delete a session and all its messages.
+
+        Child sessions are orphaned (parent_session_id set to NULL) rather
+        than cascade-deleted, so they remain accessible independently.
+        When *sessions_dir* is provided, also removes on-disk transcript
+        files (``.json`` / ``.jsonl`` / ``request_dump_*``) for the deleted
+        session. Returns True if the session was found and deleted.
+        """
+        found = False
+        async with hermes_db.connection() as conn:
+            # Check if session exists
+            result = await conn.fetchval(
+                "SELECT 1 FROM sessions WHERE id = $1", session_id
+            )
+            if result is None:
+                return False
+
+            # Orphan child sessions so FK constraint is satisfied
+            await conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE parent_session_id = $1",
+                session_id,
+            )
+            # Delete messages (FK is ON DELETE CASCADE in case, but explicit for safety)
+            await conn.execute("DELETE FROM messages WHERE session_id = $1", session_id)
+            # Delete session
+            await conn.execute("DELETE FROM sessions WHERE id = $1", session_id)
+            found = True
+
+        if found:
+            self._remove_session_files(sessions_dir, session_id)
+        return found
+
+    async def prune_sessions(
+        self,
+        older_than_days: int = 90,
+        source: str = None,
+        sessions_dir: Optional[Path] = None,
+    ) -> int:
+        """Delete sessions older than N days. Returns count of deleted sessions.
+
+        Only prunes ended sessions (not active ones).  Child sessions outside
+        the prune window are orphaned (parent_session_id set to NULL) rather
+        than cascade-deleted.  When *sessions_dir* is provided, also removes
+        on-disk transcript files (``.json`` / ``.jsonl`` /
+        ``request_dump_*``) for every pruned session, outside the DB
+        transaction.
+        """
+        import time
+
+        cutoff = time.time() - (older_than_days * 86400)
+        removed_ids: list[str] = []
+
+        async with hermes_db.connection() as conn:
+            if source:
+                cursor = await conn.fetch(
+                    """SELECT id FROM sessions
+                       WHERE started_at < to_timestamp($1)
+                       AND ended_at IS NOT NULL AND source = $2""",
+                    cutoff,
+                    source,
+                )
+            else:
+                cursor = await conn.fetch(
+                    """SELECT id FROM sessions
+                       WHERE started_at < to_timestamp($1) AND ended_at IS NOT NULL""",
+                    cutoff,
+                )
+            session_ids = {row["id"] for row in cursor}
+
+            if not session_ids:
+                return 0
+
+            # Orphan any sessions whose parent is about to be deleted
+            placeholders = ",".join([f"${i}" for i in range(1, len(session_ids) + 1)])
+            await conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                *session_ids,
+            )
+
+            for sid in session_ids:
+                await conn.execute("DELETE FROM messages WHERE session_id = $1", sid)
+                await conn.execute("DELETE FROM sessions WHERE id = $1", sid)
+                removed_ids.append(sid)
+
+        # Clean up on-disk files outside the DB transaction
+        for sid in removed_ids:
+            self._remove_session_files(sessions_dir, sid)
+
+        return len(removed_ids)
 
     # === Meta (Task 16) ===
     async def get_meta(self, key: str):
