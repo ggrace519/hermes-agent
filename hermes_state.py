@@ -3767,8 +3767,212 @@ class _AsyncSessionDB:
         return current
 
     # === Listings (Task 11) ===
-    async def list_sessions_rich(self, *args, **kwargs):
-        raise NotImplementedError
+
+    async def list_sessions_rich(
+        self,
+        source: str = None,
+        exclude_sources: List[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_children: bool = False,
+        project_compression_tips: bool = True,
+        order_by_last_active: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List sessions with preview (first user message) and last active timestamp.
+
+        Returns dicts with keys: id, source, model, title, started_at, ended_at,
+        message_count, preview (first 60 chars of first user message),
+        last_active (timestamp of last message).
+
+        Mirrors upstream SessionDB.list_sessions_rich behaviour exactly.
+        Uses LATERAL for the per-session preview subquery and a recursive CTE
+        when order_by_last_active=True.
+        """
+        where_clauses: List[str] = []
+        params: list = []
+
+        if not include_children:
+            # Show root sessions and branch sessions (whose parent ended with
+            # end_reason='branched' before the child was created), while hiding
+            # sub-agent runs and compression continuations.
+            where_clauses.append(
+                "(s.parent_session_id IS NULL"
+                " OR EXISTS (SELECT 1 FROM sessions p"
+                "            WHERE p.id = s.parent_session_id"
+                "            AND p.end_reason = 'branched'"
+                "            AND s.started_at >= p.ended_at))"
+            )
+
+        if source:
+            params.append(source)
+            where_clauses.append(f"s.source = ${len(params)}")
+        if exclude_sources:
+            placeholders = ", ".join(f"${len(params) + j + 1}" for j in range(len(exclude_sources)))
+            params.extend(exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        # Preview subquery: first user message, newlines collapsed, truncated to 63 chars.
+        # PG equivalent of SQLite's REPLACE(REPLACE(x, X'0A', ' '), X'0D', ' ').
+        _preview_subq = """
+            SELECT SUBSTR(REGEXP_REPLACE(m.content, E'[\\n\\r]', ' ', 'g'), 1, 63)
+              FROM messages m
+             WHERE m.session_id = s.id
+               AND m.role = 'user'
+               AND m.content IS NOT NULL
+             ORDER BY m.timestamp, m.id
+             LIMIT 1
+        """
+        _last_active_subq = """
+            SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id
+        """
+
+        if order_by_last_active:
+            # Recursive CTE walks compression-continuation chains forward to compute
+            # effective_last_active at SQL level so LIMIT/OFFSET stay efficient.
+            cte_seed_where = where_sql  # reuse same WHERE for CTE seed
+            query = f"""
+                WITH RECURSIVE chain(root_id, cur_id) AS (
+                    SELECT s.id, s.id FROM sessions s {cte_seed_where}
+                    UNION ALL
+                    SELECT c.root_id, child.id
+                    FROM chain c
+                    JOIN sessions parent ON parent.id = c.cur_id
+                    JOIN sessions child ON child.parent_session_id = c.cur_id
+                    WHERE parent.end_reason = 'compression'
+                      AND child.started_at >= parent.ended_at
+                ),
+                chain_max AS (
+                    SELECT
+                        root_id,
+                        MAX(COALESCE(
+                            (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
+                            (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
+                        )) AS effective_last_active
+                    FROM chain
+                    GROUP BY root_id
+                )
+                SELECT s.*,
+                    COALESCE(
+                        ({_preview_subq}),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        ({_last_active_subq}),
+                        s.started_at
+                    ) AS last_active,
+                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                FROM sessions s
+                LEFT JOIN chain_max cm ON cm.root_id = s.id
+                {where_sql}
+                ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
+                LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            """
+            # WHERE params apply twice: once in the CTE seed, once in the outer select.
+            all_params = params + params + [limit, offset]
+        else:
+            query = f"""
+                SELECT s.*,
+                    COALESCE(
+                        ({_preview_subq}),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        ({_last_active_subq}),
+                        s.started_at
+                    ) AS last_active
+                FROM sessions s
+                {where_sql}
+                ORDER BY s.started_at DESC
+                LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+            """
+            all_params = params + [limit, offset]
+
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(query, *all_params)
+
+        sessions = []
+        for row in rows:
+            s = dict(row)
+            raw = (s.pop("_preview_raw", "") or "").strip()
+            if raw:
+                text = raw[:60]
+                s["preview"] = text + ("..." if len(raw) > 60 else "")
+            else:
+                s["preview"] = ""
+            s.pop("_effective_last_active", None)
+            sessions.append(s)
+
+        # Project compression roots forward to their live continuation tip.
+        if project_compression_tips and not include_children:
+            projected = []
+            for s in sessions:
+                if s.get("end_reason") != "compression":
+                    projected.append(s)
+                    continue
+                tip_id = await self.get_compression_tip(s["id"])
+                if tip_id == s["id"]:
+                    projected.append(s)
+                    continue
+                tip_row = await self._get_session_rich_row(tip_id)
+                if not tip_row:
+                    projected.append(s)
+                    continue
+                # Preserve the root's started_at for stable sort order, but
+                # surface the tip's identity and activity data.
+                merged = dict(s)
+                for key in (
+                    "id", "ended_at", "end_reason", "message_count",
+                    "tool_call_count", "title", "last_active", "preview",
+                    "model", "system_prompt",
+                ):
+                    if key in tip_row:
+                        merged[key] = tip_row[key]
+                merged["_lineage_root_id"] = s["id"]
+                projected.append(merged)
+            sessions = projected
+
+        return sessions
+
+    async def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single session with the same enriched columns as list_sessions_rich.
+
+        Returns preview (first 60 chars of first user message) and last_active
+        (timestamp of most recent message, falling back to started_at).
+        Returns None if the session doesn't exist.
+        """
+        query = """
+            SELECT s.*,
+                COALESCE(
+                    (SELECT SUBSTR(REGEXP_REPLACE(m.content, E'[\\n\\r]', ' ', 'g'), 1, 63)
+                       FROM messages m
+                      WHERE m.session_id = s.id
+                        AND m.role = 'user'
+                        AND m.content IS NOT NULL
+                      ORDER BY m.timestamp, m.id
+                      LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(
+                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                    s.started_at
+                ) AS last_active
+            FROM sessions s
+            WHERE s.id = $1
+        """
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(query, session_id)
+        if not row:
+            return None
+        s = dict(row)
+        raw = (s.pop("_preview_raw", "") or "").strip()
+        if raw:
+            text = raw[:60]
+            s["preview"] = text + ("..." if len(raw) > 60 else "")
+        else:
+            s["preview"] = ""
+        return s
 
     # === Message I/O (Task 12) ===
     async def append_message(self, *args, **kwargs):
