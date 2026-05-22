@@ -107,8 +107,58 @@ def upgrade() -> None:
         """
     )
 
+    # ── Telegram DM topic-mode tables ────────────────────────────────────────
+    # Upstream creates these lazily via apply_telegram_topic_migration() which
+    # is called on first /topic opt-in. Phase 0 folds the DDL here so Alembic
+    # owns versioning and the no-op shim below is the only caller path.
+    op.execute(
+        """
+        CREATE TABLE telegram_dm_topic_mode (
+            chat_id                         TEXT PRIMARY KEY,
+            user_id                         TEXT NOT NULL,
+            enabled                         INTEGER NOT NULL DEFAULT 1,
+            activated_at                    TIMESTAMPTZ NOT NULL,
+            updated_at                      TIMESTAMPTZ NOT NULL,
+            has_topics_enabled              INTEGER,
+            allows_users_to_create_topics   INTEGER,
+            capability_checked_at           TIMESTAMPTZ,
+            intro_message_id                TEXT,
+            pinned_message_id               TEXT
+        )
+        """
+    )
+
+    op.execute(
+        """
+        CREATE TABLE telegram_dm_topic_bindings (
+            chat_id      TEXT NOT NULL,
+            thread_id    TEXT NOT NULL,
+            user_id      TEXT NOT NULL,
+            session_key  TEXT NOT NULL,
+            session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            managed_mode TEXT NOT NULL DEFAULT 'auto',
+            linked_at    TIMESTAMPTZ NOT NULL,
+            updated_at   TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (chat_id, thread_id)
+        )
+        """
+    )
+
+    # session_id is UNIQUE — one session can bind to at most one topic
+    op.execute(
+        "CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session "
+        "ON telegram_dm_topic_bindings (session_id)"
+    )
+    # Efficient reverse lookup for list_unlinked / list_bindings_for_chat
+    op.execute(
+        "CREATE INDEX idx_telegram_dm_topic_bindings_user "
+        "ON telegram_dm_topic_bindings (user_id, chat_id)"
+    )
+
 
 def downgrade() -> None:
+    op.execute("DROP TABLE IF EXISTS telegram_dm_topic_bindings CASCADE")
+    op.execute("DROP TABLE IF EXISTS telegram_dm_topic_mode CASCADE")
     op.execute("DROP TABLE IF EXISTS messages CASCADE")
     op.execute("DROP TABLE IF EXISTS sessions CASCADE")
     op.execute("DROP TABLE IF EXISTS state_meta CASCADE")

@@ -4906,26 +4906,247 @@ class _AsyncSessionDB:
             )
 
     # === Telegram topics (Task 17) ===
+
     async def apply_telegram_topic_migration(self) -> None:
-        raise NotImplementedError
-    async def enable_telegram_topic_mode(self, *args, **kwargs):
-        raise NotImplementedError
-    async def disable_telegram_topic_mode(self, *args, **kwargs):
-        raise NotImplementedError
+        """No-op under Alembic; DDL is in 20260522_0001 initial migration."""
+        return
+
+    async def enable_telegram_topic_mode(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        has_topics_enabled: Optional[bool] = None,
+        allows_users_to_create_topics: Optional[bool] = None,
+    ) -> None:
+        """Enable Telegram DM topic mode for one private chat/user."""
+
+        def _to_int(value: Optional[bool]) -> Optional[int]:
+            if value is None:
+                return None
+            return 1 if value else 0
+
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO telegram_dm_topic_mode (
+                    chat_id, user_id, enabled, activated_at, updated_at,
+                    has_topics_enabled, allows_users_to_create_topics,
+                    capability_checked_at
+                ) VALUES ($1, $2, 1, now(), now(), $3, $4, now())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    enabled = 1,
+                    updated_at = now(),
+                    has_topics_enabled = EXCLUDED.has_topics_enabled,
+                    allows_users_to_create_topics = EXCLUDED.allows_users_to_create_topics,
+                    capability_checked_at = now()
+                """,
+                str(chat_id),
+                str(user_id),
+                _to_int(has_topics_enabled),
+                _to_int(allows_users_to_create_topics),
+            )
+
+    async def disable_telegram_topic_mode(
+        self,
+        *,
+        chat_id: str,
+        clear_bindings: bool = True,
+    ) -> None:
+        """Disable Telegram DM topic mode for one private chat.
+
+        When ``clear_bindings`` is True (default) the (chat_id, thread_id)
+        bindings for this chat are also cleared so re-enabling later
+        starts from a clean slate.
+        """
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "UPDATE telegram_dm_topic_mode SET enabled = 0, updated_at = now() "
+                "WHERE chat_id = $1",
+                str(chat_id),
+            )
+            if clear_bindings:
+                await conn.execute(
+                    "DELETE FROM telegram_dm_topic_bindings WHERE chat_id = $1",
+                    str(chat_id),
+                )
+
     async def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
-        raise NotImplementedError
-    async def get_telegram_topic_binding(self, *args, **kwargs):
-        raise NotImplementedError
-    async def list_telegram_topic_bindings_for_chat(self, *args, **kwargs):
-        raise NotImplementedError
-    async def get_telegram_topic_binding_by_session(self, *args, **kwargs):
-        raise NotImplementedError
-    async def bind_telegram_topic(self, *args, **kwargs):
-        raise NotImplementedError
+        """Return whether Telegram DM topic mode is enabled for this chat/user."""
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT enabled FROM telegram_dm_topic_mode
+                WHERE chat_id = $1 AND user_id = $2
+                """,
+                str(chat_id),
+                str(user_id),
+            )
+        if row is None:
+            return False
+        return bool(row["enabled"])
+
+    async def get_telegram_topic_binding(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the session binding for a Telegram DM topic, if present."""
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT * FROM telegram_dm_topic_bindings
+                WHERE chat_id = $1 AND thread_id = $2
+                """,
+                str(chat_id),
+                str(thread_id),
+            )
+        return dict(row) if row else None
+
+    async def list_telegram_topic_bindings_for_chat(
+        self,
+        *,
+        chat_id: str,
+    ) -> List[Dict[str, Any]]:
+        """All Telegram DM topic bindings for one chat, newest first."""
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM telegram_dm_topic_bindings "
+                "WHERE chat_id = $1 ORDER BY updated_at DESC",
+                str(chat_id),
+            )
+        return [dict(row) for row in rows]
+
+    async def get_telegram_topic_binding_by_session(
+        self,
+        *,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the Telegram DM topic binding for a given session_id, if present.
+
+        Uses the UNIQUE INDEX on telegram_dm_topic_bindings(session_id) for an
+        efficient reverse lookup.
+        """
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM telegram_dm_topic_bindings WHERE session_id = $1",
+                str(session_id),
+            )
+        return dict(row) if row else None
+
+    async def bind_telegram_topic(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+        user_id: str,
+        session_key: str,
+        session_id: str,
+        managed_mode: str = "auto",
+    ) -> None:
+        """Bind one Telegram DM topic thread to one Hermes session.
+
+        A Hermes session may only be linked to one Telegram topic in MVP.
+        Rebinding the same topic to the same session is idempotent; trying to
+        link the same session to a different topic raises ValueError.
+        """
+        chat_id = str(chat_id)
+        thread_id = str(thread_id)
+        user_id = str(user_id)
+        session_key = str(session_key)
+        session_id = str(session_id)
+
+        async with hermes_db.connection() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT chat_id, thread_id FROM telegram_dm_topic_bindings
+                WHERE session_id = $1
+                """,
+                session_id,
+            )
+            if existing is not None:
+                if str(existing["chat_id"]) != chat_id or str(existing["thread_id"]) != thread_id:
+                    raise ValueError("session is already linked to another Telegram topic")
+
+            await conn.execute(
+                """
+                INSERT INTO telegram_dm_topic_bindings (
+                    chat_id, thread_id, user_id, session_key, session_id,
+                    managed_mode, linked_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, now(), now())
+                ON CONFLICT (chat_id, thread_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    session_key = EXCLUDED.session_key,
+                    session_id = EXCLUDED.session_id,
+                    managed_mode = EXCLUDED.managed_mode,
+                    updated_at = now()
+                """,
+                chat_id,
+                thread_id,
+                user_id,
+                session_key,
+                session_id,
+                managed_mode,
+            )
+
     async def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
-        raise NotImplementedError
-    async def list_unlinked_telegram_sessions_for_user(self, *args, **kwargs):
-        raise NotImplementedError
+        """Return True if a Hermes session is already bound to any Telegram DM topic."""
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM telegram_dm_topic_bindings WHERE session_id = $1 LIMIT 1",
+                str(session_id),
+            )
+        return row is not None
+
+    async def list_unlinked_telegram_sessions_for_user(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """List previous Telegram sessions for this user that are not bound to a topic."""
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT s.*,
+                    COALESCE(
+                        (SELECT SUBSTRING(
+                                    REGEXP_REPLACE(m.content, E'[\\r\\n]+', ' ', 'g'),
+                                    1, 63
+                               )
+                         FROM messages m
+                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                         ORDER BY m.timestamp, m.id LIMIT 1),
+                        ''
+                    ) AS _preview_raw,
+                    COALESCE(
+                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        s.started_at
+                    ) AS last_active
+                FROM sessions s
+                WHERE s.source = 'telegram'
+                  AND s.user_id = $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM telegram_dm_topic_bindings b
+                      WHERE b.session_id = s.id
+                  )
+                ORDER BY last_active DESC, s.started_at DESC
+                LIMIT $2
+                """,
+                str(user_id),
+                int(limit),
+            )
+
+        sessions: List[Dict[str, Any]] = []
+        for row in rows:
+            session = dict(row)
+            raw = str(session.pop("_preview_raw", "") or "").strip()
+            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            sessions.append(session)
+        return sessions
 
     # === Maintenance (Task 18) ===
     async def vacuum(self) -> None:
