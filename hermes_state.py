@@ -4710,13 +4710,46 @@ class _AsyncSessionDB:
 
     # === Counts & export (Task 14) ===
     async def session_count(self, source: str = None) -> int:
-        raise NotImplementedError
+        """Count sessions, optionally filtered by source."""
+        async with hermes_db.connection() as conn:
+            if source is None:
+                count = await conn.fetchval("SELECT COUNT(*) FROM sessions")
+            else:
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM sessions WHERE source = $1", source
+                )
+        return count
+
     async def message_count(self, session_id: str = None) -> int:
-        raise NotImplementedError
+        """Count messages, optionally for a specific session."""
+        async with hermes_db.connection() as conn:
+            if session_id is None:
+                count = await conn.fetchval("SELECT COUNT(*) FROM messages")
+            else:
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = $1", session_id
+                )
+        return count
+
     async def export_session(self, session_id: str):
-        raise NotImplementedError
+        """Export a single session with all its messages as a dict."""
+        session = await self.get_session(session_id)
+        if not session:
+            return None
+        messages = await self.get_messages(session_id)
+        return {**session, "messages": messages}
+
     async def export_all(self, source: str = None) -> list:
-        raise NotImplementedError
+        """
+        Export all sessions (with messages) as a list of dicts.
+        Suitable for writing to a JSONL file for backup/analysis.
+        """
+        sessions = await self.search_sessions(source=source, limit=100000)
+        results = []
+        for session in sessions:
+            messages = await self.get_messages(session["id"])
+            results.append({**session, "messages": messages})
+        return results
 
     # === Deletion / pruning (Task 15) ===
     async def clear_messages(self, session_id: str) -> None:
