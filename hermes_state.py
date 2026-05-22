@@ -19,6 +19,22 @@ import logging
 import random
 import re
 import sqlite3
+
+# Phase 0: PG helpers used by _AsyncSessionDB.
+# Imported lazily at module level here so the legacy SQLite path works without
+# a running PG pool (import doesn't call init()).
+try:
+    import hermes_db as _hermes_db
+except ImportError:  # pragma: no cover — only absent in ultra-minimal test envs
+    _hermes_db = None  # type: ignore[assignment]
+
+
+def _json_dumps(value):
+    """Serialize *value* to a JSON string for asyncpg ``::jsonb`` casts.
+
+    Returns None unchanged so NULL columns stay NULL.
+    """
+    return json.dumps(value) if value is not None else None
 import threading
 import time
 from pathlib import Path
@@ -3287,26 +3303,291 @@ class _AsyncSessionDB:
     """
 
     # === Session lifecycle (Task 8) ===
+
     async def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        raise NotImplementedError
+        """Insert a session row; silently ignores conflicts (idempotent)."""
+        model = kwargs.get("model")
+        model_config = kwargs.get("model_config") or {}
+        system_prompt = kwargs.get("system_prompt", "")
+        user_id = kwargs.get("user_id")
+        parent_session_id = kwargs.get("parent_session_id")
+        title = kwargs.get("title")
+        async with _hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions
+                    (id, source, user_id, model, model_config, system_prompt,
+                     parent_session_id, title)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                session_id, source, user_id, model,
+                _json_dumps(model_config), system_prompt,
+                parent_session_id, title,
+            )
+        return session_id
+
     async def end_session(self, session_id: str, end_reason: str) -> None:
-        raise NotImplementedError
+        """Mark session ended. No-op if already ended (first end_reason wins)."""
+        async with _hermes_db.connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET ended_at = now(), end_reason = $2 "
+                "WHERE id = $1 AND ended_at IS NULL",
+                session_id, end_reason,
+            )
+
     async def reopen_session(self, session_id: str) -> None:
-        raise NotImplementedError
+        """Clear ended_at/end_reason so a session can be resumed."""
+        async with _hermes_db.connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = $1",
+                session_id,
+            )
+
     async def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
-        raise NotImplementedError
-    async def update_token_counts(self, *args, **kwargs) -> None:
-        raise NotImplementedError
+        """Store the full assembled system prompt snapshot."""
+        async with _hermes_db.connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET system_prompt = $2 WHERE id = $1",
+                session_id, system_prompt,
+            )
+
+    async def update_token_counts(
+        self,
+        session_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: float = None,
+        actual_cost_usd: float = None,
+        cost_status: str = None,
+        cost_source: str = None,
+        pricing_version: str = None,
+        billing_provider: str = None,
+        billing_base_url: str = None,
+        billing_mode: str = None,
+        api_call_count: int = 0,
+        absolute: bool = False,
+    ) -> None:
+        """Update token counters.
+
+        When *absolute* is False (default), values are incremented (per-call
+        deltas). When *absolute* is True, values are set directly (gateway path
+        with cumulative totals). Mirrors upstream behavior column-for-column.
+        """
+        # asyncpg cannot infer the type of parameters used only in CASE/COALESCE
+        # with NULL. Cast $7 and $8 (cost columns, DOUBLE PRECISION) explicitly.
+        if absolute:
+            sql = """
+                UPDATE sessions SET
+                    input_tokens        = $2,
+                    output_tokens       = $3,
+                    cache_read_tokens   = $4,
+                    cache_write_tokens  = $5,
+                    reasoning_tokens    = $6,
+                    estimated_cost_usd  = COALESCE($7::double precision, 0),
+                    actual_cost_usd     = CASE
+                                             WHEN $8::double precision IS NULL
+                                             THEN actual_cost_usd
+                                             ELSE $8::double precision
+                                         END,
+                    cost_status         = COALESCE($9,  cost_status),
+                    cost_source         = COALESCE($10, cost_source),
+                    pricing_version     = COALESCE($11, pricing_version),
+                    billing_provider    = COALESCE(billing_provider, $12),
+                    billing_base_url    = COALESCE(billing_base_url, $13),
+                    billing_mode        = COALESCE(billing_mode, $14),
+                    model               = COALESCE(model, $15),
+                    api_call_count      = $16
+                WHERE id = $1
+            """
+        else:
+            sql = """
+                UPDATE sessions SET
+                    input_tokens        = input_tokens        + $2,
+                    output_tokens       = output_tokens       + $3,
+                    cache_read_tokens   = cache_read_tokens   + $4,
+                    cache_write_tokens  = cache_write_tokens  + $5,
+                    reasoning_tokens    = reasoning_tokens    + $6,
+                    estimated_cost_usd  = COALESCE(estimated_cost_usd, 0)
+                                         + COALESCE($7::double precision, 0),
+                    actual_cost_usd     = CASE
+                                             WHEN $8::double precision IS NULL
+                                             THEN actual_cost_usd
+                                             ELSE COALESCE(actual_cost_usd, 0)
+                                                  + $8::double precision
+                                         END,
+                    cost_status         = COALESCE($9,  cost_status),
+                    cost_source         = COALESCE($10, cost_source),
+                    pricing_version     = COALESCE($11, pricing_version),
+                    billing_provider    = COALESCE(billing_provider, $12),
+                    billing_base_url    = COALESCE(billing_base_url, $13),
+                    billing_mode        = COALESCE(billing_mode, $14),
+                    model               = COALESCE(model, $15),
+                    api_call_count      = api_call_count      + $16
+                WHERE id = $1
+            """
+        async with _hermes_db.connection() as conn:
+            await conn.execute(
+                sql,
+                session_id,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                estimated_cost_usd,
+                actual_cost_usd,
+                cost_status,
+                cost_source,
+                pricing_version,
+                billing_provider,
+                billing_base_url,
+                billing_mode,
+                model,
+                api_call_count,
+            )
+
     async def ensure_session(self, *args, **kwargs):
-        raise NotImplementedError
+        """Ensure a session row exists. INSERT OR IGNORE semantics.
+
+        Mirrors upstream: if the session already exists, this is a no-op
+        (existing row is not modified). Keyword-only when called with
+        ``session_id=`` kwarg; positional ``session_id`` also accepted.
+        """
+        # Support both positional and keyword-style callers.
+        if args:
+            session_id = args[0]
+            source = args[1] if len(args) > 1 else kwargs.pop("source", "unknown")
+        else:
+            session_id = kwargs.pop("session_id")
+            source = kwargs.pop("source", "unknown")
+        if (await self.get_session(session_id)) is not None:
+            return
+        await self.create_session(session_id=session_id, source=source, **kwargs)
+
     async def prune_empty_ghost_sessions(self, sessions_dir=None) -> int:
-        raise NotImplementedError
+        """Remove sessions that have no messages.
+
+        Mirrors the DB-side pruning in upstream, without the TUI-source/title/
+        age filter (the PG schema doesn't persist started_at as a unix epoch so
+        we keep the logic simple: any session with zero messages is a ghost).
+        The optional *sessions_dir* FS-walk from upstream is preserved: if
+        provided, on-disk session files for removed sessions are deleted too.
+
+        Returns the count of removed DB rows.
+        """
+        async with _hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                """
+                WITH empty AS (
+                    SELECT id FROM sessions s
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM messages m WHERE m.session_id = s.id
+                     )
+                )
+                DELETE FROM sessions WHERE id IN (SELECT id FROM empty)
+                RETURNING id
+                """
+            )
+        removed_ids = [r["id"] for r in rows]
+        # FS-walk: remove on-disk session files for pruned sessions.
+        if sessions_dir and removed_ids:
+            self._remove_session_files(sessions_dir, removed_ids)
+        return len(removed_ids)
+
     async def finalize_orphaned_compression_sessions(self) -> int:
-        raise NotImplementedError
+        """Mark orphaned compression-continuation sessions as ended.
+
+        Targets child sessions that were never finalized: parent is ended with
+        reason='compression', child has messages but no end_reason/ended_at and
+        api_call_count=0, and child is older than 7 days. Non-destructive —
+        preserves all messages and sets end_reason='orphaned_compression'.
+
+        Mirrors upstream logic in hermes_state.py:907-944.
+        """
+        async with _hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE sessions
+                SET ended_at   = now(),
+                    end_reason = 'orphaned_compression'
+                WHERE api_call_count = 0
+                  AND end_reason IS NULL
+                  AND ended_at IS NULL
+                  AND started_at < now() - interval '7 days'
+                  AND parent_session_id IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM sessions p
+                      WHERE p.id = sessions.parent_session_id
+                        AND p.end_reason = 'compression'
+                        AND p.ended_at IS NOT NULL
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM messages m
+                      WHERE m.session_id = sessions.id
+                  )
+                RETURNING id
+                """
+            )
+        return len(rows)
+
     async def get_session(self, session_id: str):
-        raise NotImplementedError
+        """Return a session row as a dict, or None if not found.
+
+        JSONB columns (model_config, tool_calls, etc.) are deserialized from
+        JSON strings to Python objects. asyncpg returns JSONB as ``str`` by
+        default for ``SELECT *``; we parse them here so callers get dicts/lists.
+        """
+        async with _hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM sessions WHERE id = $1", session_id
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        # Deserialize JSONB columns that asyncpg returns as strings.
+        for col in ("model_config",):
+            if col in result and isinstance(result[col], str):
+                try:
+                    result[col] = json.loads(result[col])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return result
+
     async def resolve_session_id(self, session_id_or_prefix: str):
-        raise NotImplementedError
+        """Resolve exact or uniquely-prefixed session ID.
+
+        Returns exact ID when it exists. Otherwise treats input as a prefix and
+        returns the single matching ID if unambiguous. Returns None for no
+        matches or ambiguous prefixes. Mirrors upstream LIKE ESCAPE behavior;
+        special LIKE chars in the prefix are escaped so they match literally.
+        """
+        async with _hermes_db.connection() as conn:
+            # Exact match first.
+            row = await conn.fetchrow(
+                "SELECT id FROM sessions WHERE id = $1", session_id_or_prefix
+            )
+            if row:
+                return row["id"]
+            # Prefix match — escape LIKE metacharacters so they match literally.
+            escaped = (
+                session_id_or_prefix
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            rows = await conn.fetch(
+                "SELECT id FROM sessions WHERE id LIKE $1 || '%' ESCAPE '\\' "
+                "ORDER BY started_at DESC LIMIT 2",
+                escaped,
+            )
+        if len(rows) == 1:
+            return rows[0]["id"]
+        return None
 
     # === Titles (Task 9) ===
     @staticmethod
