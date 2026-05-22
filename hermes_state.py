@@ -3727,8 +3727,44 @@ class _AsyncSessionDB:
         return f"{base} #{max_num + 1}"
 
     # === Compression (Task 10) ===
-    async def get_compression_tip(self, session_id: str):
-        raise NotImplementedError
+    async def get_compression_tip(self, session_id: str) -> str:
+        """Walk the compression-continuation chain forward and return the tip.
+
+        A compression continuation is a child session where:
+        1. The parent's ``end_reason = 'compression'``
+        2. The child was created AFTER the parent was ended (started_at >= ended_at)
+
+        The second condition distinguishes compression continuations from
+        delegate subagents or branch children, which can also have a
+        ``parent_session_id`` but were created while the parent was still live.
+
+        Returns the session_id of the latest continuation in the chain, or the
+        input ``session_id`` if it isn't part of a compression chain (or if the
+        input itself doesn't exist).
+        """
+        current = session_id
+        # Bound the walk defensively — compression chains this deep are
+        # pathological and shouldn't happen in practice. 100 = plenty.
+        for _ in range(100):
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id FROM sessions
+                    WHERE parent_session_id = $1
+                      AND started_at >= (
+                          SELECT ended_at FROM sessions
+                          WHERE id = $2 AND end_reason = 'compression'
+                      )
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    current,
+                    current,
+                )
+            if row is None:
+                return current
+            current = row["id"]
+        return current
 
     # === Listings (Task 11) ===
     async def list_sessions_rich(self, *args, **kwargs):
