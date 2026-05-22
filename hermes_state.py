@@ -4890,9 +4890,20 @@ class _AsyncSessionDB:
 
     # === Meta (Task 16) ===
     async def get_meta(self, key: str):
-        raise NotImplementedError
+        """Read a value from the state_meta key/value store."""
+        async with hermes_db.connection() as conn:
+            return await conn.fetchval("SELECT value FROM state_meta WHERE key = $1", key)
+
     async def set_meta(self, key: str, value: str) -> None:
-        raise NotImplementedError
+        """Write a value to the state_meta key/value store."""
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO state_meta (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                key, value,
+            )
 
     # === Telegram topics (Task 17) ===
     async def apply_telegram_topic_migration(self) -> None:
