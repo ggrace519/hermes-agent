@@ -307,7 +307,7 @@ END;
 """
 
 
-class SessionDB:
+class _LegacySessionDBSqlite:
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -3271,3 +3271,154 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+
+class _AsyncSessionDB:
+    """Phase 0 PG-backed replacement for the legacy SQLite `SessionDB`.
+
+    Method signatures mirror `_LegacySessionDBSqlite` so call-site refactors in
+    Task 22 are a search-and-replace. Each cluster lands in its own task
+    (Tasks 8–18). Until ported, methods raise NotImplementedError so any
+    accidental wiring is caught loudly.
+
+    The class has no per-instance connection state; all methods are async and
+    acquire a connection from `hermes_db.pool()` for the duration of the call.
+    Callers in async contexts call methods directly; callers in sync contexts
+    wrap with `hermes_db.run_sync(...)`.
+    """
+
+    # === Session lifecycle (Task 8) ===
+    async def create_session(self, session_id: str, source: str, **kwargs) -> str:
+        raise NotImplementedError
+    async def end_session(self, session_id: str, end_reason: str) -> None:
+        raise NotImplementedError
+    async def reopen_session(self, session_id: str) -> None:
+        raise NotImplementedError
+    async def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
+        raise NotImplementedError
+    async def update_token_counts(self, *args, **kwargs) -> None:
+        raise NotImplementedError
+    async def ensure_session(self, *args, **kwargs):
+        raise NotImplementedError
+    async def prune_empty_ghost_sessions(self, sessions_dir=None) -> int:
+        raise NotImplementedError
+    async def finalize_orphaned_compression_sessions(self) -> int:
+        raise NotImplementedError
+    async def get_session(self, session_id: str):
+        raise NotImplementedError
+    async def resolve_session_id(self, session_id_or_prefix: str):
+        raise NotImplementedError
+
+    # === Titles (Task 9) ===
+    @staticmethod
+    def sanitize_title(title):
+        raise NotImplementedError
+    async def set_session_title(self, session_id: str, title: str) -> bool:
+        raise NotImplementedError
+    async def get_session_title(self, session_id: str):
+        raise NotImplementedError
+    async def get_session_by_title(self, title: str):
+        raise NotImplementedError
+    async def resolve_session_by_title(self, title: str):
+        raise NotImplementedError
+    async def get_next_title_in_lineage(self, base_title: str) -> str:
+        raise NotImplementedError
+
+    # === Compression (Task 10) ===
+    async def get_compression_tip(self, session_id: str):
+        raise NotImplementedError
+
+    # === Listings (Task 11) ===
+    async def list_sessions_rich(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Message I/O (Task 12) ===
+    async def append_message(self, *args, **kwargs):
+        raise NotImplementedError
+    async def replace_messages(self, session_id: str, messages: list) -> None:
+        raise NotImplementedError
+    async def get_messages(self, session_id: str) -> list:
+        raise NotImplementedError
+    async def get_messages_around(self, *args, **kwargs):
+        raise NotImplementedError
+    async def get_anchored_view(self, *args, **kwargs):
+        raise NotImplementedError
+    async def resolve_resume_session_id(self, session_id: str) -> str:
+        raise NotImplementedError
+    async def get_messages_as_conversation(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Search (Task 13) ===
+    async def search_messages(self, *args, **kwargs):
+        raise NotImplementedError
+    async def search_sessions(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Counts & export (Task 14) ===
+    async def session_count(self, source: str = None) -> int:
+        raise NotImplementedError
+    async def message_count(self, session_id: str = None) -> int:
+        raise NotImplementedError
+    async def export_session(self, session_id: str):
+        raise NotImplementedError
+    async def export_all(self, source: str = None) -> list:
+        raise NotImplementedError
+
+    # === Deletion / pruning (Task 15) ===
+    async def clear_messages(self, session_id: str) -> None:
+        raise NotImplementedError
+    async def delete_session(self, *args, **kwargs):
+        raise NotImplementedError
+    async def prune_sessions(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Meta (Task 16) ===
+    async def get_meta(self, key: str):
+        raise NotImplementedError
+    async def set_meta(self, key: str, value: str) -> None:
+        raise NotImplementedError
+
+    # === Telegram topics (Task 17) ===
+    async def apply_telegram_topic_migration(self) -> None:
+        raise NotImplementedError
+    async def enable_telegram_topic_mode(self, *args, **kwargs):
+        raise NotImplementedError
+    async def disable_telegram_topic_mode(self, *args, **kwargs):
+        raise NotImplementedError
+    async def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
+        raise NotImplementedError
+    async def get_telegram_topic_binding(self, *args, **kwargs):
+        raise NotImplementedError
+    async def list_telegram_topic_bindings_for_chat(self, *args, **kwargs):
+        raise NotImplementedError
+    async def get_telegram_topic_binding_by_session(self, *args, **kwargs):
+        raise NotImplementedError
+    async def bind_telegram_topic(self, *args, **kwargs):
+        raise NotImplementedError
+    async def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
+        raise NotImplementedError
+    async def list_unlinked_telegram_sessions_for_user(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Maintenance (Task 18) ===
+    async def vacuum(self) -> None:
+        raise NotImplementedError
+    async def maybe_auto_prune_and_vacuum(self, *args, **kwargs):
+        raise NotImplementedError
+
+    # === Handoff (Task 18) ===
+    async def request_handoff(self, session_id: str, platform: str) -> bool:
+        raise NotImplementedError
+    async def get_handoff_state(self, session_id: str):
+        raise NotImplementedError
+    async def list_pending_handoffs(self) -> list:
+        raise NotImplementedError
+    async def claim_handoff(self, session_id: str) -> bool:
+        raise NotImplementedError
+    async def complete_handoff(self, session_id: str) -> None:
+        raise NotImplementedError
+    async def fail_handoff(self, session_id: str, error: str) -> None:
+        raise NotImplementedError
+
+
+# Temporary alias during Phase 0 cutover. Removed in Task 28.
+SessionDB = _LegacySessionDBSqlite
