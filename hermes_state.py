@@ -3975,20 +3975,440 @@ class _AsyncSessionDB:
         return s
 
     # === Message I/O (Task 12) ===
-    async def append_message(self, *args, **kwargs):
-        raise NotImplementedError
-    async def replace_messages(self, session_id: str, messages: list) -> None:
-        raise NotImplementedError
-    async def get_messages(self, session_id: str) -> list:
-        raise NotImplementedError
-    async def get_messages_around(self, *args, **kwargs):
-        raise NotImplementedError
-    async def get_anchored_view(self, *args, **kwargs):
-        raise NotImplementedError
+
+    async def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str = None,
+        tool_name: str = None,
+        tool_calls: Any = None,
+        tool_call_id: str = None,
+        token_count: int = None,
+        finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_content: str = None,
+        reasoning_details: Any = None,
+        codex_reasoning_items: Any = None,
+        codex_message_items: Any = None,
+        platform_message_id: str = None,
+    ) -> int:
+        """Append a message to a session. Returns the message row ID.
+
+        Also increments the session's message_count (and tool_call_count
+        if role is 'tool' or tool_calls is present).
+        """
+        # Pre-compute tool call count (mirrors upstream logic)
+        num_tool_calls = 0
+        if tool_calls is not None:
+            num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+
+        async with hermes_db.transaction() as conn:
+            msg_id = await conn.fetchval(
+                """
+                INSERT INTO messages (
+                    session_id, role, content, tool_call_id, tool_calls,
+                    tool_name, token_count, finish_reason, reasoning,
+                    reasoning_content, reasoning_details, codex_reasoning_items,
+                    codex_message_items, platform_message_id
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                RETURNING id
+                """,
+                session_id, role, content, tool_call_id, tool_calls,
+                tool_name, token_count, finish_reason, reasoning,
+                reasoning_content, reasoning_details, codex_reasoning_items,
+                codex_message_items, platform_message_id,
+            )
+            if num_tool_calls > 0:
+                await conn.execute(
+                    """UPDATE sessions
+                       SET message_count = message_count + 1,
+                           tool_call_count = tool_call_count + $2
+                       WHERE id = $1""",
+                    session_id, num_tool_calls,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = $1",
+                    session_id,
+                )
+        return msg_id
+
+    async def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        """Atomically replace every message for a session.
+
+        Used by transcript-rewrite flows such as /retry, /undo, and /compress.
+        """
+        async with hermes_db.transaction() as conn:
+            await conn.execute(
+                "DELETE FROM messages WHERE session_id = $1", session_id
+            )
+            await conn.execute(
+                "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = $1",
+                session_id,
+            )
+
+            total_messages = 0
+            total_tool_calls = 0
+            for msg in messages:
+                role = msg.get("role", "unknown")
+                tool_calls = msg.get("tool_calls")
+                reasoning_details = msg.get("reasoning_details") if role == "assistant" else None
+                codex_reasoning_items = (
+                    msg.get("codex_reasoning_items") if role == "assistant" else None
+                )
+                codex_message_items = (
+                    msg.get("codex_message_items") if role == "assistant" else None
+                )
+                # Accept either `platform_message_id` (new explicit name) or
+                # `message_id` (yuanbao's existing convention on message dicts).
+                platform_msg_id = (
+                    msg.get("platform_message_id") or msg.get("message_id")
+                )
+
+                await conn.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, tool_call_id, tool_calls,
+                        tool_name, token_count, finish_reason, reasoning,
+                        reasoning_content, reasoning_details, codex_reasoning_items,
+                        codex_message_items, platform_message_id
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    """,
+                    session_id,
+                    role,
+                    msg.get("content"),
+                    msg.get("tool_call_id"),
+                    tool_calls,
+                    msg.get("tool_name"),
+                    msg.get("token_count"),
+                    msg.get("finish_reason"),
+                    msg.get("reasoning") if role == "assistant" else None,
+                    msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details,
+                    codex_reasoning_items,
+                    codex_message_items,
+                    platform_msg_id,
+                )
+                total_messages += 1
+                if tool_calls is not None:
+                    total_tool_calls += (
+                        len(tool_calls) if isinstance(tool_calls, list) else 1
+                    )
+
+            await conn.execute(
+                "UPDATE sessions SET message_count = $2, tool_call_count = $3 WHERE id = $1",
+                session_id, total_messages, total_tool_calls,
+            )
+
+    async def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load all messages for a session, ordered by insertion order."""
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM messages WHERE session_id = $1 ORDER BY id",
+                session_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_messages_around(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+    ) -> Dict[str, Any]:
+        """Load a window of messages anchored on a specific message id.
+
+        Returns a dict with:
+          - ``window``: up to ``window`` messages before the anchor, the anchor
+            itself, and up to ``window`` messages after, ordered by id ascending.
+          - ``messages_before``: count of messages strictly before the anchor
+            still in the session (== window unless we hit the start).
+          - ``messages_after``: count of messages strictly after the anchor
+            still in the session (== window unless we hit the end).
+        """
+        if window < 0:
+            window = 0
+        async with hermes_db.connection() as conn:
+            anchor_exists = await conn.fetchrow(
+                "SELECT 1 FROM messages WHERE id = $1 AND session_id = $2 LIMIT 1",
+                around_message_id, session_id,
+            )
+            if not anchor_exists:
+                return {"window": [], "messages_before": 0, "messages_after": 0}
+
+            # before_rows: anchor + everything before it, DESC (so LIMIT takes closest)
+            before_rows = await conn.fetch(
+                "SELECT * FROM messages "
+                "WHERE session_id = $1 AND id <= $2 "
+                "ORDER BY id DESC LIMIT $3",
+                session_id, around_message_id, window + 1,
+            )
+            after_rows = await conn.fetch(
+                "SELECT * FROM messages "
+                "WHERE session_id = $1 AND id > $2 "
+                "ORDER BY id ASC LIMIT $3",
+                session_id, around_message_id, window,
+            )
+
+        # before_rows is DESC; reverse so ASC, then concatenate after_rows.
+        rows = list(reversed(before_rows)) + list(after_rows)
+        result = [dict(r) for r in rows]
+
+        # before_rows includes the anchor itself; subtract 1 for strict-before count.
+        messages_before = max(0, len(before_rows) - 1)
+        messages_after = len(after_rows)
+        return {
+            "window": result,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+        }
+
+    async def get_anchored_view(
+        self,
+        session_id: str,
+        around_message_id: int,
+        window: int = 5,
+        bookend: int = 3,
+        keep_roles: Optional[Tuple[str, ...]] = ("user", "assistant"),
+    ) -> Dict[str, Any]:
+        """Return an anchored window plus session bookends.
+
+        Built on top of ``get_messages_around``. Three slices:
+
+          - ``window``: messages immediately surrounding the anchor. Filtered
+            to ``keep_roles`` (tool-response noise dropped by default), EXCEPT
+            the anchor itself is always preserved regardless of role.
+          - ``bookend_start``: first ``bookend`` user/assistant messages of the
+            session — but only those whose id is strictly before the window's
+            first message id. Empty when the window already overlaps the session head.
+            Empty-content messages (tool-call-only assistant turns) are skipped.
+          - ``bookend_end``: last ``bookend`` user/assistant messages of the
+            session, same non-overlap rule at the tail.
+        """
+        if bookend < 0:
+            bookend = 0
+
+        # Reuse the primitive — handles anchor-existence, and boundary counts.
+        primitive = await self.get_messages_around(
+            session_id, around_message_id, window=window
+        )
+        window_rows = primitive["window"]
+        if not window_rows:
+            return {
+                "window": [],
+                "messages_before": 0,
+                "messages_after": 0,
+                "bookend_start": [],
+                "bookend_end": [],
+            }
+
+        # Apply role filter to the window, but never drop the anchor itself.
+        if keep_roles is not None:
+            keep_set = set(keep_roles)
+            filtered_window = [
+                m for m in window_rows
+                if m.get("id") == around_message_id or m.get("role") in keep_set
+            ]
+        else:
+            filtered_window = window_rows
+
+        window_min_id = window_rows[0]["id"]
+        window_max_id = window_rows[-1]["id"]
+
+        bookend_start_rows: List[Dict[str, Any]] = []
+        bookend_end_rows: List[Dict[str, Any]] = []
+        if bookend > 0:
+            # Build role filter clause for bookends
+            role_filter = ""
+            role_params: list = []
+            if keep_roles is not None:
+                placeholders = ", ".join(
+                    f"${i + 3}" for i in range(len(keep_roles))
+                )
+                role_filter = f" AND role IN ({placeholders})"
+                role_params = list(keep_roles)
+
+            async with hermes_db.connection() as conn:
+                start_limit_idx = 3 + len(role_params)
+                start_rows = await conn.fetch(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = $1 AND id < $2{role_filter} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id ASC LIMIT ${start_limit_idx}",
+                    session_id, window_min_id, *role_params, bookend,
+                )
+                end_limit_idx = 3 + len(role_params)
+                end_rows = await conn.fetch(
+                    f"SELECT * FROM messages "
+                    f"WHERE session_id = $1 AND id > $2{role_filter} "
+                    f"AND length(content) > 0 "
+                    f"ORDER BY id DESC LIMIT ${end_limit_idx}",
+                    session_id, window_max_id, *role_params, bookend,
+                )
+                # end_rows came back DESC for the LIMIT cap; flip to ASC.
+                end_rows = list(reversed(end_rows))
+
+            bookend_start_rows = [dict(r) for r in start_rows]
+            bookend_end_rows = [dict(r) for r in end_rows]
+
+        return {
+            "window": filtered_window,
+            "messages_before": primitive["messages_before"],
+            "messages_after": primitive["messages_after"],
+            "bookend_start": bookend_start_rows,
+            "bookend_end": bookend_end_rows,
+        }
+
     async def resolve_resume_session_id(self, session_id: str) -> str:
-        raise NotImplementedError
-    async def get_messages_as_conversation(self, *args, **kwargs):
-        raise NotImplementedError
+        """Redirect a resume target to the descendant session that holds the messages.
+
+        Walks ``parent_session_id`` forward from ``session_id`` and returns the
+        first descendant in the chain that has at least one message row. If the
+        original session already has messages, or no descendant has any, the
+        original ``session_id`` is returned unchanged.
+        """
+        if not session_id:
+            return session_id
+
+        try:
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT 1 FROM messages WHERE session_id = $1 LIMIT 1",
+                    session_id,
+                )
+        except Exception:
+            return session_id
+        if row is not None:
+            return session_id
+
+        # Walk descendants: at each step, pick the most-recently-started child.
+        current = session_id
+        seen = {current}
+        for _ in range(32):
+            try:
+                async with hermes_db.connection() as conn:
+                    child_row = await conn.fetchrow(
+                        "SELECT id FROM sessions "
+                        "WHERE parent_session_id = $1 "
+                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        current,
+                    )
+            except Exception:
+                return session_id
+            if child_row is None:
+                return session_id
+            child_id = child_row["id"]
+            if not child_id or child_id in seen:
+                return session_id
+            seen.add(child_id)
+            try:
+                async with hermes_db.connection() as conn:
+                    msg_row = await conn.fetchrow(
+                        "SELECT 1 FROM messages WHERE session_id = $1 LIMIT 1",
+                        child_id,
+                    )
+            except Exception:
+                return session_id
+            if msg_row is not None:
+                return child_id
+            current = child_id
+        return session_id
+
+    async def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        """Walk the parent_session_id chain from the root down to session_id."""
+        if not session_id:
+            return [session_id]
+
+        chain = []
+        current = session_id
+        seen: set = set()
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            chain.append(current)
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(
+                    "SELECT parent_session_id FROM sessions WHERE id = $1",
+                    current,
+                )
+            if row is None:
+                break
+            current = row["parent_session_id"]
+        return list(reversed(chain)) or [session_id]
+
+    async def get_messages_as_conversation(
+        self, session_id: str, include_ancestors: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Load messages in the OpenAI conversation format (role + content dicts).
+
+        Used by the gateway to restore conversation history.
+        """
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = await self._session_lineage_root_to_tip(session_id)
+
+        placeholders = ", ".join(f"${i + 1}" for i in range(len(session_ids)))
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                f"SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                f"finish_reason, reasoning, reasoning_content, reasoning_details, "
+                f"codex_reasoning_items, codex_message_items, platform_message_id "
+                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
+                *session_ids,
+            )
+
+        messages = []
+        for row in rows:
+            content = row["content"]
+            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+                content = sanitize_context(content).strip()
+            msg: Dict[str, Any] = {"role": row["role"], "content": content}
+            if row["tool_call_id"]:
+                msg["tool_call_id"] = row["tool_call_id"]
+            if row["tool_name"]:
+                msg["tool_name"] = row["tool_name"]
+            if row["tool_calls"] is not None:
+                msg["tool_calls"] = row["tool_calls"]
+            # Surface the platform-side message id so platform-specific flows
+            # can match by external identifier. Exposed as ``message_id`` for
+            # backward compatibility with the JSONL transcript shape.
+            if row["platform_message_id"]:
+                msg["message_id"] = row["platform_message_id"]
+            # Restore reasoning fields on assistant messages.
+            if row["role"] == "assistant":
+                if row["finish_reason"]:
+                    msg["finish_reason"] = row["finish_reason"]
+                if row["reasoning"]:
+                    msg["reasoning"] = row["reasoning"]
+                if row["reasoning_content"] is not None:
+                    msg["reasoning_content"] = row["reasoning_content"]
+                if row["reasoning_details"] is not None:
+                    msg["reasoning_details"] = row["reasoning_details"]
+                if row["codex_reasoning_items"] is not None:
+                    msg["codex_reasoning_items"] = row["codex_reasoning_items"]
+                if row["codex_message_items"] is not None:
+                    msg["codex_message_items"] = row["codex_message_items"]
+            if include_ancestors and _AsyncSessionDB._is_duplicate_replayed_user_message(messages, msg):
+                continue
+            messages.append(msg)
+        return messages
+
+    @staticmethod
+    def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            return False
+        for prev in reversed(messages):
+            if prev.get("role") == "user" and prev.get("content") == content:
+                return True
+            if prev.get("role") == "assistant" and (prev.get("content") or prev.get("tool_calls")):
+                return False
+        return False
 
     # === Search (Task 13) ===
     async def search_messages(self, *args, **kwargs):
