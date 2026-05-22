@@ -5149,24 +5149,207 @@ class _AsyncSessionDB:
         return sessions
 
     # === Maintenance (Task 18) ===
+
     async def vacuum(self) -> None:
-        raise NotImplementedError
-    async def maybe_auto_prune_and_vacuum(self, *args, **kwargs):
-        raise NotImplementedError
+        """Run VACUUM ANALYZE on the PG database.
+
+        VACUUM cannot run inside a transaction. ``hermes_db.connection()``
+        acquires a plain connection without starting a transaction, so this
+        is safe as long as the caller does not wrap in
+        ``hermes_db.transaction()``.
+        """
+        async with hermes_db.connection() as conn:
+            await conn.execute("VACUUM ANALYZE")
+
+    async def maybe_auto_prune_and_vacuum(
+        self,
+        retention_days: int = 90,
+        min_interval_hours: int = 24,
+        vacuum: bool = True,
+        sessions_dir=None,
+    ) -> Dict[str, Any]:
+        """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
+
+        Records the last run timestamp in state_meta so subsequent calls
+        within ``min_interval_hours`` no-op. Designed to be called once at
+        startup from long-lived entrypoints (CLI, gateway, cron scheduler).
+
+        Never raises. On any failure, logs a warning and returns a dict
+        with ``"error"`` set.
+
+        Returns a dict with keys:
+          - ``"skipped"`` (bool) — true if within min_interval_hours of last run
+          - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"error"`` (str, optional) — present only on failure
+        """
+        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        try:
+            last_raw = await self.get_meta("last_auto_prune")
+            now = time.time()
+            if last_raw:
+                try:
+                    last_ts = float(last_raw)
+                    if now - last_ts < min_interval_hours * 3600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass  # corrupt meta; treat as no prior run
+
+            pruned = await self.prune_sessions(
+                older_than_days=retention_days,
+                sessions_dir=sessions_dir,
+            )
+            result["pruned"] = pruned
+
+            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
+            # is wasted I/O. Threshold keeps small DBs from paying the cost.
+            if vacuum and pruned > 0:
+                try:
+                    await self.vacuum()
+                    result["vacuumed"] = True
+                except Exception as exc:
+                    logger.warning("state.db VACUUM failed: %s", exc)
+
+            # Record the attempt even if pruned == 0, so we don't retry
+            # every startup within the min_interval_hours window.
+            await self.set_meta("last_auto_prune", str(now))
+
+            if pruned > 0:
+                logger.info(
+                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    pruned,
+                    retention_days,
+                    " + VACUUM" if result["vacuumed"] else "",
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-maintenance failed: %s", exc)
+            result["error"] = str(exc)
+
+        return result
 
     # === Handoff (Task 18) ===
+    #
+    # State machine:
+    #   None        — no handoff in flight
+    #   "pending"   — CLI requested handoff, gateway hasn't picked it up yet
+    #   "running"   — gateway is processing (session switch + synthetic turn)
+    #   "completed" — gateway successfully delivered the synthetic turn
+    #   "failed"    — gateway hit an error; reason in handoff_error
+    #
+    # The CLI writes "pending" then poll-waits for terminal state. The gateway
+    # watcher transitions pending → running → {completed, failed}.
+
     async def request_handoff(self, session_id: str, platform: str) -> bool:
-        raise NotImplementedError
-    async def get_handoff_state(self, session_id: str):
-        raise NotImplementedError
-    async def list_pending_handoffs(self) -> list:
-        raise NotImplementedError
+        """Mark a session as pending handoff to the given platform.
+
+        Returns True if the row was found and not already in flight; False if
+        the session is already in a non-terminal handoff state (i.e. pending
+        or running).  Re-requesting from a terminal state (completed / failed)
+        is allowed and resets the columns.
+        """
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE sessions
+                   SET handoff_state    = 'pending',
+                       handoff_platform = $1,
+                       handoff_error    = NULL
+                 WHERE id = $2
+                   AND (handoff_state IS NULL
+                        OR handoff_state IN ('completed', 'failed'))
+                RETURNING id
+                """,
+                platform,
+                session_id,
+            )
+        return row is not None
+
+    async def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Read the current handoff state for a session.
+
+        Returns ``{"state", "platform", "error"}`` or None if the session
+        does not exist.
+        """
+        try:
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT handoff_state, handoff_platform, handoff_error
+                      FROM sessions
+                     WHERE id = $1
+                    """,
+                    session_id,
+                )
+            if row is None:
+                return None
+            return {
+                "state": row["handoff_state"],
+                "platform": row["handoff_platform"],
+                "error": row["handoff_error"],
+            }
+        except Exception:
+            return None
+
+    async def list_pending_handoffs(self) -> List[Dict[str, Any]]:
+        """Return all sessions in handoff_state='pending', oldest first.
+
+        Used by the gateway's handoff watcher.
+        """
+        try:
+            async with hermes_db.connection() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT *
+                      FROM sessions
+                     WHERE handoff_state = 'pending'
+                     ORDER BY started_at ASC
+                    """
+                )
+            return [dict(r) for r in rows]
+        except Exception:
+            return []
+
     async def claim_handoff(self, session_id: str) -> bool:
-        raise NotImplementedError
+        """Atomically transition pending → running. Returns True if claimed."""
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE sessions
+                   SET handoff_state = 'running'
+                 WHERE id = $1 AND handoff_state = 'pending'
+                RETURNING id
+                """,
+                session_id,
+            )
+        return row is not None
+
     async def complete_handoff(self, session_id: str) -> None:
-        raise NotImplementedError
+        """Mark a handoff as completed."""
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE sessions
+                   SET handoff_state = 'completed',
+                       handoff_error = NULL
+                 WHERE id = $1
+                """,
+                session_id,
+            )
+
     async def fail_handoff(self, session_id: str, error: str) -> None:
-        raise NotImplementedError
+        """Mark a handoff as failed and record the reason."""
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE sessions
+                   SET handoff_state = 'failed',
+                       handoff_error = $1
+                 WHERE id = $2
+                """,
+                error[:500],
+                session_id,
+            )
 
 
 # Temporary alias during Phase 0 cutover. Removed in Task 28.
