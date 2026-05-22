@@ -20,13 +20,7 @@ import random
 import re
 import sqlite3
 
-# Phase 0: PG helpers used by _AsyncSessionDB.
-# Imported lazily at module level here so the legacy SQLite path works without
-# a running PG pool (import doesn't call init()).
-try:
-    import hermes_db as _hermes_db
-except ImportError:  # pragma: no cover — only absent in ultra-minimal test envs
-    _hermes_db = None  # type: ignore[assignment]
+import hermes_db  # PG pool & helpers for _AsyncSessionDB; safe to import even when pool not initialized.
 
 
 def _json_dumps(value):
@@ -3312,24 +3306,24 @@ class _AsyncSessionDB:
         user_id = kwargs.get("user_id")
         parent_session_id = kwargs.get("parent_session_id")
         title = kwargs.get("title")
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO sessions
                     (id, source, user_id, model, model_config, system_prompt,
                      parent_session_id, title)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (id) DO NOTHING
                 """,
                 session_id, source, user_id, model,
-                _json_dumps(model_config), system_prompt,
+                model_config, system_prompt,
                 parent_session_id, title,
             )
         return session_id
 
     async def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark session ended. No-op if already ended (first end_reason wins)."""
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             await conn.execute(
                 "UPDATE sessions SET ended_at = now(), end_reason = $2 "
                 "WHERE id = $1 AND ended_at IS NULL",
@@ -3338,7 +3332,7 @@ class _AsyncSessionDB:
 
     async def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             await conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = $1",
                 session_id,
@@ -3346,7 +3340,7 @@ class _AsyncSessionDB:
 
     async def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             await conn.execute(
                 "UPDATE sessions SET system_prompt = $2 WHERE id = $1",
                 session_id, system_prompt,
@@ -3430,7 +3424,7 @@ class _AsyncSessionDB:
                     api_call_count      = api_call_count      + $16
                 WHERE id = $1
             """
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             await conn.execute(
                 sql,
                 session_id,
@@ -3470,31 +3464,33 @@ class _AsyncSessionDB:
         await self.create_session(session_id=session_id, source=source, **kwargs)
 
     async def prune_empty_ghost_sessions(self, sessions_dir=None) -> int:
-        """Remove sessions that have no messages.
+        """Remove empty TUI ghost sessions (no messages, no title, >24hr old).
 
-        Mirrors the DB-side pruning in upstream, without the TUI-source/title/
-        age filter (the PG schema doesn't persist started_at as a unix epoch so
-        we keep the logic simple: any session with zero messages is a ghost).
-        The optional *sessions_dir* FS-walk from upstream is preserved: if
-        provided, on-disk session files for removed sessions are deleted too.
+        Matches upstream behavior (hermes_state.py:893-921). Only prunes
+        sessions that are: source='tui', title IS NULL, ended,
+        started >24 hours ago, and have zero messages. The optional
+        sessions_dir FS-walk removes on-disk session files for pruned IDs.
 
         Returns the count of removed DB rows.
         """
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             rows = await conn.fetch(
                 """
                 WITH empty AS (
                     SELECT id FROM sessions s
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM messages m WHERE m.session_id = s.id
-                     )
+                     WHERE s.source = 'tui'
+                       AND s.title IS NULL
+                       AND s.ended_at IS NOT NULL
+                       AND s.started_at < now() - interval '24 hours'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM messages m WHERE m.session_id = s.id
+                       )
                 )
                 DELETE FROM sessions WHERE id IN (SELECT id FROM empty)
                 RETURNING id
                 """
             )
         removed_ids = [r["id"] for r in rows]
-        # FS-walk: remove on-disk session files for pruned sessions.
         if sessions_dir and removed_ids:
             self._remove_session_files(sessions_dir, removed_ids)
         return len(removed_ids)
@@ -3509,7 +3505,7 @@ class _AsyncSessionDB:
 
         Mirrors upstream logic in hermes_state.py:907-944.
         """
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             rows = await conn.fetch(
                 """
                 UPDATE sessions
@@ -3538,25 +3534,17 @@ class _AsyncSessionDB:
     async def get_session(self, session_id: str):
         """Return a session row as a dict, or None if not found.
 
-        JSONB columns (model_config, tool_calls, etc.) are deserialized from
-        JSON strings to Python objects. asyncpg returns JSONB as ``str`` by
-        default for ``SELECT *``; we parse them here so callers get dicts/lists.
+        JSONB columns (model_config, tool_calls, reasoning_details, etc.) are
+        automatically decoded to Python objects by the pool-level JSONB codec
+        registered in hermes_db._setup_jsonb_codec.
         """
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM sessions WHERE id = $1", session_id
             )
         if row is None:
             return None
-        result = dict(row)
-        # Deserialize JSONB columns that asyncpg returns as strings.
-        for col in ("model_config",):
-            if col in result and isinstance(result[col], str):
-                try:
-                    result[col] = json.loads(result[col])
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        return result
+        return dict(row)
 
     async def resolve_session_id(self, session_id_or_prefix: str):
         """Resolve exact or uniquely-prefixed session ID.
@@ -3566,7 +3554,7 @@ class _AsyncSessionDB:
         matches or ambiguous prefixes. Mirrors upstream LIKE ESCAPE behavior;
         special LIKE chars in the prefix are escaped so they match literally.
         """
-        async with _hermes_db.connection() as conn:
+        async with hermes_db.connection() as conn:
             # Exact match first.
             row = await conn.fetchrow(
                 "SELECT id FROM sessions WHERE id = $1", session_id_or_prefix

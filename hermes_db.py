@@ -13,6 +13,7 @@ Close at shutdown (`close()`). Pool size is tunable via env vars:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -24,6 +25,16 @@ T = TypeVar("T")
 
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock = threading.Lock()
+
+
+async def _setup_jsonb_codec(conn):
+    """Register JSONB codec so asyncpg returns Python objects for jsonb columns."""
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 async def init(
@@ -45,6 +56,7 @@ async def init(
         min_size=ms,
         max_size=Ms,
         command_timeout=command_timeout,
+        init=_setup_jsonb_codec,
     )
     with _pool_lock:
         if _pool is None:

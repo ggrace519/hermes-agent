@@ -64,3 +64,10 @@ def test_run_sync_executes_coroutine_synchronously():
     async def make_seven():
         return 7
     assert hermes_db.run_sync(make_seven()) == 7
+
+
+@pytest.mark.asyncio
+async def test_jsonb_codec_returns_python_objects(initialized_db):
+    async with hermes_db.connection() as conn:
+        result = await conn.fetchval("SELECT '{\"a\":1,\"b\":[2,3]}'::jsonb")
+    assert result == {"a": 1, "b": [2, 3]}

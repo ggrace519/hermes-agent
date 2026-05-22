@@ -111,11 +111,60 @@ async def test_ensure_session_noop_if_present(db):
 
 
 @pytest.mark.asyncio
-async def test_prune_empty_ghost_sessions_removes_zero_message_sessions(db):
-    await db.create_session(session_id="ghost", source="cli", model="m", model_config={}, system_prompt="")
+async def test_prune_empty_ghost_removes_old_unnamed_ended_tui_session(db):
+    """Match upstream filter: source=tui, title IS NULL, ended, >24h old, no messages."""
+    await db.create_session(session_id="ghost", source="tui", model="m", model_config={}, system_prompt="")
+    await db.end_session("ghost", "x")
+    # Force started_at into the past so the age filter matches.
+    import hermes_db
+    async with hermes_db.connection() as c:
+        await c.execute(
+            "UPDATE sessions SET started_at = now() - interval '25 hours' WHERE id = 'ghost'"
+        )
     n = await db.prune_empty_ghost_sessions()
-    assert n >= 1
+    assert n == 1
     assert (await db.get_session("ghost")) is None
+
+
+@pytest.mark.asyncio
+async def test_prune_empty_ghost_keeps_cli_sessions(db):
+    """source != 'tui' should never be pruned even if otherwise empty/old/ended."""
+    await db.create_session(session_id="cli_old", source="cli", model="m", model_config={}, system_prompt="")
+    await db.end_session("cli_old", "x")
+    import hermes_db
+    async with hermes_db.connection() as c:
+        await c.execute(
+            "UPDATE sessions SET started_at = now() - interval '25 hours' WHERE id = 'cli_old'"
+        )
+    n = await db.prune_empty_ghost_sessions()
+    assert n == 0
+    assert (await db.get_session("cli_old")) is not None
+
+
+@pytest.mark.asyncio
+async def test_prune_empty_ghost_keeps_recent_session(db):
+    """Sessions younger than 24h should not be pruned."""
+    await db.create_session(session_id="recent_tui", source="tui", model="m", model_config={}, system_prompt="")
+    await db.end_session("recent_tui", "x")
+    # started_at is now() by default; age filter prevents pruning.
+    n = await db.prune_empty_ghost_sessions()
+    assert n == 0
+    assert (await db.get_session("recent_tui")) is not None
+
+
+@pytest.mark.asyncio
+async def test_prune_empty_ghost_keeps_titled_session(db):
+    """Sessions with a title are user-blessed; should never be pruned."""
+    await db.create_session(session_id="titled_tui", source="tui", model="m", model_config={}, system_prompt="", title="My Session")
+    await db.end_session("titled_tui", "x")
+    import hermes_db
+    async with hermes_db.connection() as c:
+        await c.execute(
+            "UPDATE sessions SET started_at = now() - interval '25 hours' WHERE id = 'titled_tui'"
+        )
+    n = await db.prune_empty_ghost_sessions()
+    assert n == 0
+    assert (await db.get_session("titled_tui")) is not None
 
 
 @pytest.mark.asyncio
