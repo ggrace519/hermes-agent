@@ -254,7 +254,7 @@ markers = [
 # scripts/run_tests_parallel.py). Per-file isolation gives every test
 # file a fresh Python interpreter; pytest-timeout catches Python-level
 # hangs within a file.
-addopts = "-m 'not integration' --timeout=30 --timeout-method=signal"
+addopts = "-m 'not integration' --timeout=30 --timeout-method=signal --postgresql-drop-test-database"
 
 [tool.ty.environment]
 python-version = "3.13"
