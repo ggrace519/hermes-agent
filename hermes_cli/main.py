@@ -10852,6 +10852,13 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def main():
     """Main entry point for hermes CLI."""
+    # Initialize PG pool if HERMES_PG_DSN is set; otherwise proceed with legacy path
+    try:
+        from hermes_bootstrap import init_db_sync
+        init_db_sync()
+    except RuntimeError:
+        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
         from hermes_cli.stdio import configure_windows_stdio
