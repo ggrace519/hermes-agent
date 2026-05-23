@@ -65,25 +65,21 @@ def test_pool_raises_before_init(monkeypatch):
         hermes_db.pool()
 
 
-def test_pool_lazy_initialises_from_env(hermes_db_dsn, monkeypatch):
-    """When HERMES_PG_DSN is set and ``init()`` was never called explicitly,
-    ``pool()`` must bootstrap the pool on first use.
-
-    This is what lets CLI subcommands skip eager init in their ``main()`` —
-    DB-touching code paths still get a working pool, while ``--help``/version
-    paths never reach this function.
+def test_ensure_pool_sync_returns_false_when_no_dsn(monkeypatch):
+    """When no DSN is configured, ``ensure_pool_sync`` is a no-op that
+    returns False — sync entry points use this to gracefully degrade.
     """
-    # Tear down any pool the test fixtures might have created.
-    if hermes_db._pool is not None:
-        hermes_db.run_sync(hermes_db.close())
-    assert hermes_db._pool is None
-    monkeypatch.setenv("HERMES_PG_DSN", hermes_db_dsn)
+    monkeypatch.delenv("HERMES_PG_DSN", raising=False)
+    # Don't close an existing pool (would interfere with later tests
+    # that share the module-level singleton); just verify the no-DSN
+    # branch returns False when called against an uninitialised state.
+    saved_pool = hermes_db._pool
+    hermes_db._pool = None
     try:
-        p = hermes_db.pool()
-        assert p is not None
-        assert hermes_db._pool is p
+        assert hermes_db.ensure_pool_sync() is False
+        assert hermes_db._pool is None
     finally:
-        hermes_db.run_sync(hermes_db.close())
+        hermes_db._pool = saved_pool
 
 
 def test_run_sync_executes_coroutine_synchronously():

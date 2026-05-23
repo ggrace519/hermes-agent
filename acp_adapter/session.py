@@ -11,6 +11,7 @@ from __future__ import annotations
 from hermes_constants import get_hermes_home
 
 import copy
+import hermes_db  # PG pool + sync bridge for async SessionDB calls.
 import json
 import logging
 import os
@@ -288,7 +289,7 @@ class SessionManager:
 
         if db is not None:
             try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
+                for row in hermes_db.run_sync(db.list_sessions_rich(source="acp", limit=1000)):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
                 logger.debug("Failed to load ACP sessions from DB", exc_info=True)
@@ -377,11 +378,11 @@ class SessionManager:
         db = self._get_db()
         if db is not None:
             try:
-                rows = db.search_sessions(source="acp", limit=10000)
+                rows = hermes_db.run_sync(db.search_sessions(source="acp", limit=10000))
                 for row in rows:
                     sid = row["id"]
                     _clear_task_cwd(sid)
-                    db.delete_session(sid)
+                    hermes_db.run_sync(db.delete_session(sid))
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
@@ -402,7 +403,7 @@ class SessionManager:
         """Lazily initialise and return the SessionDB instance.
 
         Returns ``None`` if the DB is unavailable (e.g. import error in a
-        minimal test environment).
+        minimal test environment, or no ``HERMES_PG_DSN`` configured).
 
         Note: we resolve ``HERMES_HOME`` dynamically rather than relying on
         the module-level ``DEFAULT_DB_PATH`` constant, because that constant
@@ -413,6 +414,29 @@ class SessionManager:
             return self._db_instance
         try:
             from hermes_state import SessionDB
+            # Ensure the asyncpg pool exists before we hand back an
+            # _AsyncSessionDB — its methods will hit ``hermes_db.connection()``
+            # via ``run_sync`` and need a live pool. We do this once here
+            # (sync, outside any event loop) so the inner async calls don't
+            # have to bootstrap from inside a running loop.
+            try:
+                if not hermes_db.ensure_pool_sync():
+                    logger.debug(
+                        "No HERMES_PG_DSN configured; ACP persistence disabled"
+                    )
+                    return None
+            except RuntimeError as exc:
+                # ``ensure_pool_sync`` refuses to run from inside a running
+                # event loop. ACP server methods are async; tests and the
+                # real server alike must initialise the pool eagerly at
+                # entry point (acp_adapter/entry.py:init_db_sync). If it's
+                # not initialised by the time async code calls into here,
+                # the test environment is at fault — degrade gracefully
+                # so the JSON-RPC surface keeps responding.
+                logger.debug(
+                    "Cannot bootstrap PG pool from inside event loop: %s", exc
+                )
+                return None
             hermes_home = get_hermes_home()
             self._db_instance = SessionDB(db_path=hermes_home / "state.db")
             return self._db_instance
@@ -446,30 +470,40 @@ class SessionManager:
 
         try:
             # Ensure the session record exists.
-            existing = db.get_session(state.session_id)
+            existing = hermes_db.run_sync(db.get_session(state.session_id))
             if existing is None:
-                db.create_session(
+                hermes_db.run_sync(db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
                     model_config={"cwd": state.cwd},
-                )
+                ))
             else:
-                # Update model_config (contains cwd) if changed.
-                try:
-                    with db._lock:
-                        db._conn.execute(
-                            "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                            (cwd_json, model_str, state.session_id),
+                # Update model_config (contains cwd) and model if changed.
+                # Previously this reached into ``db._lock`` / ``db._conn`` and
+                # issued SQLite-shaped SQL with ``?`` placeholders; the PG
+                # port replaces that with a parameterised asyncpg update
+                # through the shared pool.
+                async def _update_meta() -> None:
+                    async with hermes_db.connection() as conn:
+                        await conn.execute(
+                            "UPDATE sessions "
+                            "   SET model_config = $1, "
+                            "       model = COALESCE($2, model) "
+                            " WHERE id = $3",
+                            session_meta,
+                            model_str,
+                            state.session_id,
                         )
-                        db._conn.commit()
+                try:
+                    hermes_db.run_sync(_update_meta())
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 
             # Replace stored messages with current history atomically so a
             # mid-rewrite failure rolls back and the previously persisted
             # conversation is preserved (salvaged from #13675).
-            db.replace_messages(state.session_id, state.history)
+            hermes_db.run_sync(db.replace_messages(state.session_id, state.history))
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
@@ -482,7 +516,7 @@ class SessionManager:
             return None
 
         try:
-            row = db.get_session(session_id)
+            row = hermes_db.run_sync(db.get_session(session_id))
         except Exception:
             logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
             return None
@@ -494,28 +528,35 @@ class SessionManager:
         if row.get("source") != "acp":
             return None
 
-        # Extract cwd from model_config.
+        # Extract cwd from model_config. asyncpg's JSONB codec decodes
+        # jsonb columns to Python ``dict``/``list`` already, so ``mc`` is
+        # usually a dict here; legacy rows written as TEXT may still come
+        # back as a JSON-encoded string. Handle both.
         cwd = "."
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
         mc = row.get("model_config")
         if mc:
-            try:
-                meta = json.loads(mc)
-                if isinstance(meta, dict):
-                    cwd = meta.get("cwd", ".")
-                    requested_provider = meta.get("provider") or requested_provider
-                    restored_base_url = meta.get("base_url") or restored_base_url
-                    restored_api_mode = meta.get("api_mode") or restored_api_mode
-            except (json.JSONDecodeError, TypeError):
-                pass
+            meta: Any
+            if isinstance(mc, str):
+                try:
+                    meta = json.loads(mc)
+                except (json.JSONDecodeError, TypeError):
+                    meta = None
+            else:
+                meta = mc
+            if isinstance(meta, dict):
+                cwd = meta.get("cwd", ".")
+                requested_provider = meta.get("provider") or requested_provider
+                restored_base_url = meta.get("base_url") or restored_base_url
+                restored_api_mode = meta.get("api_mode") or restored_api_mode
 
         model = row.get("model") or None
 
         # Load conversation history.
         try:
-            history = db.get_messages_as_conversation(session_id)
+            history = hermes_db.run_sync(db.get_messages_as_conversation(session_id))
         except Exception:
             logger.warning("Failed to load messages for ACP session %s", session_id, exc_info=True)
             history = []
@@ -553,7 +594,7 @@ class SessionManager:
         if db is None:
             return False
         try:
-            return db.delete_session(session_id)
+            return hermes_db.run_sync(db.delete_session(session_id))
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
             return False

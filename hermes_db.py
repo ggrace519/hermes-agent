@@ -26,6 +26,23 @@ T = TypeVar("T")
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock = threading.Lock()
 
+# Persistent module-level event loop for sync bridging. The asyncpg pool
+# binds to whichever loop created it; reusing one loop across run_sync()
+# calls keeps the pool valid across pytest tests (otherwise a per-call
+# ``asyncio.new_event_loop`` leaves the pool bound to a closed loop and
+# every subsequent call raises ``RuntimeError: Event loop is closed``).
+# Mirrors the pattern in ``model_tools._get_tool_loop``.
+_sync_loop: Optional[asyncio.AbstractEventLoop] = None
+_sync_loop_lock = threading.Lock()
+
+
+def _get_sync_loop() -> asyncio.AbstractEventLoop:
+    global _sync_loop
+    with _sync_loop_lock:
+        if _sync_loop is None or _sync_loop.is_closed():
+            _sync_loop = asyncio.new_event_loop()
+        return _sync_loop
+
 
 async def _setup_jsonb_codec(conn):
     """Register JSONB codec so asyncpg returns Python objects for jsonb columns."""
@@ -84,14 +101,8 @@ def pool() -> asyncpg.Pool:
         # at the entry point.
         dsn = os.environ.get("HERMES_PG_DSN")
         if dsn:
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = None
-            if loop is None or not loop.is_running():
-                if loop is None:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+            loop = _get_sync_loop()
+            if not loop.is_running():
                 loop.run_until_complete(init(dsn))
                 if _pool is not None:
                     return _pool
@@ -118,15 +129,70 @@ def run_sync(coro: Awaitable[T]) -> T:
     Mirrors the proven pattern in `model_tools._run_async`. Must NOT be called
     from inside a running event loop — that indicates the caller is async and
     should `await` directly.
+
+    Uses a persistent module-level event loop (``_get_sync_loop``) so the
+    asyncpg pool stays bound to a live loop across calls. Per-call
+    ``asyncio.new_event_loop()`` would orphan the pool against a closed loop
+    after the first call and surface as ``RuntimeError: Event loop is closed``
+    on the next acquire.
+
+    NOTE: this function does NOT lazy-bootstrap the pool — auto-init lives in
+    ``pool()`` for sync code paths that touch the DB outside an event loop,
+    and ``ensure_pool_sync()`` for code that knows it's about to acquire
+    connections from inside ``run_sync``. The reason is that ``run_sync`` may
+    legitimately be passed coroutines that never touch the pool (tests of
+    other primitives, smoke checks) and we don't want every call to attempt
+    a PG connect.
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    loop = _get_sync_loop()
     if loop.is_running():
         raise RuntimeError(
             "hermes_db.run_sync called from inside running event loop; "
             "refactor caller to `await` the coroutine directly."
         )
     return loop.run_until_complete(coro)
+
+
+def ensure_pool_sync() -> bool:
+    """Initialise the pool from ``HERMES_PG_DSN`` if it hasn't been already.
+
+    Returns True if a pool is available after the call, False if no DSN is
+    configured and no pool exists. Safe to call from any sync context;
+    must NOT be called from inside a running event loop.
+
+    Intended for sync entry points that are about to call ``run_sync`` on
+    a DB-touching coroutine. Calling this once at the top of e.g. an
+    ACP ``_get_db`` ensures the inner ``async with connection()`` doesn't
+    hit the "init not called" error.
+    """
+    if _pool is not None:
+        return True
+    dsn = os.environ.get("HERMES_PG_DSN")
+    if not dsn:
+        return False
+    # Reject calls from inside ANY running loop on this thread (not just
+    # our own persistent ``_sync_loop``). pytest-asyncio creates a
+    # per-test loop that's distinct from our persistent one but still
+    # owns the thread; ``run_until_complete`` would raise "Cannot run
+    # the event loop while another loop is running" if we tried to
+    # bootstrap synchronously from inside such a test.
+    try:
+        asyncio.get_running_loop()
+        running = True
+    except RuntimeError:
+        running = False
+    if running:
+        raise RuntimeError(
+            "hermes_db.ensure_pool_sync called from inside a running event "
+            "loop; await hermes_db.init(dsn) directly instead."
+        )
+    loop = _get_sync_loop()
+    coro = init(dsn)
+    try:
+        loop.run_until_complete(coro)
+    except BaseException:
+        # ``init`` may have set up partial state; close the coroutine
+        # explicitly so the leak warning doesn't fire.
+        coro.close()
+        raise
+    return _pool is not None

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 import acp
+import hermes_db
 from acp.agent.router import build_agent_router
 from acp.schema import (
     AgentCapabilities,
@@ -1237,7 +1238,7 @@ class TestPrompt:
         })
 
         def fake_auto_title(db, session_id, user_text, final_response, history, **kwargs):
-            db.set_session_title(session_id, "Fix Zed titles")
+            hermes_db.run_sync(db.set_session_title(session_id, "Fix Zed titles"))
             kwargs["title_callback"]("Fix Zed titles")
 
         with patch("agent.title_generator.maybe_auto_title", side_effect=fake_auto_title):
