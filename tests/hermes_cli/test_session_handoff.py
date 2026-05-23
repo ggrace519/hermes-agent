@@ -15,172 +15,176 @@ from __future__ import annotations
 import time
 
 import pytest
+import pytest_asyncio
 
 from hermes_state import SessionDB
 
 
 class TestHandoffStateDB:
-    """Test the handoff schema + helper methods on SessionDB."""
+    """Test the handoff schema + helper methods on SessionDB (PG-backed)."""
 
-    @pytest.fixture
-    def db(self, tmp_path, monkeypatch):
-        home = tmp_path / ".hermes"
-        home.mkdir()
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        return SessionDB(db_path=home / "state.db")
+    @pytest_asyncio.fixture
+    async def db(self, hermes_db_initialized):
+        return SessionDB()
 
-    def _make_session(self, db, session_id, source="cli", title=None):
-        """Insert a session row directly for testing."""
-        def _do(conn):
-            conn.execute(
-                "INSERT OR IGNORE INTO sessions (id, source, title, started_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, source, title, time.time()),
-            )
-        db._execute_write(_do)
+    async def _make_session(self, db, session_id, source="cli", title=None):
+        """Insert a session row using the public async API."""
+        await db.create_session(session_id, source=source, title=title)
 
-    def test_columns_exist(self, db):
-        db._conn.execute(
-            "SELECT handoff_state, handoff_platform, handoff_error "
-            "FROM sessions LIMIT 0"
-        )
+    @pytest.mark.skip(
+        reason="SQLite-only: checks db._conn raw SQL column existence. "
+        "PG columns are managed by Alembic migrations; verified by migration tests. "
+        "Phase 0 Task 28 cleanup."
+    )
+    def test_columns_exist(self):
+        pass
 
-    def test_request_handoff_marks_pending(self, db):
+    @pytest.mark.asyncio
+    async def test_request_handoff_marks_pending(self, db):
         sid = "sess-1"
-        self._make_session(db, sid)
+        await self._make_session(db, sid)
 
-        assert db.request_handoff(sid, "telegram") is True
+        assert await db.request_handoff(sid, "telegram") is True
 
-        state = db.get_handoff_state(sid)
+        state = await db.get_handoff_state(sid)
         assert state == {
             "state": "pending",
             "platform": "telegram",
             "error": None,
         }
 
-    def test_request_handoff_rejects_in_flight(self, db):
+    @pytest.mark.asyncio
+    async def test_request_handoff_rejects_in_flight(self, db):
         sid = "sess-2"
-        self._make_session(db, sid)
+        await self._make_session(db, sid)
 
-        assert db.request_handoff(sid, "telegram") is True
+        assert await db.request_handoff(sid, "telegram") is True
         # Still pending → reject re-request
-        assert db.request_handoff(sid, "discord") is False
+        assert await db.request_handoff(sid, "discord") is False
 
         # And after gateway claims it (running) → still rejected
-        assert db.claim_handoff(sid) is True
-        assert db.request_handoff(sid, "discord") is False
+        assert await db.claim_handoff(sid) is True
+        assert await db.request_handoff(sid, "discord") is False
 
-    def test_request_handoff_after_terminal_state_resets_error(self, db):
+    @pytest.mark.asyncio
+    async def test_request_handoff_after_terminal_state_resets_error(self, db):
         sid = "sess-3"
-        self._make_session(db, sid)
-        db.request_handoff(sid, "telegram")
-        db.claim_handoff(sid)
-        db.fail_handoff(sid, "earlier failure")
+        await self._make_session(db, sid)
+        await db.request_handoff(sid, "telegram")
+        await db.claim_handoff(sid)
+        await db.fail_handoff(sid, "earlier failure")
 
         # User retries — should be allowed and clear the prior error.
-        assert db.request_handoff(sid, "discord") is True
-        state = db.get_handoff_state(sid)
+        assert await db.request_handoff(sid, "discord") is True
+        state = await db.get_handoff_state(sid)
         assert state["state"] == "pending"
         assert state["platform"] == "discord"
         assert state["error"] is None
 
-    def test_list_pending_handoffs_excludes_running_and_terminal(self, db):
+    @pytest.mark.asyncio
+    async def test_list_pending_handoffs_excludes_running_and_terminal(self, db):
         a, b, c, d = "sess-a", "sess-b", "sess-c", "sess-d"
         for sid in (a, b, c, d):
-            self._make_session(db, sid)
+            await self._make_session(db, sid)
 
-        db.request_handoff(a, "telegram")
-        db.request_handoff(b, "discord")
-        db.request_handoff(c, "telegram")
-        db.claim_handoff(c)  # c is now running, not pending
-        db.request_handoff(d, "slack")
-        db.claim_handoff(d)
-        db.complete_handoff(d)  # d is terminal
+        await db.request_handoff(a, "telegram")
+        await db.request_handoff(b, "discord")
+        await db.request_handoff(c, "telegram")
+        await db.claim_handoff(c)  # c is now running, not pending
+        await db.request_handoff(d, "slack")
+        await db.claim_handoff(d)
+        await db.complete_handoff(d)  # d is terminal
 
-        pending = db.list_pending_handoffs()
+        pending = await db.list_pending_handoffs()
         ids = [r["id"] for r in pending]
         assert set(ids) == {a, b}
 
-    def test_claim_handoff_is_atomic(self, db):
+    @pytest.mark.asyncio
+    async def test_claim_handoff_is_atomic(self, db):
         sid = "sess-claim"
-        self._make_session(db, sid)
-        db.request_handoff(sid, "telegram")
+        await self._make_session(db, sid)
+        await db.request_handoff(sid, "telegram")
 
         # First claim wins
-        assert db.claim_handoff(sid) is True
+        assert await db.claim_handoff(sid) is True
         # Second claim is a no-op (state is now "running", not "pending")
-        assert db.claim_handoff(sid) is False
-        assert db.get_handoff_state(sid)["state"] == "running"
+        assert await db.claim_handoff(sid) is False
+        assert (await db.get_handoff_state(sid))["state"] == "running"
 
-    def test_complete_handoff_clears_error(self, db):
+    @pytest.mark.asyncio
+    async def test_complete_handoff_clears_error(self, db):
         sid = "sess-complete"
-        self._make_session(db, sid)
-        db.request_handoff(sid, "telegram")
-        db.claim_handoff(sid)
-        db.fail_handoff(sid, "transient")
+        await self._make_session(db, sid)
+        await db.request_handoff(sid, "telegram")
+        await db.claim_handoff(sid)
+        await db.fail_handoff(sid, "transient")
         # User retries; mock the watcher path
-        db.request_handoff(sid, "telegram")
-        db.claim_handoff(sid)
-        db.complete_handoff(sid)
+        await db.request_handoff(sid, "telegram")
+        await db.claim_handoff(sid)
+        await db.complete_handoff(sid)
 
-        state = db.get_handoff_state(sid)
+        state = await db.get_handoff_state(sid)
         assert state["state"] == "completed"
         assert state["error"] is None
 
-    def test_fail_handoff_records_reason(self, db):
+    @pytest.mark.asyncio
+    async def test_fail_handoff_records_reason(self, db):
         sid = "sess-fail"
-        self._make_session(db, sid)
-        db.request_handoff(sid, "telegram")
-        db.claim_handoff(sid)
-        db.fail_handoff(sid, "no home channel for telegram")
+        await self._make_session(db, sid)
+        await db.request_handoff(sid, "telegram")
+        await db.claim_handoff(sid)
+        await db.fail_handoff(sid, "no home channel for telegram")
 
-        state = db.get_handoff_state(sid)
+        state = await db.get_handoff_state(sid)
         assert state["state"] == "failed"
         assert state["error"] == "no home channel for telegram"
 
-    def test_fail_handoff_truncates_long_reasons(self, db):
+    @pytest.mark.asyncio
+    async def test_fail_handoff_truncates_long_reasons(self, db):
         sid = "sess-fail-long"
-        self._make_session(db, sid)
-        db.request_handoff(sid, "telegram")
-        db.claim_handoff(sid)
+        await self._make_session(db, sid)
+        await db.request_handoff(sid, "telegram")
+        await db.claim_handoff(sid)
 
         # 1000-character error string
         big_err = "x" * 1000
-        db.fail_handoff(sid, big_err)
+        await db.fail_handoff(sid, big_err)
 
-        state = db.get_handoff_state(sid)
+        state = await db.get_handoff_state(sid)
         assert len(state["error"]) <= 500
 
-    def test_get_handoff_state_for_unknown_session(self, db):
-        assert db.get_handoff_state("does-not-exist") is None
+    @pytest.mark.asyncio
+    async def test_get_handoff_state_for_unknown_session(self, db):
+        assert await db.get_handoff_state("does-not-exist") is None
 
-    def test_full_pending_to_completed_flow(self, db):
+    @pytest.mark.asyncio
+    async def test_full_pending_to_completed_flow(self, db):
         """End-to-end sequence the CLI + gateway watcher follow."""
         sid = "sess-flow"
-        self._make_session(db, sid, title="my session")
-        db.append_message(sid, "user", "Hello")
-        db.append_message(sid, "assistant", "Hi there!")
+        await self._make_session(db, sid, title="my session")
+        await db.append_message(sid, "user", "Hello")
+        await db.append_message(sid, "assistant", "Hi there!")
 
         # CLI: request handoff
-        assert db.request_handoff(sid, "telegram") is True
-        assert db.get_handoff_state(sid)["state"] == "pending"
+        assert await db.request_handoff(sid, "telegram") is True
+        assert (await db.get_handoff_state(sid))["state"] == "pending"
 
         # Gateway watcher: discover + claim
-        pending = db.list_pending_handoffs()
+        pending = await db.list_pending_handoffs()
         assert len(pending) == 1
         assert pending[0]["id"] == sid
-        assert db.claim_handoff(sid) is True
-        assert db.get_handoff_state(sid)["state"] == "running"
+        assert await db.claim_handoff(sid) is True
+        assert (await db.get_handoff_state(sid))["state"] == "running"
 
         # Gateway uses get_messages to load the transcript (real flow uses
         # session_store.switch_session which reads the same table).
-        messages = db.get_messages(sid)
+        messages = await db.get_messages(sid)
         assert [m["role"] for m in messages] == ["user", "assistant"]
 
         # Gateway: mark completed
-        db.complete_handoff(sid)
-        assert db.get_handoff_state(sid)["state"] == "completed"
-        assert db.list_pending_handoffs() == []
+        await db.complete_handoff(sid)
+        assert (await db.get_handoff_state(sid))["state"] == "completed"
+        assert await db.list_pending_handoffs() == []
 
 
 class TestHandoffCommandRegistration:

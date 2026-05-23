@@ -836,6 +836,46 @@ import pytest_postgresql.factories as pg_factories
 from alembic import command
 from alembic.config import Config
 
+# ── Pre-session template DB cleanup ──────────────────────────────────────────
+#
+# pytest-postgresql creates a template DB (hermes_tmpl) once per session and
+# clones it for each per-test DB.  The template is NOT dropped at session end
+# (it's intentionally reused for speed).  On a second run in the same docker-
+# compose cluster the CREATE DATABASE ... IS_TEMPLATE = true call fails with
+# DuplicateDatabase because the template already exists.
+#
+# Fix: drop the template before pytest-postgresql tries to create it.  Use the
+# same DatabaseJanitor used internally so all the "unmark template, terminate
+# connections, drop" steps run correctly.  Silently skip if the DB doesn't
+# exist (first-ever run) or if PG is not reachable (unit-only run without PG).
+
+@pytest.fixture(scope="session", autouse=True)
+def _drop_pg_template_if_stale():
+    """Drop hermes_tmpl from the docker-compose cluster before the session starts.
+
+    This lets pytest-postgresql recreate a fresh template on every pytest run
+    without hitting 'DuplicateDatabase: hermes_tmpl already exists'.
+    Silently no-ops when PG is unreachable (pure unit-test runs without Docker).
+    """
+    from pytest_postgresql.janitor import DatabaseJanitor
+    try:
+        janitor = DatabaseJanitor(
+            user=os.environ.get("POSTGRES_USER", "hermes"),
+            password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
+            host="localhost",
+            port=int(os.environ.get("POSTGRES_PORT", "5432")),
+            dbname="hermes_tmpl",
+            as_template=True,
+            version="17",  # ignored for drop(); any valid semver string works
+            connection_timeout=3,
+        )
+        janitor.drop()
+    except Exception:
+        # PG not running, DB doesn't exist, or any other error — ignore.
+        pass
+    yield
+
+
 postgresql_noproc = pg_factories.postgresql_noproc(
     host="localhost",
     port=int(os.environ.get("POSTGRES_PORT", "5432")),
