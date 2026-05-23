@@ -23,7 +23,7 @@ class _StubDB:
         self.rows = rows
         self.calls: list[dict] = []
 
-    def list_sessions_rich(self, **kwargs):
+    async def list_sessions_rich(self, **kwargs):
         self.calls.append(kwargs)
         return list(self.rows)
 
