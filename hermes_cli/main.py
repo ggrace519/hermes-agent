@@ -10852,12 +10852,11 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def main():
     """Main entry point for hermes CLI."""
-    # Initialize PG pool if HERMES_PG_DSN is set; otherwise proceed with legacy path
-    try:
-        from hermes_bootstrap import init_db_sync
-        init_db_sync()
-    except RuntimeError:
-        pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+    # PG pool initialisation is lazy: ``hermes_db.pool()`` auto-inits from
+    # HERMES_PG_DSN on first use. Subcommands like ``hermes --help`` or
+    # ``hermes version`` that never touch the DB do not require a live
+    # PG connection (or even a configured DSN). This is what lets the Nix
+    # sandbox smoke (`hermes --help | grep gateway`) succeed without PG.
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:

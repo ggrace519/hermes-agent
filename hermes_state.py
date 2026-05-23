@@ -53,6 +53,18 @@ class _AsyncSessionDB:
     wrap with `hermes_db.run_sync(...)`.
     """
 
+    def __init__(self, db_path: Optional[Path] = None, **_legacy_kwargs: Any) -> None:
+        # db_path and other legacy SQLite kwargs are accepted for backward
+        # compatibility with call sites that still pass the old signature
+        # (e.g. acp_adapter/session.py and several test suites). They are
+        # ignored — storage is the process-wide asyncpg pool, not a file path.
+        if db_path is not None or _legacy_kwargs:
+            logger.debug(
+                "_AsyncSessionDB ignoring legacy SQLite kwargs (db_path=%r, others=%s)",
+                db_path,
+                sorted(_legacy_kwargs.keys()),
+            )
+
     # === Session lifecycle (Task 8) ===
 
     async def create_session(self, session_id: str, source: str, **kwargs) -> str:

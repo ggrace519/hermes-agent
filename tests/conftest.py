@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -27,6 +28,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+logger = logging.getLogger(__name__)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -855,24 +858,63 @@ def _drop_pg_template_if_stale():
 
     This lets pytest-postgresql recreate a fresh template on every pytest run
     without hitting 'DuplicateDatabase: hermes_tmpl already exists'.
-    Silently no-ops when PG is unreachable (pure unit-test runs without Docker).
+
+    Race-safety:
+      * We connect directly to the `postgres` maintenance DB (NOT via
+        DatabaseJanitor, which issues ALTER DATABASE unconditionally and
+        races with pytest-postgresql's own template setup path on a clean
+        cluster — the ALTER would land before the DB existed).
+      * We check `pg_database` first and bail out cleanly if `hermes_tmpl`
+        doesn't exist, so we never issue ALTER/DROP against a missing DB.
+      * Steps run with autocommit and IF EXISTS where possible, so a
+        concurrent drop from another worker is harmless.
+
+    Silently no-ops when PG is unreachable (pure unit-test runs without
+    Docker). Exception type and traceback are logged at DEBUG so the
+    failure mode is visible when -o log_cli_level=DEBUG is enabled.
     """
-    from pytest_postgresql.janitor import DatabaseJanitor
     try:
-        janitor = DatabaseJanitor(
-            user=os.environ.get("POSTGRES_USER", "hermes"),
-            password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
-            host="localhost",
-            port=int(os.environ.get("POSTGRES_PORT", "5432")),
-            dbname="hermes_tmpl",
-            as_template=True,
-            version="17",  # ignored for drop(); any valid semver string works
-            connection_timeout=3,
+        import psycopg  # type: ignore[import-not-found]
+    except ImportError as exc:
+        logger.debug("psycopg unavailable, skipping hermes_tmpl cleanup: %s", exc)
+        yield
+        return
+
+    user = os.environ.get("POSTGRES_USER", "hermes")
+    password = os.environ.get("POSTGRES_PASSWORD", "hermes")
+    port = int(os.environ.get("POSTGRES_PORT", "5432"))
+    dsn = f"postgresql://{user}:{password}@localhost:{port}/postgres"
+
+    try:
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = 'hermes_tmpl'"
+                )
+                if cur.fetchone() is None:
+                    # First-ever run or already cleaned — nothing to do, and
+                    # critically: don't ALTER a DB pytest-postgresql is about
+                    # to create.
+                    yield
+                    return
+                # Unmark template so DROP is permitted, evict any sessions
+                # holding the DB open, then drop.
+                cur.execute("ALTER DATABASE hermes_tmpl IS_TEMPLATE false")
+                cur.execute(
+                    "SELECT pg_terminate_backend(pid) "
+                    "FROM pg_stat_activity "
+                    "WHERE datname = 'hermes_tmpl' AND pid <> pg_backend_pid()"
+                )
+                cur.execute("DROP DATABASE IF EXISTS hermes_tmpl")
+    except Exception as exc:
+        # PG not running, permission denied, concurrent drop from another
+        # worker — all benign. Log the type so debugging isn't blind.
+        logger.debug(
+            "hermes_tmpl cleanup skipped (%s): %s",
+            type(exc).__name__,
+            exc,
+            exc_info=True,
         )
-        janitor.drop()
-    except Exception:
-        # PG not running, DB doesn't exist, or any other error — ignore.
-        pass
     yield
 
 

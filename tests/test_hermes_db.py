@@ -53,11 +53,37 @@ async def test_transaction_rolls_back_on_exception(initialized_db):
     assert exists is False
 
 
-def test_pool_raises_before_init():
+def test_pool_raises_before_init(monkeypatch):
     # Reset module state for this synchronous test.
     hermes_db._pool = None
+    # ``pool()`` now lazy-initialises from ``HERMES_PG_DSN`` when present, so
+    # to assert the "init not called" RuntimeError we must also ensure no
+    # DSN is in the environment (otherwise lazy init kicks in and returns a
+    # real pool).
+    monkeypatch.delenv("HERMES_PG_DSN", raising=False)
     with pytest.raises(RuntimeError, match="hermes_db.init"):
         hermes_db.pool()
+
+
+def test_pool_lazy_initialises_from_env(hermes_db_dsn, monkeypatch):
+    """When HERMES_PG_DSN is set and ``init()`` was never called explicitly,
+    ``pool()`` must bootstrap the pool on first use.
+
+    This is what lets CLI subcommands skip eager init in their ``main()`` —
+    DB-touching code paths still get a working pool, while ``--help``/version
+    paths never reach this function.
+    """
+    # Tear down any pool the test fixtures might have created.
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db._pool is None
+    monkeypatch.setenv("HERMES_PG_DSN", hermes_db_dsn)
+    try:
+        p = hermes_db.pool()
+        assert p is not None
+        assert hermes_db._pool is p
+    finally:
+        hermes_db.run_sync(hermes_db.close())
 
 
 def test_run_sync_executes_coroutine_synchronously():
@@ -68,6 +94,19 @@ def test_run_sync_executes_coroutine_synchronously():
 
 @pytest.mark.asyncio
 async def test_jsonb_codec_returns_python_objects(initialized_db):
+    # Per DECISIONS.md "Phase 0 delivered" ADR: never use ``::jsonb`` casts
+    # — they corrupt asyncpg's statement type cache. Use a real jsonb-typed
+    # column so the codec drives both encode (dict → jsonb) and decode
+    # (jsonb → dict) paths through a parameterised binding.
+    payload = {"a": 1, "b": [2, 3]}
     async with hermes_db.connection() as conn:
-        result = await conn.fetchval("SELECT '{\"a\":1,\"b\":[2,3]}'::jsonb")
-    assert result == {"a": 1, "b": [2, 3]}
+        await conn.execute("CREATE TEMP TABLE _jsonb_codec_probe (data jsonb)")
+        try:
+            await conn.execute(
+                "INSERT INTO _jsonb_codec_probe (data) VALUES ($1)",
+                payload,
+            )
+            result = await conn.fetchval("SELECT data FROM _jsonb_codec_probe")
+        finally:
+            await conn.execute("DROP TABLE _jsonb_codec_probe")
+    assert result == payload
