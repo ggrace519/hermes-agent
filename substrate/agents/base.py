@@ -136,7 +136,11 @@ class SubAgent(ABC):
         )
         try:
             while not self._stopped.is_set():
-                interval = _INTERVAL_BY_LEVEL[self._level]
+                # Call ``self._interval_for(...)`` so subclasses can
+                # override the mapping (e.g. partition-maintenance
+                # forces a fixed 24h cadence regardless of intensity).
+                # The base implementation looks up _INTERVAL_BY_LEVEL.
+                interval = self._interval_for(self._level)
                 if interval is None:  # OFF
                     await asyncio.sleep(_OFF_POLL_INTERVAL)
                     continue
