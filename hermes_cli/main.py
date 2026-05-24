@@ -10587,7 +10587,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "substrate", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
