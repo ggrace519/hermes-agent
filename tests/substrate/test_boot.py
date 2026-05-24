@@ -1,0 +1,206 @@
+"""Tests for ``Substrate.boot()`` end-to-end (spec §8 + §11.2 test cases).
+
+Exercises:
+* Alembic-head check — refuses to boot if the schema is on an earlier
+  revision (mocked).
+* All §9 streams auto-register at boot.
+* Sub-agent tasks are spawned and running.
+* ``shutdown()`` stops the sub-agents within the timeout.
+* The substrate does NOT open its own asyncpg pool.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+import pytest_asyncio
+
+from substrate import Substrate
+from substrate.events import hermes_hooks
+from substrate.facade import _autoregister_specs
+
+
+@pytest_asyncio.fixture
+async def booted_no_subagents(hermes_db_initialized):
+    sub = await Substrate.boot(start_subagents=False)
+    yield sub
+    await sub.shutdown()
+
+
+@pytest_asyncio.fixture
+async def booted_with_subagents(hermes_db_initialized):
+    sub = await Substrate.boot(start_subagents=True)
+    yield sub
+    await sub.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Alembic head check.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_boot_passes_alembic_head_check(booted_no_subagents):
+    """The Phase-0 ``hermes_db_initialized`` fixture already ran alembic
+    upgrade head; boot should accept the revision without raising."""
+    # If we got here without raising, the head check passed.
+    assert booted_no_subagents is not None
+
+
+@pytest.mark.asyncio
+async def test_boot_refuses_old_alembic_head(hermes_db_initialized, monkeypatch):
+    """When the DB is on an older revision (mocked), boot raises so the
+    caller knows to migrate (or set HERMES_AUTO_MIGRATE=1)."""
+    import hermes_db
+
+    # Replace the version_num value via SQL — pretend the DB is one
+    # revision behind.
+    async with hermes_db.connection() as conn:
+        await conn.execute(
+            "UPDATE alembic_version SET version_num = '20260522_0002'"
+        )
+
+    with pytest.raises(RuntimeError, match="alembic head"):
+        await Substrate.boot(start_subagents=False)
+
+
+# ---------------------------------------------------------------------------
+# Stream auto-registration.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streams_autoregister(booted_no_subagents):
+    """After boot, every §9 stream exists as ACTIVE.
+
+    The migration seeds ``substrate.self_state``; boot adds the rest.
+    The full §9 list is 15 streams.
+    """
+    import hermes_db
+
+    expected_names = {name for (name, *_rest) in _autoregister_specs()}
+    expected_names.add("substrate.self_state")
+    assert len(expected_names) == 15  # spec §9
+
+    async with hermes_db.connection() as conn:
+        rows = await conn.fetch(
+            "SELECT name, lifecycle_state FROM substrate_streams"
+        )
+    by_name = {r["name"]: r["lifecycle_state"] for r in rows}
+    for name in expected_names:
+        assert name in by_name, f"stream missing after boot: {name}"
+        assert by_name[name] == "active"
+
+
+@pytest.mark.asyncio
+async def test_streams_autoregister_idempotent(booted_no_subagents):
+    """Re-running auto-register doesn't duplicate streams (the ON
+    CONFLICT (name) DO NOTHING path)."""
+    import hermes_db
+
+    async with hermes_db.connection() as conn:
+        before = await conn.fetchval("SELECT count(*) FROM substrate_streams")
+
+    # Run the auto-register helper again on the same booted substrate.
+    await booted_no_subagents._autoregister_streams()
+
+    async with hermes_db.connection() as conn:
+        after = await conn.fetchval("SELECT count(*) FROM substrate_streams")
+    assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent lifecycle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagents_running(booted_with_subagents):
+    """Sentinel + force-reject + partition-maintenance tasks exist and
+    are running after boot."""
+    agents = booted_with_subagents.subagents
+    assert set(agents.keys()) == {"sentinel", "force-reject", "partition-maintenance"}
+    for name, agent in agents.items():
+        task = agent.task
+        assert task is not None, f"{name} has no task"
+        assert not task.done(), f"{name} task already exited: {task}"
+
+
+@pytest.mark.asyncio
+async def test_subagents_not_started_when_disabled(booted_no_subagents):
+    """``start_subagents=False`` constructs the substrate without
+    spawning any tasks; conductor is still instantiated."""
+    assert booted_no_subagents.subagents == {}
+    assert booted_no_subagents.conductor is not None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_subagents(hermes_db_initialized):
+    """``shutdown()`` cancels every sub-agent task within the bounded
+    shutdown timeout."""
+    sub = await Substrate.boot(start_subagents=True)
+    tasks = [agent.task for agent in sub.subagents.values()]
+    await sub.shutdown()
+
+    # Give the loop one cycle to settle the cancellation.
+    await asyncio.sleep(0)
+    for task in tasks:
+        assert task is None or task.done()
+    assert sub.subagents == {}
+    assert sub.conductor is None
+
+
+@pytest.mark.asyncio
+async def test_shutdown_unbinds_hooks(booted_with_subagents):
+    """``shutdown()`` resets the module-global so subsequent hook calls
+    are silent no-ops."""
+    # Sanity: the binding is live while booted.
+    assert hermes_hooks._substrate is booted_with_subagents
+    await booted_with_subagents.shutdown()
+    assert hermes_hooks._substrate is None
+
+
+# ---------------------------------------------------------------------------
+# Pool ownership — substrate must not create its own pool.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_does_not_open_own_pool(monkeypatch, hermes_db_initialized):
+    """``Substrate.boot()`` must reuse ``hermes_db.pool()`` — it must
+    NOT call ``asyncpg.create_pool`` directly."""
+    import asyncpg
+
+    create_calls = 0
+    real_create = asyncpg.create_pool
+
+    async def _spy(*args, **kwargs):
+        nonlocal create_calls
+        create_calls += 1
+        return await real_create(*args, **kwargs)
+
+    monkeypatch.setattr("asyncpg.create_pool", _spy)
+    sub = await Substrate.boot(start_subagents=False)
+    try:
+        # The hermes_db fixture initialised the pool BEFORE we replaced
+        # the symbol, so any create_pool call during ``Substrate.boot``
+        # would be by substrate code itself.
+        assert create_calls == 0, "Substrate must not call asyncpg.create_pool"
+    finally:
+        await sub.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_close_pool(booted_with_subagents):
+    """``Substrate.shutdown()`` does NOT close ``hermes_db.pool()`` —
+    that's the responsibility of ``hermes_db.close()`` which is owned
+    by Hermes's own shutdown sequence."""
+    import hermes_db
+
+    pool = hermes_db.pool()
+    await booted_with_subagents.shutdown()
+    # The pool is still usable after substrate shutdown.
+    async with pool.acquire() as conn:
+        v = await conn.fetchval("SELECT 1")
+    assert v == 1
