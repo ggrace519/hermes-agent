@@ -3,6 +3,7 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import logging
 import re
 import sqlite3
 import threading
@@ -12,6 +13,53 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+
+_log = logging.getLogger(__name__)
+
+
+# Filesystem markers for WAL-mode incompatibility. Mirrors the pre-Phase-0
+# ``hermes_state.apply_wal_with_fallback`` helper that was deleted when the
+# session DB moved to PostgreSQL. The holographic store still uses SQLite
+# locally, so we keep a private copy of the helper here.
+_WAL_INCOMPAT_MARKERS = (
+    "locking protocol",
+    "database is locked",
+    "disk i/o error",
+)
+
+# Module-level dedup: log the WAL-fallback warning only once per
+# (process, db_label) pair so a re-opened HolographicStore on NFS doesn't
+# spam the log.
+_wal_fallback_warned: set[str] = set()
+
+
+def _apply_wal_with_fallback(conn: sqlite3.Connection, *, db_label: str) -> str:
+    """Set ``journal_mode=WAL`` on ``conn``; fall back to DELETE if the
+    filesystem rejects WAL. Returns the mode actually applied.
+
+    Replaces the removed ``hermes_state.apply_wal_with_fallback`` helper.
+    The session DB no longer needs WAL — it moved to PostgreSQL in
+    Phase 0 — but the holographic memory store and the gateway's
+    response_store still use SQLite locally.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return "wal"
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
+            raise
+        if db_label not in _wal_fallback_warned:
+            _wal_fallback_warned.add(db_label)
+            _log.warning(
+                "%s: WAL unsupported on this filesystem (%s) — "
+                "falling back to journal_mode=DELETE.",
+                db_label,
+                exc,
+            )
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return "delete"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -127,11 +175,11 @@ class MemoryStore:
 
     def _init_db(self) -> None:
         """Create tables, indexes, and triggers if they do not exist. Enable WAL mode."""
-        # Use the shared WAL-fallback helper so memory_store.db degrades
-        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same issue as
-        # state.db / kanban.db — see hermes_state._WAL_INCOMPAT_MARKERS).
-        from hermes_state import apply_wal_with_fallback
-        apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
+        # Use the local WAL-fallback helper so memory_store.db degrades
+        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME. The shared
+        # helper that used to live in hermes_state was removed when the
+        # session DB moved to PostgreSQL in Phase 0.
+        _apply_wal_with_fallback(self._conn, db_label="memory_store.db (holographic)")
         self._conn.executescript(_SCHEMA)
         # Migrate: add hrr_vector column if missing (safe for existing databases)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
