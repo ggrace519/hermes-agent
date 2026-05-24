@@ -1,0 +1,96 @@
+# Test-runner image — lean Debian + Python 3.11 + uv + dev deps.
+#
+# Mirrors the GH Actions CI environment so failures reproduce locally.
+# Used by the `test-runner` service in docker-compose.yml under the
+# `test` profile. NOT used for production runtime — see the top-level
+# Dockerfile for the production image.
+#
+# Build:
+#     docker compose --profile test build test-runner
+#
+# Run the full suite:
+#     docker compose --profile test up -d postgres-test
+#     docker compose --profile test run --rm test-runner \
+#         python scripts/run_tests_parallel.py
+#
+# Run a single file:
+#     docker compose --profile test run --rm test-runner \
+#         python -m pytest tests/substrate/ -o "addopts=" \
+#         --timeout-method=thread --timeout=300
+
+FROM ghcr.io/astral-sh/uv:0.11.6-python3.11-trixie@sha256:d5c8dc53a52c10064877507fc64ce084e08e0f9fce75d5134e43667c2ecc0b7b AS uv_source
+
+FROM python:3.11-slim-trixie
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    # Tests need this so they don't try to use the host's real /root
+    # for cache directories.
+    HOME=/work \
+    # Force UV cache outside /work so the compose bind-mount doesn't
+    # hide it. Persist via a named volume in docker-compose.yml.
+    UV_CACHE_DIR=/opt/uv-cache \
+    UV_LINK_MODE=copy \
+    # The venv MUST live outside /work because compose bind-mounts the
+    # host source over /work and would hide an in-image /work/.venv.
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+# System deps — match what GH Actions provides + what tests need.
+# - ripgrep: used by many tests directly + grep tooling.
+# - git: pytest discovery + some tests shell out to git.
+# - curl + ca-certificates: a handful of network-y tests + uv downloads.
+# - build-essential + libffi-dev: native extensions during `uv pip install`.
+# - libpq-dev: psycopg/asyncpg native build path (already shipped wheels in
+#   most cases, but the headers are cheap insurance for unusual extras).
+# - postgresql-client: pg_isready + psql for diagnostics from inside the
+#   test container.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        libffi-dev \
+        libpq-dev \
+        postgresql-client \
+        ripgrep && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+
+WORKDIR /work
+
+# ---------- Layer-cached Python dependency install ----------
+# Copy only pyproject.toml + uv.lock so the venv layer is cached across
+# source-only changes. CI uses `uv pip install -e ".[all,dev]"`; we do
+# the same — but into /opt/venv so the compose bind-mount over /work
+# doesn't hide it.
+COPY pyproject.toml uv.lock ./
+RUN touch README.md
+RUN uv venv /opt/venv --python 3.11
+RUN uv pip install -e ".[all,dev]"
+
+# ---------- Source code ----------
+# The compose service bind-mounts the host source over this at runtime
+# (so test edits don't require a rebuild), but the build-time COPY is
+# kept so `docker build` produces a self-contained image that can be
+# used WITHOUT the bind-mount (for CI experiments).
+COPY . .
+
+# Re-install in editable mode now that source is present. Cheap (no
+# dep resolution; just registers the package).
+RUN uv pip install --no-deps -e "."
+
+# Default test environment — overridden by docker-compose at run time
+# but documents the intent.
+ENV HERMES_PG_DSN=postgresql://hermes:hermes@postgres-test:5432/hermes
+ENV HERMES_TEST_POSTGRES_PORT=5432
+ENV TZ=UTC
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONHASHSEED=0
+
+# Default command is the parallel test runner. Override with `run --rm
+# test-runner <other-command>` for ad-hoc invocations.
+CMD ["python", "scripts/run_tests_parallel.py"]
