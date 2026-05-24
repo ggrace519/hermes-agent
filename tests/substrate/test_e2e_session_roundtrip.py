@@ -152,6 +152,61 @@ async def test_inspect_summary_after_roundtrip_is_nonempty(booted):
 
 
 @pytest.mark.asyncio
+async def test_end_session_emits_substrate_slice(booted):
+    """``SessionDB.end_session`` emits a ``session_end`` lifecycle slice
+    when it actually flips a session from open → ended; a redundant
+    call (already-ended session) is a no-op and does NOT emit.
+
+    Mirrors the on_session_start chokepoint wiring in
+    ``create_session`` so the substrate sees the full session
+    lifecycle without per-call-site hook plumbing.
+    """
+    import hermes_db
+    from hermes_state import _AsyncSessionDB
+
+    db = _AsyncSessionDB()
+    sid = await db.create_session(
+        session_id="e2e-end-1", source="cli", model="m"
+    )
+
+    # First end_session call should emit a session_end slice.
+    await db.end_session(sid, "user_quit")
+
+    async with hermes_db.connection() as conn:
+        end_count_first = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM substrate_slices sl
+             JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE st.name = 'hermes.self_state.session_lifecycle'
+               AND sl.payload->>'session_id' = $1
+               AND sl.payload->>'event' = 'session_end'
+            """,
+            sid,
+        )
+    assert end_count_first == 1
+
+    # Second end_session is a no-op against the row (already ended);
+    # therefore no new substrate slice — the wiring guards on the
+    # ``UPDATE 1`` command tag.
+    await db.end_session(sid, "another_reason")
+
+    async with hermes_db.connection() as conn:
+        end_count_second = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM substrate_slices sl
+             JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE st.name = 'hermes.self_state.session_lifecycle'
+               AND sl.payload->>'session_id' = $1
+               AND sl.payload->>'event' = 'session_end'
+            """,
+            sid,
+        )
+    assert end_count_second == 1, (
+        "redundant end_session call should NOT emit a second slice"
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_start_shares_txn_with_session_row(booted):
     """The atomicity wired into ``SessionDB.create_session`` is verifiable
     end-to-end: if we set up a stream so the substrate INSERT fails after
