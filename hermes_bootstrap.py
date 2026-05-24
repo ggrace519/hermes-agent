@@ -162,3 +162,60 @@ def init_db_sync() -> None:
     asyncio.run(hermes_db.init(dsn))
     atexit.register(lambda: asyncio.run(hermes_db.close()) if hermes_db._pool else None)
     _db_initialized = True
+
+
+# ---------------------------------------------------------------------------
+# Substrate bootstrap helper (Phase A Task 14)
+# ---------------------------------------------------------------------------
+#
+# Called after init_db_sync / hermes_db.init has populated the asyncpg pool.
+# Pure-async entry points (gateway/run.py) ``await bootstrap_substrate()``
+# from inside asyncio.run(); sync entry points use the sync wrapper which
+# bridges via hermes_db.run_sync.
+#
+# Bootstrap failure is non-fatal: a logged warning, no substrate emission,
+# Hermes runs as before (Phase A spec §0 — substrate failures must not
+# crash Hermes).
+
+_substrate_booted = False
+_substrate_handle: "object | None" = None
+
+
+async def bootstrap_substrate(log=None):
+    """Boot the substrate and bind perception hooks. Idempotent.
+
+    Returns the Substrate instance (or ``None`` if boot failed). Failures
+    are logged as warnings and the function returns ``None`` so the
+    caller (Hermes startup) can proceed without substrate emission.
+
+    Tests that need a deterministic substrate construct it directly via
+    ``Substrate.from_pool``; this helper is for production startup.
+    """
+    global _substrate_booted, _substrate_handle
+    if _substrate_booted:
+        return _substrate_handle
+    import logging
+
+    log = log or logging.getLogger("substrate.bootstrap")
+    try:
+        from substrate import Substrate
+
+        substrate = await Substrate.boot(log=log)
+        _substrate_handle = substrate
+        _substrate_booted = True
+        return substrate
+    except Exception:
+        log.exception("substrate.bootstrap.failed — Hermes continues without substrate emission")
+        return None
+
+
+def bootstrap_substrate_sync(log=None):
+    """Sync facade for ``bootstrap_substrate``.
+
+    Bridges via :func:`hermes_db.run_sync`. Must NOT be called from inside
+    a running event loop — async entry points should ``await
+    bootstrap_substrate(log)`` directly.
+    """
+    import hermes_db
+
+    return hermes_db.run_sync(bootstrap_substrate(log=log))

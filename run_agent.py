@@ -4072,6 +4072,13 @@ def main(
     except RuntimeError:
         pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
 
+    # Phase A: bootstrap the substrate so perception hooks emit slices.
+    try:
+        from hermes_bootstrap import bootstrap_substrate_sync
+        bootstrap_substrate_sync()
+    except Exception:  # noqa: BLE001 — defensive, substrate failure is non-fatal
+        pass
+
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
 

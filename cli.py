@@ -14276,6 +14276,14 @@ def main(
     except RuntimeError:
         pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
 
+    # Phase A: bootstrap the substrate so perception hooks emit slices.
+    # Non-fatal — substrate failure must not crash Hermes (spec §0).
+    try:
+        from hermes_bootstrap import bootstrap_substrate_sync
+        bootstrap_substrate_sync()
+    except Exception:  # noqa: BLE001 — defensive
+        pass
+
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
     # UnicodeEncodeError on cp1252.  No-op on Linux/macOS.

@@ -1290,6 +1290,17 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    # Substrate cron_dispatch perception. Fires per dispatched job,
+    # before the prompt-build (which may raise on an injection scanner
+    # hit). The hook is a no-op when substrate isn't booted, and its
+    # own try/except inside swallows any emission failure.
+    try:
+        from datetime import datetime, timezone
+        from substrate.events.hermes_hooks import on_cron_fire as _sub_cron_fire
+        _sub_cron_fire(str(job_id), datetime.now(timezone.utc))
+    except Exception:  # noqa: BLE001 — substrate failures non-fatal
+        pass
+
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
     except CronPromptInjectionBlocked as block_exc:
@@ -1806,6 +1817,13 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         init_db_sync()
     except RuntimeError:
         pass  # No HERMES_PG_DSN → legacy path still works during cutover period.
+
+    # Phase A: bootstrap the substrate so on_cron_fire emissions land.
+    try:
+        from hermes_bootstrap import bootstrap_substrate_sync
+        bootstrap_substrate_sync()
+    except Exception:  # noqa: BLE001 — defensive, substrate failure is non-fatal
+        pass
 
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
