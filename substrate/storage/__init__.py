@@ -1,13 +1,20 @@
 """Substrate storage layer — repositories over the shared asyncpg pool.
 
-All repos are async and accept an explicit ``asyncpg.Connection`` so the
-caller controls transactions. Repos hold a ``hermes_db.pool()`` reference
-only for the read-only, no-txn-needed methods (e.g. ``StreamRepo.get``).
-
-Phase A build status: types + enums are present; repositories land in
-Task 6 of the Phase A plan and start exporting once they exist.
+All repos are async. Repos that participate in caller-controlled
+transactions accept an explicit ``asyncpg.Connection`` argument;
+read-only no-txn helpers may acquire from the shared
+``hermes_db.pool()`` themselves.
 """
 
+from substrate.storage.decay_profiles import (
+    DEFAULT_BINARY_PROFILE,
+    DEFAULT_SIGNAL_PROFILE,
+    DEFAULT_STRUCTURED_PROFILE,
+    DEFAULT_TEXT_PROFILE,
+    DecayProfileRepo,
+)
+from substrate.storage.slices import SliceRepo
+from substrate.storage.streams import StreamRepo
 from substrate.storage.types import (
     Address,
     ConsolidationState,
@@ -24,12 +31,19 @@ from substrate.storage.types import (
 __all__ = [
     "Address",
     "ConsolidationState",
+    "DEFAULT_BINARY_PROFILE",
+    "DEFAULT_SIGNAL_PROFILE",
+    "DEFAULT_STRUCTURED_PROFILE",
+    "DEFAULT_TEXT_PROFILE",
     "DecayProfile",
+    "DecayProfileRepo",
     "Family",
     "Lifecycle",
     "Modality",
     "SentinelState",
     "Slice",
+    "SliceRepo",
     "Stream",
+    "StreamRepo",
     "TombstonePolicy",
 ]
