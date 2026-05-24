@@ -254,7 +254,16 @@ markers = [
 # scripts/run_tests_parallel.py). Per-file isolation gives every test
 # file a fresh Python interpreter; pytest-timeout catches Python-level
 # hangs within a file.
-addopts = "-m 'not integration' --timeout=30 --timeout-method=signal --postgresql-drop-test-database"
+addopts = "-m 'not integration' --timeout=30 --timeout-method=signal"
+# Why not ``--postgresql-drop-test-database``? With per-subprocess worker
+# ids (PYTEST_XDIST_WORKER injected by scripts/run_tests_parallel.py),
+# each subprocess gets its own template DB name (e.g. ``hermesrun_42_tmpl``)
+# that never pre-exists. The drop flag tries to ``ALTER DATABASE … allow_
+# connections false`` before init(), which raises
+# ``InvalidCatalogName: database "…_tmpl" does not exist`` and kills the
+# session before any test runs. Skipping the upfront drop is safe because
+# pytest-postgresql calls CREATE DATABASE in ``with janitor:`` itself and
+# the per-subprocess names never collide.
 
 [tool.ty.environment]
 python-version = "3.13"
