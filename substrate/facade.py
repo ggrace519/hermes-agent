@@ -386,15 +386,19 @@ class Substrate:
             )
 
     def _spawn_subagents(self) -> None:
-        """Instantiate + ``start()`` the Phase A sub-agents.
+        """Instantiate + ``start()`` the Phase A + Phase B sub-agents.
 
         Order is deliberate:
           * partition-maintenance first — touches storage DDL, cheap.
           * force-reject second — protects the pending queue.
+          * curator third — real decay/release loop (Phase B).
           * sentinel last — the highest-frequency tick.
-        Conductor is instantiated but doesn't tick (Phase A stub).
+        Conductor is instantiated but doesn't tick (still a stub —
+        Phase B adds the push-on-set_intensity hook so live agents
+        pick up intensity changes within one tick).
         """
         from substrate.agents.conductor import StubConductor
+        from substrate.agents.curator import Curator
         from substrate.agents.force_reject import ForceRejectWorker
         from substrate.agents.partition_maintenance import (
             PartitionMaintenanceWorker,
@@ -405,8 +409,9 @@ class Substrate:
 
         partition = PartitionMaintenanceWorker(self)
         force_reject = ForceRejectWorker(self)
+        curator = Curator(self)
         sentinel = StubSentinel(self)
-        for agent in (partition, force_reject, sentinel):
+        for agent in (partition, force_reject, curator, sentinel):
             agent.start()
             self._subagents[agent.name] = agent
 

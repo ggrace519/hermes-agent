@@ -11,6 +11,16 @@ are internal substrate machinery, not part of the public Phase A
 surface.
 """
 
-from substrate.l0.api import commit_slice, commit_slice_sync
+from substrate.l0.api import (
+    commit_slice,
+    commit_slice_sync,
+    reinforce_slice,
+    reinforce_slice_sync,
+)
 
-__all__ = ["commit_slice", "commit_slice_sync"]
+__all__ = [
+    "commit_slice",
+    "commit_slice_sync",
+    "reinforce_slice",
+    "reinforce_slice_sync",
+]
