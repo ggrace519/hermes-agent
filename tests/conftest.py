@@ -841,81 +841,25 @@ from alembic.config import Config
 
 # ── Pre-session template DB cleanup ──────────────────────────────────────────
 #
-# pytest-postgresql creates a template DB (hermes_tmpl) once per session and
-# clones it for each per-test DB.  The template is NOT dropped at session end
-# (it's intentionally reused for speed).  On a second run in the same docker-
-# compose cluster the CREATE DATABASE ... IS_TEMPLATE = true call fails with
-# DuplicateDatabase because the template already exists.
+# pytest-postgresql 8.1 creates a template DB (``hermes_tmpl`` here, derived
+# from ``dbname="hermes"`` below) the first time the ``postgresql`` fixture
+# is requested, then clones it for each per-test DB. The template is meant
+# to survive across pytest sessions for speed.
 #
-# Fix: drop the template before pytest-postgresql tries to create it.  Use the
-# same DatabaseJanitor used internally so all the "unmark template, terminate
-# connections, drop" steps run correctly.  Silently skip if the DB doesn't
-# exist (first-ever run) or if PG is not reachable (unit-only run without PG).
-
-@pytest.fixture(scope="session", autouse=True)
-def _drop_pg_template_if_stale():
-    """Drop hermes_tmpl from the docker-compose cluster before the session starts.
-
-    This lets pytest-postgresql recreate a fresh template on every pytest run
-    without hitting 'DuplicateDatabase: hermes_tmpl already exists'.
-
-    Race-safety:
-      * We connect directly to the `postgres` maintenance DB (NOT via
-        DatabaseJanitor, which issues ALTER DATABASE unconditionally and
-        races with pytest-postgresql's own template setup path on a clean
-        cluster — the ALTER would land before the DB existed).
-      * We check `pg_database` first and bail out cleanly if `hermes_tmpl`
-        doesn't exist, so we never issue ALTER/DROP against a missing DB.
-      * Steps run with autocommit and IF EXISTS where possible, so a
-        concurrent drop from another worker is harmless.
-
-    Silently no-ops when PG is unreachable (pure unit-test runs without
-    Docker). Exception type and traceback are logged at DEBUG so the
-    failure mode is visible when -o log_cli_level=DEBUG is enabled.
-    """
-    try:
-        import psycopg  # type: ignore[import-not-found]
-    except ImportError as exc:
-        logger.debug("psycopg unavailable, skipping hermes_tmpl cleanup: %s", exc)
-        yield
-        return
-
-    user = os.environ.get("POSTGRES_USER", "hermes")
-    password = os.environ.get("POSTGRES_PASSWORD", "hermes")
-    port = int(os.environ.get("POSTGRES_PORT", "5432"))
-    dsn = f"postgresql://{user}:{password}@localhost:{port}/postgres"
-
-    try:
-        with psycopg.connect(dsn, autocommit=True, connect_timeout=3) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT 1 FROM pg_database WHERE datname = 'hermes_tmpl'"
-                )
-                if cur.fetchone() is None:
-                    # First-ever run or already cleaned — nothing to do, and
-                    # critically: don't ALTER a DB pytest-postgresql is about
-                    # to create.
-                    yield
-                    return
-                # Unmark template so DROP is permitted, evict any sessions
-                # holding the DB open, then drop.
-                cur.execute("ALTER DATABASE hermes_tmpl IS_TEMPLATE false")
-                cur.execute(
-                    "SELECT pg_terminate_backend(pid) "
-                    "FROM pg_stat_activity "
-                    "WHERE datname = 'hermes_tmpl' AND pid <> pg_backend_pid()"
-                )
-                cur.execute("DROP DATABASE IF EXISTS hermes_tmpl")
-    except Exception as exc:
-        # PG not running, permission denied, concurrent drop from another
-        # worker — all benign. Log the type so debugging isn't blind.
-        logger.debug(
-            "hermes_tmpl cleanup skipped (%s): %s",
-            type(exc).__name__,
-            exc,
-            exc_info=True,
-        )
-    yield
+# An earlier revision of this conftest dropped the template at session start
+# to work around a ``DuplicateDatabase: hermes_tmpl already exists`` error
+# on local reruns against the same Docker cluster — but that ALTERed an empty
+# (or absent) DB which then either raced with pytest-postgresql's own
+# create-template path (CI) or left a hole pytest-postgresql never refilled
+# (caching its template-exists state from the previous session).
+#
+# Current approach: don't pre-emptively drop. CI starts from a fresh
+# postgres container so the template doesn't exist. Local dev with a
+# persistent container handles re-runs because pytest-postgresql 8.1's
+# template creation is idempotent (CREATE DATABASE IF NOT EXISTS-style
+# via DatabaseJanitor at the fixture level). If a stale template is
+# blocking your local run, drop it once by hand:
+#     psql -U hermes -h localhost -c "DROP DATABASE IF EXISTS hermes_tmpl"
 
 
 postgresql_noproc = pg_factories.postgresql_noproc(
