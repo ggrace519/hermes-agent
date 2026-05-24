@@ -59,14 +59,14 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Sonnet 4.5 is the right balance for PR review — fast turnaround
-          # and strong at spotting concrete bugs. Bump to opus for deeper
-          # passes if review quality is insufficient.
-          model: claude-sonnet-4-5
-          # Treat large PRs gracefully — Hermes PRs occasionally touch
-          # dozens of files; the default review prompt handles this, but
-          # we bump the per-comment cap so the summary stays useful.
-          direct_prompt: |
+          # v1 schema: model selection goes into ``claude_args`` (passed
+          # through to the underlying ``claude`` CLI). v0's top-level
+          # ``model:`` input was removed.
+          claude_args: --model claude-sonnet-4-5
+          # v1 schema: ``prompt`` replaces v0's ``direct_prompt``.
+          # Pin the review to actionable items so the comment stays useful
+          # for the human reviewer.
+          prompt: |
             You are reviewing a pull request against ``main``. Produce a
             short Markdown summary (under 400 words) covering:
 
