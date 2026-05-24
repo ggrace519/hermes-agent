@@ -8,11 +8,13 @@ without re-plumbing.
 
 from substrate.agents.base import Level, SubAgent
 from substrate.agents.conductor import StubConductor
+from substrate.agents.curator import Curator
 from substrate.agents.force_reject import ForceRejectWorker
 from substrate.agents.partition_maintenance import PartitionMaintenanceWorker
 from substrate.agents.sentinel import StubSentinel, _trust_for_modality
 
 __all__ = [
+    "Curator",
     "ForceRejectWorker",
     "Level",
     "PartitionMaintenanceWorker",

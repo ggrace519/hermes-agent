@@ -42,13 +42,25 @@ class StubConductor:
         self._levels: dict[str, Level] = {}
 
     def set_intensity(self, agent_name: str, level: Level) -> None:
-        """Override the stored intensity for ``agent_name``.
+        """Override the stored intensity for ``agent_name`` AND push it
+        to a running sub-agent of the same name (Phase B §8.2).
 
-        Note: setting the level here does NOT update a running agent's
-        ``_level`` — Phase B+ wires the Conductor → SubAgent push.
-        For now, sub-agents fetch on tick or at boot.
+        The push is a synchronous in-process method call — the
+        sub-agent's ``set_intensity`` updates its ``_level`` (atomic,
+        single-attribute assignment) and the next tick reads the new
+        value. The agent's own ``set_intensity`` enforces its floor
+        (Sentinel at FULL, Curator at LOW, others can OFF).
+
+        If no agent is currently running under ``agent_name`` (e.g.
+        substrate booted with ``start_subagents=False``, or the agent
+        was never spawned), the level is stored and a future
+        construction will pick it up via the conductor.
         """
         self._levels[agent_name] = level
+        agents = getattr(self._substrate, "_subagents", {}) or {}
+        agent = agents.get(agent_name)
+        if agent is not None:
+            agent.set_intensity(level)
 
     def intensity_for(self, agent_name: str, *, is_sentinel: bool = False) -> Level:
         """Return the level for an agent, defaulting based on whether

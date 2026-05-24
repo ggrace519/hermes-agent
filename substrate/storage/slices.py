@@ -16,6 +16,7 @@ caller-friendly errors.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID, uuid4
@@ -30,6 +31,22 @@ from substrate.storage.types import (
 
 if TYPE_CHECKING:  # pragma: no cover
     import asyncpg
+
+
+@dataclass(frozen=True)
+class ReleaseRecord:
+    """One released slice as returned by ``SliceRepo.release_eligible``.
+
+    Carries the data the Curator's audit emission needs without a
+    second SELECT (Phase B spec §6.3). ``salience_at_release`` is the
+    salience score at the moment of release decision — useful for
+    Reflector/Critic calibration on Curator's threshold choices.
+    """
+
+    slice_id: UUID
+    stream_id: UUID
+    tombstone_policy: str
+    salience_at_release: float
 
 
 class SliceRepo:
@@ -265,6 +282,194 @@ class SliceRepo:
             rows,
         )
         return len(rows)
+
+    # ------------------------------------------------------------------
+    # Force-reject: delete pending slices past their TTL.
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Phase B: reinforcement.
+    # ------------------------------------------------------------------
+
+    async def reinforce(
+        self,
+        conn: "asyncpg.Connection",
+        slice_id: UUID,
+        *,
+        bump: Optional[float] = None,
+    ) -> None:
+        """Bump salience by ``bump`` or by the profile's
+        ``reinforcement_bump``. Caps at 1.0.
+
+        Updates ``salience_updated_at`` so subsequent decay starts from
+        now. Does NOT update any other field — reinforcement is
+        salience-only. The bump is applied SQL-side via
+        ``LEAST(1.0, salience + bump)`` so concurrent reinforces don't
+        trample each other.
+
+        Reinforcing a released slice is harmless: salience stays at 0
+        (already capped) and the timestamp updates. ``consolidation_state``
+        is NOT brought back from ``released`` — release is one-way.
+        """
+        await conn.execute(
+            """
+            UPDATE substrate_slices sl
+               SET salience_score = LEAST(1.0,
+                       sl.salience_score + COALESCE($2::real, dp.reinforcement_bump)),
+                   salience_updated_at = now()
+              FROM substrate_streams        st
+              JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+             WHERE sl.slice_id = $1
+               AND sl.stream_id = st.stream_id
+            """,
+            slice_id,
+            bump,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase B: release eligible slices per tombstone policy.
+    # ------------------------------------------------------------------
+
+    async def release_eligible(
+        self,
+        conn: "asyncpg.Connection",
+        *,
+        limit: int = 200,
+    ) -> list[ReleaseRecord]:
+        """Release up to ``limit`` slices whose salience has fallen
+        below their profile's ``min_salience_to_retain``.
+
+        Three SQL paths per ``tombstone_policy``:
+          * ``none`` — DELETE the row entirely. Requires the profile's
+            ``tombstone_none_justification`` to be set (the CHECK
+            constraint from Phase A migration enforces this; we don't
+            need a Python-side check).
+          * ``thin`` — NULL ``payload`` + ``payload_blob_ref``, zero
+            salience, mark ``consolidation_state='released'``.
+          * ``full`` — NULL ``payload`` + ``payload_blob_ref``, mark
+            ``consolidation_state='released'`` (keep salience at its
+            release-time value).
+
+        The eligibility CTE uses ``FOR UPDATE OF sl SKIP LOCKED`` so
+        concurrent Curators don't fight over the same rows.
+
+        Returns ``ReleaseRecord`` per released slice so the caller can
+        emit per-release audit slices without a second SELECT.
+        """
+        eligible = await conn.fetch(
+            """
+            SELECT sl.slice_id, sl.ingest_time_world, st.stream_id,
+                   dp.tombstone_policy, sl.salience_score
+              FROM substrate_slices         sl
+              JOIN substrate_streams        st ON st.stream_id  = sl.stream_id
+              JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+             WHERE sl.sentinel_state      = 'passed'
+               AND sl.consolidation_state <> 'released'
+               AND sl.salience_score      < dp.min_salience_to_retain
+               AND (NOT dp.release_after_consolidation
+                    OR sl.consolidation_state = 'consolidated')
+             ORDER BY sl.salience_score ASC
+             LIMIT $1
+             FOR UPDATE OF sl SKIP LOCKED
+            """,
+            limit,
+        )
+
+        released: list[ReleaseRecord] = []
+        for r in eligible:
+            policy = r["tombstone_policy"]
+            slice_id = r["slice_id"]
+            ingest = r["ingest_time_world"]
+            if policy == "none":
+                await conn.execute(
+                    """
+                    DELETE FROM substrate_slices
+                     WHERE slice_id = $1 AND ingest_time_world = $2
+                    """,
+                    slice_id,
+                    ingest,
+                )
+            elif policy == "thin":
+                await conn.execute(
+                    """
+                    UPDATE substrate_slices
+                       SET payload = NULL,
+                           payload_blob_ref = NULL,
+                           salience_score = 0,
+                           consolidation_state = 'released'
+                     WHERE slice_id = $1 AND ingest_time_world = $2
+                    """,
+                    slice_id,
+                    ingest,
+                )
+            elif policy == "full":
+                await conn.execute(
+                    """
+                    UPDATE substrate_slices
+                       SET payload = NULL,
+                           payload_blob_ref = NULL,
+                           consolidation_state = 'released'
+                     WHERE slice_id = $1 AND ingest_time_world = $2
+                    """,
+                    slice_id,
+                    ingest,
+                )
+            else:  # pragma: no cover — CHECK constraint guards this
+                raise ValueError(f"unknown tombstone_policy: {policy!r}")
+            released.append(
+                ReleaseRecord(
+                    slice_id=slice_id,
+                    stream_id=r["stream_id"],
+                    tombstone_policy=policy,
+                    salience_at_release=float(r["salience_score"]),
+                )
+            )
+        return released
+
+    # ------------------------------------------------------------------
+    # Phase B: salience pressure read (for inspect CLI).
+    # ------------------------------------------------------------------
+
+    async def salience_pressure(
+        self,
+        conn: "asyncpg.Connection",
+        *,
+        window_seconds: int = 300,
+    ) -> list[dict]:
+        """Per-stream salience density + update rate over ``window_seconds``.
+
+        Returns one row per active stream:
+          * ``name`` — stream name
+          * ``density`` — mean salience across non-released slices
+          * ``count`` — number of non-released slices
+          * ``update_rate`` — count of salience_updated_at writes in the
+             last ``window_seconds`` (proxy for Curator + reinforcement
+             activity)
+
+        Surfaced by ``hermes substrate inspect curator pressure``. Phase
+        B doesn't consume this programmatically — it's an operator
+        observability window into what Phase F's real Conductor will
+        eventually read for opportunity-forecast inputs.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT st.name AS name,
+                   COALESCE(AVG(sl.salience_score), 0)::real AS density,
+                   COUNT(sl.slice_id)::int AS count,
+                   COUNT(*) FILTER (
+                       WHERE sl.salience_updated_at > now() - make_interval(secs => $1)
+                   )::int AS update_rate
+              FROM substrate_streams st
+              LEFT JOIN substrate_slices sl
+                     ON sl.stream_id = st.stream_id
+                    AND sl.consolidation_state <> 'released'
+             WHERE st.lifecycle_state = 'active'
+             GROUP BY st.name
+             ORDER BY st.name
+            """,
+            window_seconds,
+        )
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
     # Force-reject: delete pending slices past their TTL.

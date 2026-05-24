@@ -13,7 +13,7 @@ from substrate.storage.decay_profiles import (
     DEFAULT_TEXT_PROFILE,
     DecayProfileRepo,
 )
-from substrate.storage.slices import SliceRepo
+from substrate.storage.slices import ReleaseRecord, SliceRepo
 from substrate.storage.streams import StreamRepo
 from substrate.storage.types import (
     Address,
@@ -40,6 +40,7 @@ __all__ = [
     "Family",
     "Lifecycle",
     "Modality",
+    "ReleaseRecord",
     "SentinelState",
     "Slice",
     "SliceRepo",

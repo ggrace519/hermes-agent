@@ -89,6 +89,37 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     inspect_profiles.set_defaults(func=_cmd_inspect_profiles)
 
+    # ── Phase B: curator subtree ──────────────────────────────────────
+    inspect_curator = inspect_sub.add_parser(
+        "curator",
+        help="Inspect Curator state (Phase B)",
+        description="Show Curator decay/release activity. Without a sub "
+        "subcommand, prints the default summary.",
+    )
+    inspect_curator_sub = inspect_curator.add_subparsers(dest="curator_subcommand")
+    inspect_curator.set_defaults(func=_cmd_inspect_curator_summary)
+
+    inspect_curator_sub.add_parser(
+        "summary", help="Curator summary (default)"
+    ).set_defaults(func=_cmd_inspect_curator_summary)
+
+    inspect_curator_sub.add_parser(
+        "histogram", help="Per-profile salience histogram (10 buckets)"
+    ).set_defaults(func=_cmd_inspect_curator_histogram)
+
+    curator_recent = inspect_curator_sub.add_parser(
+        "recent", help="Recent curator.* self-state emissions"
+    )
+    curator_recent.add_argument(
+        "--limit", type=int, default=20, help="Max emissions to show (default 20)"
+    )
+    curator_recent.set_defaults(func=_cmd_inspect_curator_recent)
+
+    inspect_curator_sub.add_parser(
+        "pressure",
+        help="Per-stream salience pressure (Conductor opportunity-forecast inputs)",
+    ).set_defaults(func=_cmd_inspect_curator_pressure)
+
     substrate_parser.set_defaults(func=_cmd_substrate_help)
 
 
@@ -128,6 +159,24 @@ def _cmd_inspect_pending(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_profiles(args: argparse.Namespace) -> int:
     return _run_inspect(_print_profiles)
+
+
+def _cmd_inspect_curator_summary(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_curator_summary)
+
+
+def _cmd_inspect_curator_histogram(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_curator_histogram)
+
+
+def _cmd_inspect_curator_recent(args: argparse.Namespace) -> int:
+    return _run_inspect(
+        lambda conn: _print_curator_recent(conn, limit=args.limit)
+    )
+
+
+def _cmd_inspect_curator_pressure(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_curator_pressure)
 
 
 def _run_inspect(action) -> int:
@@ -353,6 +402,219 @@ def _short_payload(payload) -> str:
     if len(s) > 80:
         return s[:80] + "…"
     return s
+
+
+# ---------------------------------------------------------------------------
+# Phase B printers — Curator summary, histogram, recent, pressure.
+# ---------------------------------------------------------------------------
+
+
+async def _print_curator_summary(conn: "asyncpg.Connection") -> None:
+    """Default ``hermes substrate inspect curator`` output. Matches the
+    format documented in Phase B spec §9.2."""
+    now = datetime.now(timezone.utc)
+    print(f"Curator state @ {now.isoformat()}")
+    print()
+
+    # Release stats — count by tombstone_policy. Released slices keep
+    # their consolidation_state='released' even after payload is nulled.
+    rel = await conn.fetch(
+        """
+        SELECT dp.tombstone_policy AS policy, COUNT(sl.slice_id)::int AS n
+          FROM substrate_slices sl
+          JOIN substrate_streams st ON st.stream_id = sl.stream_id
+          JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+         WHERE sl.consolidation_state = 'released'
+         GROUP BY dp.tombstone_policy
+        """
+    )
+    rel_by_policy = {r["policy"]: r["n"] for r in rel}
+    rel_total = sum(rel_by_policy.values())
+    print(f"Released:                   {rel_total:,} slices")
+    print("  by policy:")
+    for policy in ("thin", "full", "none"):
+        label = policy + (" (default)" if policy == "thin" else "")
+        print(f"    {label:24s}{rel_by_policy.get(policy, 0):,}")
+
+    print()
+
+    # Pending consolidation — anything passed + unconsolidated.
+    pending = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (
+                WHERE sl.sentinel_state = 'passed'
+                  AND sl.consolidation_state = 'unconsolidated'
+            )::int AS total,
+            COUNT(*) FILTER (
+                WHERE sl.sentinel_state = 'passed'
+                  AND sl.consolidation_state = 'unconsolidated'
+                  AND sl.salience_score < 0.1
+            )::int AS low_salience,
+            COUNT(*) FILTER (
+                WHERE sl.sentinel_state = 'passed'
+                  AND sl.consolidation_state = 'unconsolidated'
+                  AND sl.ingest_time_world + (dp.consolidation_window * 0.9) < now()
+                  AND sl.ingest_time_world + dp.consolidation_window > now()
+            )::int AS near_window
+          FROM substrate_slices sl
+          JOIN substrate_streams st ON st.stream_id = sl.stream_id
+          JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+        """
+    )
+    print(f"Pending consolidation:        {pending['total']:,} slices")
+    print(f"  with salience < 0.1            {pending['low_salience']:,}")
+    print(
+        f"  approaching consolidation_window (within 10% of profile setting): "
+        f"{pending['near_window']:,}"
+    )
+
+    print()
+
+    # Recent curator emissions over last hour. Counts per event kind.
+    recent = await conn.fetch(
+        """
+        SELECT sl.payload->>'event' AS event, COUNT(*)::int AS n
+          FROM substrate_slices sl
+          JOIN substrate_streams st ON st.stream_id = sl.stream_id
+         WHERE st.name = 'substrate.self_state'
+           AND sl.ingest_time_world > now() - interval '1 hour'
+           AND sl.payload->>'event' LIKE 'curator.%'
+         GROUP BY sl.payload->>'event'
+        """
+    )
+    recent_by_event = {r["event"]: r["n"] for r in recent}
+    rel_n = recent_by_event.get("curator.release", 0)
+    alarm_n = recent_by_event.get(
+        "curator.pathological_forgetting_alarm", 0
+    )
+    print(f"Recent curator.release emissions: {rel_n} in last hour")
+    print(f"Recent pathological-forgetting alarms: {alarm_n} in last hour")
+
+
+async def _print_curator_histogram(conn: "asyncpg.Connection") -> None:
+    """10-bucket salience histogram per active profile.
+
+    Bucket 0 covers [0.0, 0.1); bucket 9 covers [0.9, 1.0]. Released
+    slices are excluded (their salience is 0 by definition and would
+    dominate bucket 0).
+    """
+    rows = await conn.fetch(
+        """
+        WITH bucketed AS (
+            SELECT dp.name AS profile,
+                   LEAST(9, GREATEST(0, FLOOR(sl.salience_score * 10)::int)) AS bucket
+              FROM substrate_slices sl
+              JOIN substrate_streams st ON st.stream_id = sl.stream_id
+              JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+             WHERE sl.consolidation_state <> 'released'
+               AND sl.sentinel_state = 'passed'
+        )
+        SELECT profile, bucket, COUNT(*)::int AS n
+          FROM bucketed
+         GROUP BY profile, bucket
+         ORDER BY profile, bucket
+        """
+    )
+    if not rows:
+        print("(no active passed slices to bucket)")
+        return
+
+    by_profile: dict[str, dict[int, int]] = {}
+    for r in rows:
+        by_profile.setdefault(r["profile"], {})[r["bucket"]] = r["n"]
+
+    bucket_labels = [
+        "0.0–0.1", "0.1–0.2", "0.2–0.3", "0.3–0.4", "0.4–0.5",
+        "0.5–0.6", "0.6–0.7", "0.7–0.8", "0.8–0.9", "0.9–1.0",
+    ]
+    for profile, buckets in by_profile.items():
+        total = sum(buckets.values())
+        print(f"{profile}  (total = {total})")
+        for i, label in enumerate(bucket_labels):
+            n = buckets.get(i, 0)
+            bar = "█" * min(50, n)
+            print(f"  {label}  {n:>6d}  {bar}")
+        print()
+
+
+async def _print_curator_recent(
+    conn: "asyncpg.Connection", *, limit: int
+) -> None:
+    """Most-recent N curator.* emissions on substrate.self_state."""
+    rows = await conn.fetch(
+        """
+        SELECT sl.ingest_time_world, sl.payload
+          FROM substrate_slices sl
+          JOIN substrate_streams st ON st.stream_id = sl.stream_id
+         WHERE st.name = 'substrate.self_state'
+           AND sl.payload->>'event' LIKE 'curator.%'
+         ORDER BY sl.ingest_time_world DESC
+         LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        print("(no curator emissions found)")
+        return
+    print(f"Most-recent {len(rows)} curator emissions:")
+    for r in rows:
+        ev = r["payload"].get("event", "?")
+        ts = r["ingest_time_world"].isoformat() if r["ingest_time_world"] else "-"
+        if ev == "curator.release":
+            extra = (
+                f"slice={r['payload'].get('slice_id', '?')[:8]} "
+                f"policy={r['payload'].get('tombstone_policy')} "
+                f"salience={r['payload'].get('salience_at_release'):.4f}"
+            )
+        elif ev == "curator.pathological_forgetting_alarm":
+            extra = (
+                f"slice={r['payload'].get('slice_id', '?')[:8]} "
+                f"age={r['payload'].get('age_seconds')}s "
+                f"window={r['payload'].get('consolidation_window_seconds')}s "
+                f"bumped→{r['payload'].get('bumped_to'):.4f}"
+            )
+        else:
+            extra = str(r["payload"])
+        print(f"  [{ts}] {ev}  {extra}")
+
+
+async def _print_curator_pressure(conn: "asyncpg.Connection") -> None:
+    """Per-stream salience pressure — density + update rate.
+
+    Surfaces design §5.6's Conductor opportunity-forecast inputs. Phase
+    B doesn't consume programmatically; the values are surfaced so
+    operators can develop intuition before Phase F's real Conductor.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT st.name,
+               COALESCE(AVG(sl.salience_score), 0)::real AS density,
+               COUNT(sl.slice_id)::int AS count,
+               COUNT(*) FILTER (
+                   WHERE sl.salience_updated_at > now() - interval '5 minutes'
+               )::int AS update_rate
+          FROM substrate_streams st
+          LEFT JOIN substrate_slices sl
+                 ON sl.stream_id = st.stream_id
+                AND sl.consolidation_state <> 'released'
+         WHERE st.lifecycle_state = 'active'
+         GROUP BY st.name
+         ORDER BY st.name
+        """
+    )
+    if not rows:
+        print("(no active streams)")
+        return
+    print(
+        f"{'stream':50s}  {'count':>8s}  {'density':>9s}  {'5m_updates':>11s}"
+    )
+    print("-" * 90)
+    for r in rows:
+        print(
+            f"{r['name']:50s}  {r['count']:>8d}  "
+            f"{r['density']:>9.4f}  {r['update_rate']:>11d}"
+        )
 
 
 def _fmt_td(value) -> str:

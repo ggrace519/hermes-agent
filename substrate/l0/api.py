@@ -230,4 +230,63 @@ def commit_slice_sync(
     )
 
 
-__all__ = ["commit_slice", "commit_slice_sync"]
+# ---------------------------------------------------------------------------
+# Phase B: reinforcement API. Public way for any caller (recall API in
+# Phase C, consolidation handshake in Phase D, manual operator nudges) to
+# bump a slice's salience.
+# ---------------------------------------------------------------------------
+
+
+async def reinforce_slice(
+    substrate: "Substrate",
+    slice_id: UUID,
+    *,
+    bump: Optional[float] = None,
+    conn: "Optional[asyncpg.Connection]" = None,
+) -> None:
+    """Reinforce ``slice_id`` — bump salience and update timestamp.
+
+    ``bump=None`` uses the slice's decay-profile ``reinforcement_bump``
+    value (the default reinforcement contract). An explicit ``bump``
+    overrides — used when a caller has stronger signal than the default
+    (e.g. a recall hit that was directly relevant gets a larger bump
+    than one that was returned but irrelevant).
+
+    Salience is capped at 1.0 SQL-side. Reinforcing a slice that's
+    already at the cap is a harmless no-op for the score but DOES
+    update ``salience_updated_at`` so subsequent decay starts from now.
+
+    If ``conn`` is passed, the UPDATE runs on that connection so the
+    caller can wrap reinforcement into a larger transaction (e.g. the
+    consolidation acknowledgment in Phase D).
+    """
+    if conn is not None:
+        await substrate.slices.reinforce(conn, slice_id, bump=bump)
+        return
+    async with substrate.pool.acquire() as own:
+        await substrate.slices.reinforce(own, slice_id, bump=bump)
+
+
+def reinforce_slice_sync(
+    substrate: "Substrate",
+    slice_id: UUID,
+    *,
+    bump: Optional[float] = None,
+) -> None:
+    """Sync facade for :func:`reinforce_slice`. Bridges via
+    :func:`hermes_db.run_sync`. Must NOT be called from inside a
+    running event loop (the underlying ``run_sync`` raises).
+    """
+    import hermes_db
+
+    return hermes_db.run_sync(
+        reinforce_slice(substrate, slice_id, bump=bump)
+    )
+
+
+__all__ = [
+    "commit_slice",
+    "commit_slice_sync",
+    "reinforce_slice",
+    "reinforce_slice_sync",
+]
