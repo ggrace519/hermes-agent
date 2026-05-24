@@ -240,13 +240,35 @@ class _AsyncSessionDB:
         return session_id
 
     async def end_session(self, session_id: str, end_reason: str) -> None:
-        """Mark session ended. No-op if already ended (first end_reason wins)."""
-        async with hermes_db.connection() as conn:
-            await conn.execute(
+        """Mark session ended. No-op if already ended (first end_reason wins).
+
+        Emits a ``hermes.self_state.session_lifecycle`` perception slice
+        IFF the UPDATE actually flipped a row from ``ended_at IS NULL``
+        to ended. This avoids emitting on every redundant end_session
+        call (e.g. retry paths that double-end). Hook failures are
+        logged + swallowed inside the helper.
+        """
+        from datetime import datetime, timezone
+
+        async with hermes_db.transaction() as conn:
+            tag = await conn.execute(
                 "UPDATE sessions SET ended_at = now(), end_reason = $2 "
                 "WHERE id = $1 AND ended_at IS NULL",
                 session_id, end_reason,
             )
+            # Only emit when we actually transitioned the session — asyncpg's
+            # ``UPDATE 1`` / ``UPDATE 0`` tag tells us which.
+            if tag.endswith(" 1"):
+                try:
+                    from substrate.events.hermes_hooks import on_session_end_async
+                    await on_session_end_async(
+                        session_id, end_reason, datetime.now(timezone.utc)
+                    )
+                except Exception:  # noqa: BLE001 — defensive
+                    logger.warning(
+                        "substrate on_session_end hook raised; ignoring",
+                        exc_info=True,
+                    )
 
     async def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
