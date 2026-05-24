@@ -103,7 +103,11 @@ jobs:
           HERMES_PG_DSN: postgresql://hermes:hermes@localhost:5432/hermes
           POSTGRES_USER: hermes
           POSTGRES_PASSWORD: hermes
-          # POSTGRES_PORT defaults to 5432; no override needed
+          # CI runs against the ephemeral GH Actions PG service on 5432.
+          # Local-dev pytest defaults to 5433 (the docker-compose
+          # `postgres-test` profile) so the developer's real Hermes DB on
+          # 5432 is never touched — see tests/conftest.py:_TEST_PG_PORT.
+          HERMES_TEST_POSTGRES_PORT: "5432"
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

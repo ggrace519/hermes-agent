@@ -10587,7 +10587,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "postinstall", "profile", "proxy",
         "send", "sessions", "setup",
-        "skills", "slack", "status", "tools", "uninstall", "update",
+        "skills", "slack", "status", "substrate", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat", "secrets",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
@@ -11284,6 +11284,17 @@ def main():
         # LSP is optional infrastructure — never let a registration
         # failure break the CLI overall.
         logger.debug("LSP CLI registration failed: %s", _lsp_err)
+
+    # =========================================================================
+    # substrate command (Phase A inspect surface)
+    # =========================================================================
+    try:
+        from substrate.cli.inspect import register_subparser as _substrate_register
+        _substrate_register(subparsers)
+    except Exception as _substrate_err:  # noqa: BLE001
+        # Substrate CLI is debug-only — never let registration failure
+        # break the rest of the CLI.
+        logger.debug("Substrate CLI registration failed: %s", _substrate_err)
 
     # =========================================================================
     # setup command

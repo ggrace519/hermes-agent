@@ -1,0 +1,444 @@
+"""``class Substrate`` — the public lifecycle + accessor surface.
+
+Phase A spec §8: ``Substrate.boot()`` does the full lifecycle —
+Alembic-head check, partition maintenance, stream auto-registration
+(the 15 streams from spec §9), sub-agent task spawn (Sentinel +
+force-reject + partition-maintenance + conductor stub), and binds the
+``substrate.events.hermes_hooks`` module so Hermes call sites can emit
+perception.
+
+``Substrate.from_pool()`` is the test seam — it constructs a Substrate
+without running boot-time side effects so individual subsystems can be
+unit-tested.
+
+Both constructors share the same dataclass-like instance shape so the
+``substrate.l0.api.commit_slice`` call site doesn't branch on construction
+mode.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # pragma: no cover
+    import asyncpg
+    import logging as _logging
+
+from substrate.config import SubstrateConfig
+from substrate.storage import (
+    DEFAULT_STRUCTURED_PROFILE,
+    DEFAULT_TEXT_PROFILE,
+    DecayProfileRepo,
+    Family,
+    Modality,
+    SliceRepo,
+    StreamRepo,
+)
+
+
+# ---------------------------------------------------------------------------
+# Stream auto-registration table — Phase A spec §9.
+# (name, family, modality, source, organ, decay_profile_id)
+# ``substrate.self_state`` is seeded by the Alembic revision (§3.5) so it's
+# not in this list; the rest are inserted at boot via idempotent ON CONFLICT.
+# ---------------------------------------------------------------------------
+
+
+_USER_MESSAGE_SOURCES = (
+    "cli",
+    "telegram",
+    "discord",
+    "slack",
+    "whatsapp",
+    "signal",
+    "acp",
+)
+
+
+def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object"]]:
+    """Return the (name, family, modality, source, organ, decay_profile)
+    tuples for the streams ``Substrate.boot`` must auto-register.
+
+    Kept as a function (rather than a module-level constant) so tests can
+    monkeypatch / shorten it, and so the DEFAULT_* UUID imports stay near
+    the call site that uses them.
+    """
+    specs: list[tuple[str, Family, Modality, str, str, object]] = []
+
+    # Per-source user-message streams (7).
+    for source in _USER_MESSAGE_SOURCES:
+        specs.append(
+            (
+                f"hermes.world.user_message.{source}",
+                Family.EXTEROCEPTIVE,
+                Modality.TEXT,
+                source,
+                f"gateway.{source}" if source != "acp" else "acp_adapter",
+                DEFAULT_TEXT_PROFILE,
+            )
+        )
+
+    # Self-action + self-state streams (7 + substrate.self_state seeded by
+    # the Alembic revision = 15 total per §9).
+    specs.extend(
+        [
+            (
+                "hermes.self_action.assistant_response",
+                Family.SELF_ACTION,
+                Modality.TEXT,
+                "agent",
+                "conversation_loop",
+                DEFAULT_TEXT_PROFILE,
+            ),
+            (
+                "hermes.self_action.tool_call",
+                Family.SELF_ACTION,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "model_tools",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+            (
+                "hermes.self_state.tool_result",
+                Family.SELF_STATE,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "model_tools",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+            (
+                "hermes.self_action.subagent_spawn",
+                Family.SELF_ACTION,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "delegate_tool",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+            (
+                "hermes.self_state.subagent_return",
+                Family.SELF_STATE,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "delegate_tool",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+            (
+                "hermes.self_state.session_lifecycle",
+                Family.SELF_STATE,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "hermes_state",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+            (
+                "hermes.self_state.cron_dispatch",
+                Family.SELF_STATE,
+                Modality.STRUCTURED_EVENT,
+                "agent",
+                "cron.scheduler",
+                DEFAULT_STRUCTURED_PROFILE,
+            ),
+        ]
+    )
+
+    return specs
+
+
+# Expected Alembic head — the substrate refuses to boot if the DB is on an
+# older revision (unless ``HERMES_AUTO_MIGRATE=1``). When a future revision
+# (Phase B+) lands, add it here AND keep the substrate code able to boot
+# against the prior head until the new schema is required.
+_EXPECTED_REVISIONS = frozenset({"20260523_0003"})
+
+
+# Shutdown timeout — Phase A spec §8.2.
+_SUBAGENT_SHUTDOWN_TIMEOUT = 2.0
+
+
+class Substrate:
+    """Process-wide substrate handle.
+
+    Constructed via :meth:`boot` from Hermes startup. Tests use
+    :meth:`from_pool` for deterministic unit-test setup without the
+    full boot side effects.
+    """
+
+    def __init__(
+        self,
+        *,
+        pool: "asyncpg.Pool",
+        streams: StreamRepo,
+        slices: SliceRepo,
+        profiles: DecayProfileRepo,
+        log: "_logging.Logger",
+        config: SubstrateConfig,
+    ) -> None:
+        self.pool = pool
+        self.streams = streams
+        self.slices = slices
+        self.profiles = profiles
+        self.log = log
+        self.config = config
+
+        # Populated by ``boot()`` when sub-agents are started. Tests using
+        # ``from_pool`` get an empty dict; ``shutdown`` handles both.
+        self._subagents: dict[str, "object"] = {}
+        self._conductor: Optional["object"] = None
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pool(
+        cls,
+        pool: "asyncpg.Pool",
+        *,
+        log: "Optional[_logging.Logger]" = None,
+        config: Optional[SubstrateConfig] = None,
+    ) -> "Substrate":
+        """Build a Substrate without running boot-time side effects.
+
+        Useful for tests that exercise individual subsystems (commit
+        path, repos, sub-agent ticks) without spinning up the full
+        runtime. Boot-time work (Alembic check, stream auto-register,
+        sub-agent spawn, hook bind) is skipped — see :meth:`boot` for
+        the production entry point.
+        """
+        import logging
+
+        return cls(
+            pool=pool,
+            streams=StreamRepo(pool),
+            slices=SliceRepo(pool),
+            profiles=DecayProfileRepo(pool),
+            log=log or logging.getLogger("substrate"),
+            config=config or SubstrateConfig.from_env(),
+        )
+
+    @classmethod
+    async def boot(
+        cls,
+        *,
+        log: "Optional[_logging.Logger]" = None,
+        config: Optional[SubstrateConfig] = None,
+        start_subagents: bool = True,
+    ) -> "Substrate":
+        """Full Phase A boot sequence.
+
+        1. Assert ``hermes_db.pool()`` is initialised.
+        2. Verify Alembic head is at or beyond
+           ``20260523_0003_substrate_skeleton``. If older and
+           ``HERMES_AUTO_MIGRATE=1`` (from ``SubstrateConfig.auto_migrate``)
+           run ``alembic upgrade head``; otherwise raise.
+        3. Ensure month partitions exist (current + next 2).
+        4. Auto-register the 15 streams from spec §9 (idempotent).
+        5. Spawn sub-agent tasks: StubSentinel, ForceRejectWorker,
+           PartitionMaintenanceWorker. Also instantiate StubConductor
+           (which holds state but doesn't tick).
+        6. Bind ``substrate.events.hermes_hooks`` to this instance so
+           Hermes call sites can emit perception via the hook surface.
+
+        Returns the booted Substrate. Failures are surfaced — the
+        caller (Hermes startup) decides whether to abort the process
+        or degrade gracefully.
+        """
+        import hermes_db
+
+        pool = hermes_db.pool()  # raises if init() wasn't called
+        cfg = config or SubstrateConfig.from_env()
+        substrate = cls.from_pool(pool, log=log, config=cfg)
+
+        # 2. Alembic head check (optional auto-migrate).
+        await substrate._check_alembic_head(auto_migrate=cfg.auto_migrate)
+
+        # 3. Partition maintenance (sync, one-shot at boot — the daily
+        # tick is the PartitionMaintenanceWorker started below).
+        from substrate.storage.partitions import ensure_partitions
+
+        async with hermes_db.connection() as conn:
+            await ensure_partitions(conn, ahead_months=2)
+
+        # 4. Auto-register §9 streams.
+        await substrate._autoregister_streams()
+
+        # 5. Spawn sub-agents (unless deliberately suppressed by tests).
+        if start_subagents:
+            substrate._spawn_subagents()
+        else:
+            # Even when sub-agent loops are off, the Conductor exists so
+            # operator surfaces can read/write intensity levels.
+            from substrate.agents.conductor import StubConductor
+
+            substrate._conductor = StubConductor(substrate)
+
+        # 6. Bind hook module to this substrate instance.
+        from substrate.events import hermes_hooks
+
+        hermes_hooks._bind(substrate)
+
+        substrate.log.info(
+            "substrate.boot.ok streams_registered=%d subagents=%d",
+            len(_autoregister_specs()) + 1,  # +1 for the seeded self_state
+            len(substrate._subagents),
+        )
+        return substrate
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    async def shutdown(self) -> None:
+        """Stop sub-agents, flush pending audit emissions, unbind hooks.
+
+        The asyncpg pool is NOT closed here — that belongs to
+        ``hermes_db.close()`` which is owned by Hermes's own shutdown
+        sequence (spec §8.2).
+        """
+        # Unbind hooks first so any in-flight Hermes call site that
+        # reaches a hook during shutdown is a silent no-op rather than
+        # racing against a partially-shut-down substrate.
+        from substrate.events import hermes_hooks
+
+        hermes_hooks._unbind()
+
+        # Stop every running sub-agent with a bounded wait. The base
+        # class's ``stop_and_wait`` cancels the task on timeout so a
+        # misbehaving tick can't hang shutdown forever.
+        if self._subagents:
+            await asyncio.gather(
+                *(
+                    agent.stop_and_wait(timeout=_SUBAGENT_SHUTDOWN_TIMEOUT)
+                    for agent in self._subagents.values()
+                ),
+                return_exceptions=True,
+            )
+            self._subagents.clear()
+        self._conductor = None
+        self.log.info("substrate.shutdown.ok")
+
+    # ------------------------------------------------------------------
+    # Boot helpers
+    # ------------------------------------------------------------------
+
+    async def _check_alembic_head(self, *, auto_migrate: bool) -> None:
+        """Verify the DB's Alembic head includes the substrate revision.
+
+        The Phase 0 baseline created ``alembic_version`` — we just SELECT
+        from it. If the revision is older than expected:
+          * with ``auto_migrate=True``: run ``alembic upgrade head``.
+          * otherwise: raise RuntimeError so the caller can prompt.
+        """
+        import hermes_db
+
+        async with hermes_db.connection() as conn:
+            current = await conn.fetchval(
+                "SELECT version_num FROM alembic_version"
+            )
+
+        if current in _EXPECTED_REVISIONS:
+            return
+
+        if not auto_migrate:
+            raise RuntimeError(
+                f"substrate.boot: alembic head is {current!r}; expected one of "
+                f"{sorted(_EXPECTED_REVISIONS)}. Set HERMES_AUTO_MIGRATE=1 or "
+                f"run `alembic upgrade head` against this database."
+            )
+
+        # Run alembic upgrade in a thread — alembic.command.upgrade is
+        # sync and would otherwise block the event loop.
+        self.log.info(
+            "substrate.boot.auto_migrate from=%s to=head", current
+        )
+        await asyncio.to_thread(_run_alembic_upgrade)
+
+        # Verify the migration actually advanced the head.
+        async with hermes_db.connection() as conn:
+            after = await conn.fetchval(
+                "SELECT version_num FROM alembic_version"
+            )
+        if after not in _EXPECTED_REVISIONS:
+            raise RuntimeError(
+                f"substrate.boot: alembic upgrade landed at {after!r}, not "
+                f"one of {sorted(_EXPECTED_REVISIONS)}"
+            )
+
+    async def _autoregister_streams(self) -> None:
+        """Insert every §9 stream via ``StreamRepo.register`` (idempotent
+        on the unique ``name`` index)."""
+        for (
+            name,
+            family,
+            modality,
+            source,
+            organ,
+            decay_profile_id,
+        ) in _autoregister_specs():
+            await self.streams.register(
+                name=name,
+                family=family,
+                modality=modality,
+                source=source,
+                organ=organ,
+                decay_profile_id=decay_profile_id,
+            )
+
+    def _spawn_subagents(self) -> None:
+        """Instantiate + ``start()`` the Phase A sub-agents.
+
+        Order is deliberate:
+          * partition-maintenance first — touches storage DDL, cheap.
+          * force-reject second — protects the pending queue.
+          * sentinel last — the highest-frequency tick.
+        Conductor is instantiated but doesn't tick (Phase A stub).
+        """
+        from substrate.agents.conductor import StubConductor
+        from substrate.agents.force_reject import ForceRejectWorker
+        from substrate.agents.partition_maintenance import (
+            PartitionMaintenanceWorker,
+        )
+        from substrate.agents.sentinel import StubSentinel
+
+        self._conductor = StubConductor(self)
+
+        partition = PartitionMaintenanceWorker(self)
+        force_reject = ForceRejectWorker(self)
+        sentinel = StubSentinel(self)
+        for agent in (partition, force_reject, sentinel):
+            agent.start()
+            self._subagents[agent.name] = agent
+
+    # ------------------------------------------------------------------
+    # Accessors — convenient for the inspect CLI and tests.
+    # ------------------------------------------------------------------
+
+    @property
+    def subagents(self) -> dict[str, object]:
+        """Read-only view of the running sub-agents keyed by ``name``.
+        Empty when ``Substrate`` was built via :meth:`from_pool` or with
+        ``start_subagents=False``.
+        """
+        return dict(self._subagents)
+
+    @property
+    def conductor(self) -> "Optional[object]":
+        """The StubConductor instance, or ``None`` if not booted."""
+        return self._conductor
+
+
+def _run_alembic_upgrade() -> None:
+    """Thread-pool entry point for ``alembic upgrade head``.
+
+    Kept at module scope so the Substrate doesn't carry an alembic
+    reference at import time (alembic is a heavy import).
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config("migrations/alembic.ini")
+    command.upgrade(cfg, "head")
+
+
+__all__ = ["Substrate"]

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Gateway runner - entry point for messaging platform integrations.
 
 This module provides:
@@ -17776,6 +17776,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             await _hermes_db.init(_pg_dsn)
         except Exception as _e:
             logger.warning("PG pool init failed, continuing: %s", _e)
+
+    # Phase A: bootstrap the substrate so perception hooks emit slices.
+    # Failures are non-fatal — substrate problems must never crash the
+    # gateway (spec §0). The helper itself logs the traceback.
+    try:
+        from hermes_bootstrap import bootstrap_substrate as _bootstrap_substrate
+        await _bootstrap_substrate(log=logger)
+    except Exception as _se:  # noqa: BLE001 — defensive
+        logger.warning("substrate bootstrap failed, continuing: %s", _se)
 
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.

@@ -862,9 +862,20 @@ from alembic.config import Config
 #     psql -U hermes -h localhost -c "DROP DATABASE IF EXISTS hermes_tmpl"
 
 
+# Default to the dedicated `postgres-test` docker-compose service
+# (port 5433), NOT the real `postgres` service the developer's Hermes
+# install runs against (port 5432). The override env var honours
+# HERMES_TEST_POSTGRES_PORT first (matches the compose variable name),
+# then POSTGRES_PORT, then falls back to 5433. Overriding to 5432 is
+# only safe in CI where there is no real install to collide with.
+_TEST_PG_PORT = int(
+    os.environ.get("HERMES_TEST_POSTGRES_PORT")
+    or os.environ.get("POSTGRES_PORT")
+    or "5433"
+)
 postgresql_noproc = pg_factories.postgresql_noproc(
     host="localhost",
-    port=int(os.environ.get("POSTGRES_PORT", "5432")),
+    port=_TEST_PG_PORT,
     user=os.environ.get("POSTGRES_USER", "hermes"),
     password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
     dbname="hermes",

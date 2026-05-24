@@ -87,6 +87,91 @@ uv run hermes db migrate-from-sqlite --sqlite-path ~/.hermes/state.db
 
 ---
 
+## Cognitive substrate (Phase A)
+
+> **Heads up:** Phase A adds an additional `substrate_*` set of tables to your
+> Hermes Postgres database, plus three background asyncio workers (Sentinel,
+> force-reject, partition-maintenance). Hermes continues to behave exactly as
+> before — substrate failures are non-fatal — but the schema migration is
+> permanent. Back up your DB before the first run if you care.
+
+The substrate is a write-only **L0 perception sink** that runs alongside Hermes:
+every user message, assistant response, tool call/result, sub-agent
+spawn/return, session-lifecycle event, and cron dispatch is emitted as a
+*slice* on a named *stream* (`hermes.world.user_message.cli`,
+`hermes.self_action.assistant_response`, etc.). Slices are stored in
+`substrate_slices` (RANGE-partitioned monthly on ingest time) and decided by a
+stub Sentinel (Phase A passes every slice; real defense lands in Phase B+).
+
+**What you get:**
+
+- New schema added via Alembic revision `20260523_0003_substrate_skeleton` —
+  three tables (`substrate_streams`, `substrate_slices`,
+  `substrate_decay_profiles`), 15 auto-registered streams, monthly partition
+  carving.
+- Background workers spawned on Hermes startup: Sentinel (200 ms tick),
+  force-reject (10 s tick, drops pending slices past their decay-profile TTL),
+  partition-maintenance (24 h tick, keeps a rolling window of 3 monthly
+  partitions ahead of `now()`).
+- A `hermes substrate inspect` CLI for poking at substrate state.
+
+**Inspecting substrate state:**
+
+```bash
+hermes substrate inspect            # default summary (streams, slice counts, pending queue)
+hermes substrate inspect streams    # per-stream slice counts
+hermes substrate inspect slices --stream hermes.world.user_message.cli --limit 20
+hermes substrate inspect pending    # current pending-queue depth + oldest age
+hermes substrate inspect profiles   # the 4 seeded decay profiles
+```
+
+If your DB is on an older Alembic revision when Hermes starts, the substrate
+boot raises a `RuntimeError` with the upgrade command to run; set
+`HERMES_AUTO_MIGRATE=1` to upgrade automatically on first boot.
+
+**Out of scope for Phase A** (deferred to later phases): recall API, Curator
+decay loop, LLM-driven sub-agents (Parser, Reflector, …), L1+ layers,
+cross-stream alignment, blob storage, pgvector use. See
+[`PHASE_A_SPEC.md`](PHASE_A_SPEC.md) for the full delivery + non-goals list.
+
+---
+
+## Development testing
+
+The test suite uses `pytest-postgresql` against a **separate** PostgreSQL
+container so the developer's real Hermes DB on port 5432 is never touched.
+
+**One-time setup:**
+
+```bash
+docker compose --profile test up -d postgres-test
+# Starts a dedicated PG on port 5433 with its own volume (hermes_pg_test_data).
+```
+
+**Running tests locally:**
+
+```bash
+# Per-file isolation runner (matches CI). Picks up the test DB via
+# tests/conftest.py:_TEST_PG_PORT which defaults to 5433.
+PYTEST_XDIST_WORKER=run_local uv run python scripts/run_tests_parallel.py tests/substrate/
+
+# Or a single file:
+PYTEST_XDIST_WORKER=run_local uv run python -m pytest tests/substrate/test_commit.py \
+    -o "addopts=" --timeout-method=thread --timeout=120
+```
+
+`PYTEST_XDIST_WORKER` must be set when running pytest directly (the parallel
+runner sets it per subprocess automatically). The value is just a unique label
+— `pytest-postgresql` uses it to derive per-worker DB names so concurrent
+subprocesses don't race on the shared template DB.
+
+**To target a different test PG** (e.g. an external test cluster), set
+`HERMES_TEST_POSTGRES_PORT` (or `POSTGRES_PORT`) before running pytest. CI
+sets `HERMES_TEST_POSTGRES_PORT=5432` to use the ephemeral GitHub Actions
+service container.
+
+---
+
 ## Getting Started
 
 ```bash

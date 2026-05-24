@@ -86,5 +86,36 @@ services:
       timeout: 2s
       retries: 20
 
+  # Dedicated PostgreSQL instance for the test suite. Runs on a different
+  # port (5433 by default) and a different docker volume so pytest can
+  # never collide with the real `hermes` DB. The pytest-postgresql
+  # fixtures in tests/conftest.py honour POSTGRES_PORT — set it to 5433
+  # (or whatever HERMES_TEST_POSTGRES_PORT resolves to) before running
+  # tests, e.g.::
+  #
+  #     docker compose --profile test up -d postgres-test
+  #     POSTGRES_PORT=5433 PYTEST_XDIST_WORKER=run_local \
+  #         uv run python -m pytest tests/substrate/
+  #
+  # Profile-gated so a plain `docker compose up -d` doesn't start it
+  # (most users don't run the test suite from compose).
+  postgres-test:
+    profiles: ["test"]
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-hermes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hermes}
+      POSTGRES_DB:       ${POSTGRES_DB:-hermes}
+    ports:
+      - "${HERMES_TEST_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - hermes_pg_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
 volumes:
   hermes_pg_data:
+  hermes_pg_test_data:

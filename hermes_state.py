@@ -39,6 +39,131 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
     return f"{prefix}."
 
 
+# ---------------------------------------------------------------------------
+# Substrate perception hook bridge — Phase A §7 wiring.
+#
+# Lives at the SessionDB.append_message chokepoint because it's the single
+# function every Hermes call path goes through to persist a turn. Looking
+# up source/model from the session row keeps the per-call-site changes to
+# zero — the conversation loop, gateway intake, ACP server, etc. don't
+# need to learn the substrate's hook API.
+# ---------------------------------------------------------------------------
+
+
+async def _emit_substrate_message_hook(
+    conn,
+    session_id: str,
+    role: str,
+    content: Optional[str],
+    tool_calls: Any,
+    tool_name: Optional[str],
+) -> None:
+    """Best-effort substrate emission for an append_message call.
+
+    Never raises — hook errors are logged and dropped per Phase A spec
+    §6.2 (hooks must never bubble to a Hermes caller). Shares ``conn``
+    so the slice INSERT joins the message INSERT's transaction.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        from substrate.events import hermes_hooks
+    except Exception:  # pragma: no cover — substrate import failure
+        return
+
+    # No-op when substrate isn't booted (CLI subcommands that touch
+    # SessionDB without going through bootstrap_substrate).
+    if hermes_hooks._substrate is None:
+        return
+
+    t_event = datetime.now(timezone.utc)
+
+    # Source + model live on the session row; one extra fetch per
+    # append. The substrate cares about the wire-level metadata but
+    # doesn't need it in the inner messages-write path, so we fetch
+    # lazily here rather than threading it through every caller.
+    try:
+        srow = await conn.fetchrow(
+            "SELECT source, model FROM sessions WHERE id = $1",
+            session_id,
+        )
+    except Exception:
+        srow = None
+    source = (srow["source"] if srow else None) or "unknown"
+    model = (srow["model"] if srow else None) or ""
+
+    try:
+        if role == "user":
+            if content:
+                await hermes_hooks.on_user_message_async(
+                    session_id, source, content, t_event
+                )
+        elif role == "assistant":
+            # An assistant turn may carry both text content AND tool_calls.
+            # Emit the response slice for the text portion (when present)
+            # and a tool_call slice per scheduled call.
+            if content:
+                await hermes_hooks.on_assistant_response_async(
+                    session_id, model, content, t_event
+                )
+            if tool_calls:
+                calls = tool_calls if isinstance(tool_calls, list) else [tool_calls]
+                for call in calls:
+                    name, args = _extract_tool_call(call)
+                    if name is None:
+                        continue
+                    await hermes_hooks.on_tool_call_async(
+                        session_id, name, args, t_event
+                    )
+        elif role == "tool":
+            # A tool message carries the result. We don't get a structured
+            # error field here; the conversation loop passes failure text
+            # in ``content`` for the model to consume — pass it through as
+            # ``result`` and leave ``error=None``.
+            await hermes_hooks.on_tool_result_async(
+                session_id,
+                tool_name or "unknown",
+                content,
+                None,
+                t_event,
+            )
+    except Exception:  # noqa: BLE001 — defensive belt-and-suspenders
+        logger.warning(
+            "substrate message-hook emission raised; continuing",
+            exc_info=True,
+        )
+
+
+def _extract_tool_call(call: Any) -> tuple[Optional[str], dict]:
+    """Pull (tool_name, args_dict) out of a single tool_call entry.
+
+    Tool-call shapes vary by provider — the upstream Hermes
+    representation typically wraps OpenAI-style ``{"function": {"name":
+    ..., "arguments": "..."}}``, sometimes pre-parsed to a dict.
+    Returns ``(None, {})`` if the shape can't be recognised so the hook
+    silently skips the emission rather than asserting on shape.
+    """
+    import json
+
+    if isinstance(call, dict):
+        fn = call.get("function") if isinstance(call.get("function"), dict) else None
+        if fn is not None:
+            name = fn.get("name")
+            args = fn.get("arguments")
+        else:
+            name = call.get("name") or call.get("tool")
+            args = call.get("arguments") or call.get("args")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"_raw": args}
+        if not isinstance(args, dict):
+            args = {}
+        return name, args
+    return None, {}
+
+
 class _AsyncSessionDB:
     """Phase 0 PG-backed replacement for the legacy SQLite `SessionDB`.
 
@@ -68,14 +193,24 @@ class _AsyncSessionDB:
     # === Session lifecycle (Task 8) ===
 
     async def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Insert a session row; silently ignores conflicts (idempotent)."""
+        """Insert a session row; silently ignores conflicts (idempotent).
+
+        Emits a ``hermes.self_state.session_lifecycle`` perception slice
+        in the same transaction (Phase A §7 — atomic with the session
+        INSERT so the substrate's view of session-start can never disagree
+        with the session row). Hook failure is logged + swallowed and
+        does not bubble back to the caller.
+        """
+        from datetime import datetime, timezone
+
         model = kwargs.get("model")
         model_config = kwargs.get("model_config") or {}
         system_prompt = kwargs.get("system_prompt", "")
         user_id = kwargs.get("user_id")
         parent_session_id = kwargs.get("parent_session_id")
         title = kwargs.get("title")
-        async with hermes_db.connection() as conn:
+        t_event = datetime.now(timezone.utc)
+        async with hermes_db.transaction() as conn:
             await conn.execute(
                 """
                 INSERT INTO sessions
@@ -88,6 +223,20 @@ class _AsyncSessionDB:
                 model_config, system_prompt,
                 parent_session_id, title,
             )
+            # Substrate session-lifecycle emission, shared txn. The hook
+            # is a no-op when substrate hasn't been booted; failures inside
+            # the hook are logged but never re-raised to here.
+            try:
+                from substrate.events.hermes_hooks import on_session_start_async
+                await on_session_start_async(
+                    session_id, source, model or "",
+                    t_event, conn=conn,
+                )
+            except Exception:  # noqa: BLE001 — defensive belt-and-suspenders
+                logger.warning(
+                    "substrate on_session_start hook raised; ignoring",
+                    exc_info=True,
+                )
         return session_id
 
     async def end_session(self, session_id: str, end_reason: str) -> None:
@@ -802,6 +951,14 @@ class _AsyncSessionDB:
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = $1",
                     session_id,
                 )
+            # Substrate perception emission (Phase A §7 — wired at the
+            # single message-persist chokepoint). Shares the txn so the
+            # slice and the message row commit together. Failures are
+            # logged + swallowed inside the helper so message persistence
+            # is never blocked by a substrate problem.
+            await _emit_substrate_message_hook(
+                conn, session_id, role, content, tool_calls, tool_name,
+            )
         return msg_id
 
     async def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:

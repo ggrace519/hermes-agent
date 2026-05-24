@@ -1480,6 +1480,22 @@ def _run_single_child(
         import uuid as _uuid
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
+
+        # Substrate perception — emit subagent_spawn. The sync facade is
+        # safe here because _run_single_child runs in a worker thread
+        # (no asyncio loop on this thread). Hook is a no-op when
+        # substrate isn't booted; its own try/except swallows failures.
+        try:
+            from datetime import datetime, timezone
+            from substrate.events.hermes_hooks import on_subagent_spawn
+            _parent_sess = getattr(parent_agent, "session_id", None) or (
+                _parent_sid if isinstance(_parent_sid, str) else ""
+            )
+            on_subagent_spawn(
+                _parent_sess, child_task_id, goal, datetime.now(timezone.utc)
+            )
+        except Exception:  # noqa: BLE001 — substrate failures non-fatal
+            pass
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
         wall_start = time.time()
         parent_reads_snapshot = (
@@ -1813,6 +1829,21 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
+        # Substrate perception — emit subagent_return on success path.
+        try:
+            from datetime import datetime, timezone
+            from substrate.events.hermes_hooks import on_subagent_return
+            _parent_sess = getattr(parent_agent, "session_id", None) or (
+                _parent_sid if isinstance(_parent_sid, str) else ""
+            )
+            _summary_text = str(entry.get("summary") or entry.get("status") or "")
+            on_subagent_return(
+                _parent_sess, child_task_id, _summary_text,
+                datetime.now(timezone.utc),
+            )
+        except Exception:  # noqa: BLE001 — substrate failures non-fatal
+            pass
+
         return entry
 
     except Exception as exc:
@@ -1829,6 +1860,26 @@ def _run_single_child(
                 )
             except Exception as e:
                 logger.debug("Progress callback failure relay failed: %s", e)
+
+        # Substrate perception — emit subagent_return on failure path so
+        # the substrate sees the lifecycle close regardless of outcome.
+        try:
+            from datetime import datetime, timezone
+            from substrate.events.hermes_hooks import on_subagent_return
+            _parent_sess = getattr(parent_agent, "session_id", None) or (
+                _parent_sid if isinstance(_parent_sid, str) else ""
+            )
+            # child_task_id is set inside the try block above; fall back
+            # to subagent_id (the registered handle) if the failure
+            # happened before the assignment.
+            _cid = locals().get("child_task_id") or _subagent_id or ""
+            on_subagent_return(
+                _parent_sess, _cid, f"error: {exc}",
+                datetime.now(timezone.utc),
+            )
+        except Exception:  # noqa: BLE001 — substrate failures non-fatal
+            pass
+
         return {
             "task_index": task_index,
             "status": "error",
