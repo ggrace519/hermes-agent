@@ -116,6 +116,58 @@ services:
       timeout: 2s
       retries: 20
 
+  # Test runner — lean Debian + Python 3.11 + uv + dev deps. Mirrors
+  # the GH Actions CI environment so failures reproduce locally and
+  # Windows-host noise (POSIX file perms, /mnt/c paths, tilde expansion)
+  # disappears. Gated behind the `test` profile alongside postgres-test
+  # so plain `docker compose up -d` doesn't build it.
+  #
+  # Usage:
+  #     docker compose --profile test up -d postgres-test
+  #     docker compose --profile test build test-runner
+  #     docker compose --profile test run --rm test-runner   # full suite
+  #     docker compose --profile test run --rm test-runner \
+  #         python -m pytest tests/substrate/ -o "addopts=" \
+  #         --timeout-method=thread --timeout=300
+  #
+  # Source is bind-mounted at /work so test edits don't require a
+  # rebuild. The .venv layer survives because it lives in the image
+  # at /work/.venv — bind mounts on Linux overlay only the host paths
+  # that exist; ours does not contain a .venv (gitignored).
+  test-runner:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.test
+    image: hermes-test-runner
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+    environment:
+      # Inside the compose network, the test PG is reachable by service
+      # name on its container-side port 5432 (not the host-mapped 5433).
+      HERMES_PG_DSN: postgresql://hermes:hermes@postgres-test:5432/hermes
+      HERMES_TEST_POSTGRES_HOST: postgres-test
+      HERMES_TEST_POSTGRES_PORT: "5432"
+      POSTGRES_USER: hermes
+      POSTGRES_PASSWORD: hermes
+      # CI parity — set so the perf microbenches honour the CI ceilings.
+      CI: "true"
+      # Deterministic runtime.
+      TZ: UTC
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONHASHSEED: "0"
+    volumes:
+      # Bind-mount source so iterating on tests doesn't need a rebuild.
+      # The venv lives at /opt/venv (outside /work) so this bind-mount
+      # doesn't hide it.
+      - .:/work
+      # Persist uv cache between runs to speed up dep installs. Lives
+      # outside /work for the same reason as the venv.
+      - hermes_test_uv_cache:/opt/uv-cache
+
 volumes:
   hermes_pg_data:
   hermes_pg_test_data:
+  hermes_test_uv_cache:

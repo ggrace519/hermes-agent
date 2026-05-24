@@ -170,6 +170,35 @@ subprocesses don't race on the shared template DB.
 sets `HERMES_TEST_POSTGRES_PORT=5432` to use the ephemeral GitHub Actions
 service container.
 
+**Running tests in a Linux container (matches CI exactly):**
+
+Windows hosts hit a class of pytest failures that are host-environment
+noise (POSIX file permissions, `/mnt/c` paths in acp_adapter tests,
+tilde expansion in cron_workdir tests) rather than real bugs. The
+`test-runner` docker-compose service runs the suite inside Debian +
+Python 3.11 + the `[all,dev]` extras — mirroring the GH Actions CI
+environment exactly — so failures reproduce locally and Windows-host
+noise disappears.
+
+```bash
+# First-time build (~3 min):
+docker compose --profile test up -d postgres-test
+docker compose --profile test build test-runner
+
+# Full suite (~15 min):
+scripts/run_tests_docker.sh
+
+# Single file:
+scripts/run_tests_docker.sh tests/substrate/test_commit.py
+
+# Subset + extra pytest args:
+scripts/run_tests_docker.sh tests/substrate/ -- -v -k 'reinforce'
+```
+
+Source is bind-mounted so test edits don't trigger an image rebuild;
+the venv lives at `/opt/venv` inside the image to survive the bind
+mount. The `postgres-test` container is shared with host-side runs.
+
 ---
 
 ## Getting Started

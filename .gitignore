@@ -5,6 +5,16 @@
 __pycache__/
 .venv/
 .vscode/
+
+# Test-container HERMES_HOME artifacts. The docker-compose test-runner
+# sets HOME=/work so any test that hits the default HERMES_HOME lands
+# files here. Not real user data; safe to ignore.
+/.hermes/
+/.local/
+
+# Working-scratch directory for in-progress drafts (the
+# PHASE_A_DELIVERY_ADR.md was the first inhabitant). Not committed.
+/_scratch/
 .env
 .env.local
 .env.development.local

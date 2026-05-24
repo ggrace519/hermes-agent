@@ -873,8 +873,17 @@ _TEST_PG_PORT = int(
     or os.environ.get("POSTGRES_PORT")
     or "5433"
 )
+# Default host is ``localhost`` for local-host runs (pytest invoked
+# directly on the developer's machine). Inside the docker-compose
+# test-runner container ``localhost`` is the container itself, so the
+# override env vars route to the ``postgres-test`` compose service.
+_TEST_PG_HOST = (
+    os.environ.get("HERMES_TEST_POSTGRES_HOST")
+    or os.environ.get("POSTGRES_HOST")
+    or "localhost"
+)
 postgresql_noproc = pg_factories.postgresql_noproc(
-    host="localhost",
+    host=_TEST_PG_HOST,
     port=_TEST_PG_PORT,
     user=os.environ.get("POSTGRES_USER", "hermes"),
     password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
