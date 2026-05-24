@@ -869,7 +869,16 @@ postgresql_noproc = pg_factories.postgresql_noproc(
     password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
     dbname="hermes",
 )
-postgresql = pg_factories.postgresql("postgresql_noproc", dbname="hermes_test")
+# Note: we deliberately don't pass ``dbname="hermes_test"`` here. The
+# ``postgresql`` factory uses ``proc_fixture.dbname`` when ``dbname`` is
+# absent, and that name has already been xdistified by pytest-postgresql
+# to include the per-subprocess worker id (e.g. ``hermesrun_42``). Hard-
+# coding ``hermes_test`` would route every concurrent subprocess onto
+# the same per-test DB name and surface as
+# ``DuplicateDatabase: database "hermes_test" already exists`` when two
+# subprocesses race to create it. Letting the factory inherit the
+# xdistified name keeps each subprocess on its own per-test DB.
+postgresql = pg_factories.postgresql("postgresql_noproc")
 
 
 @pytest.fixture
