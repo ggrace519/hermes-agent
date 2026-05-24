@@ -84,6 +84,23 @@ class SliceRepo:
           oldest pending.
         """
         slice_id = uuid4()
+        # Clock-skew safety: cap caller-supplied timestamps to PG's
+        # ``now()`` inside the INSERT so the
+        # ``event <= perception <= ingest`` CHECK constraints hold even
+        # when the Hermes host's wall clock drifts a few ms ahead of
+        # PG's wall clock. This is the realistic case when Hermes runs
+        # in a VM separate from the Postgres container.
+        #
+        # Formula (let E, P be caller's event_time_world,
+        # perception_time_world; now() be PG's wall clock at INSERT):
+        #   stored_event      = LEAST(E, now())
+        #   stored_perception = LEAST(GREATEST(P, E), now())
+        # Walk through:
+        #   - E ≤ now, P ≤ now, P ≥ E: stored = (E, P).
+        #   - E ≤ now, P > now (skew):  stored = (E, now).
+        #   - E > now (skew):           stored = (now, now).
+        # In every case stored_event ≤ stored_perception ≤ now (ingest),
+        # so the CHECK constraints are satisfied.
         row = await conn.fetchrow(
             """
             INSERT INTO substrate_slices
@@ -94,7 +111,10 @@ class SliceRepo:
                  sentinel_state, pending_committed_at,
                  salience_score, metadata, summary_of)
             VALUES
-                ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                ($1, $2, $3, $4,
+                 LEAST($5, now()),
+                 LEAST(GREATEST($6, $5), now()),
+                 $7, $8, $9,
                  'pending', now(), 1.0, $10, $11)
             RETURNING slice_id, ingest_time_world
             """,
