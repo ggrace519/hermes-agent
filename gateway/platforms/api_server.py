@@ -317,6 +317,48 @@ def check_api_server_requirements() -> bool:
     return AIOHTTP_AVAILABLE
 
 
+# Filesystem markers for WAL-mode incompatibility. Lifted verbatim from
+# the pre-Phase-0 ``hermes_state.apply_wal_with_fallback`` so the
+# response_store DB behaves identically on NFS/SMB/FUSE mounts.
+_WAL_INCOMPAT_MARKERS = (
+    "locking protocol",
+    "database is locked",
+    "disk i/o error",
+)
+
+# Module-level dedup: log the WAL-fallback warning only once per
+# (process, db_label) pair so an NFS-mounted HERMES_HOME doesn't spam
+# the gateway log on every restart.
+_wal_fallback_warned = set()
+
+
+def _apply_wal_with_fallback(conn: sqlite3.Connection, *, db_label: str) -> str:
+    """Set ``journal_mode=WAL`` on ``conn``; fall back to DELETE if the
+    filesystem rejects WAL. Returns the mode actually applied.
+
+    Replaces the removed ``hermes_state.apply_wal_with_fallback`` helper
+    for the gateway's response_store. The session DB itself no longer
+    needs this — it moved to PostgreSQL in Phase 0.
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return "wal"
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
+            raise
+        if db_label not in _wal_fallback_warned:
+            _wal_fallback_warned.add(db_label)
+            logger.warning(
+                "%s: WAL unsupported on this filesystem (%s) — "
+                "falling back to journal_mode=DELETE.",
+                db_label,
+                exc,
+            )
+        conn.execute("PRAGMA journal_mode=DELETE")
+        return "delete"
+
+
 class ResponseStore:
     """
     SQLite-backed LRU store for Responses API state.
@@ -341,12 +383,12 @@ class ResponseStore:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
-        # Use shared WAL-fallback helper so response_store.db degrades
-        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
-        # issue addressed for state.db/kanban.db — see
-        # hermes_state._WAL_INCOMPAT_MARKERS).
-        from hermes_state import apply_wal_with_fallback
-        apply_wal_with_fallback(self._conn, db_label="response_store.db")
+        # WAL journal mode with graceful fallback so response_store.db
+        # degrades safely on NFS/SMB/FUSE-mounted HERMES_HOME. The shared
+        # helper that used to live in hermes_state was removed when the
+        # session DB moved to PostgreSQL in Phase 0; this is the response-
+        # store's own copy of the same logic.
+        _apply_wal_with_fallback(self._conn, db_label="response_store.db")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS responses (
                 response_id TEXT PRIMARY KEY,
