@@ -30,6 +30,10 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  # claude-code-action requests an OIDC token to authenticate to GitHub
+  # for the inline-review-comment API. Without ``id-token: write`` the
+  # action fails immediately with "Could not fetch an OIDC token".
+  id-token: write
 
 concurrency:
   # Only one Claude review per PR ref at a time. A new push cancels the
