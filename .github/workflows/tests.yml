@@ -77,6 +77,33 @@ jobs:
         env:
           HERMES_PG_DSN: postgresql://hermes:hermes@localhost:5432/hermes
 
+      - name: Pre-create hermes_tmpl template database
+        # ``scripts/run_tests_parallel.py`` spawns 8 subprocesses, each of which
+        # invokes pytest-postgresql separately. Without coordination, those
+        # subprocesses race to CREATE / ALTER / DROP the shared ``hermes_tmpl``
+        # template DB and ~5 cascade errors land in tests that touch the
+        # ``postgresql`` fixture (test_hermes_db, test_pool_contention, half
+        # the hermes_state suite, etc.). The error in CI looks like::
+        #
+        #     psycopg.errors.InvalidCatalogName: database "hermes_tmpl" does not exist
+        #
+        # because one worker's session-end teardown drops the template while
+        # another worker is still cloning per-test DBs from it.
+        #
+        # Fix: pre-create ``hermes_tmpl`` once here, cloned from the freshly
+        # migrated ``hermes`` DB, and mark it ``IS_TEMPLATE true`` so every
+        # worker's "does the template exist?" check short-circuits to "yes"
+        # and skips the racy create/migrate steps.
+        run: |
+          set -euo pipefail
+          PGPASSWORD=hermes psql -h localhost -U hermes -d postgres <<'SQL'
+          DROP DATABASE IF EXISTS hermes_tmpl;
+          CREATE DATABASE hermes_tmpl TEMPLATE hermes;
+          ALTER DATABASE hermes_tmpl IS_TEMPLATE true;
+          SQL
+          PGPASSWORD=hermes psql -h localhost -U hermes -d postgres \
+            -c "SELECT datname, datistemplate FROM pg_database WHERE datname IN ('hermes','hermes_tmpl');"
+
       - name: Run tests
         # Per-file isolation via scripts/run_tests_parallel.py: discovers
         # every test_*.py file under tests/ (excluding integration/ + e2e/),
