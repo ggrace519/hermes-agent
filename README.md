@@ -63,6 +63,30 @@ hermes              # start chatting!
 
 ---
 
+## Database setup (Phase 0+)
+
+Hermes uses PostgreSQL 17 with the pgvector extension.
+
+**For local development:**
+
+```bash
+docker compose up -d postgres
+export HERMES_PG_DSN=postgresql://hermes:hermes@localhost:5432/hermes
+uv run alembic -c migrations/alembic.ini upgrade head
+```
+
+**For production deploys:** point `HERMES_PG_DSN` at any PostgreSQL 17+ instance with the `vector` and `pg_trgm` extensions installed. Run `alembic upgrade head` as part of your deploy.
+
+**Migrating from a SQLite Hermes (upstream):**
+
+```bash
+uv run hermes db migrate-from-sqlite --sqlite-path ~/.hermes/state.db
+```
+
+(One-shot; safe to re-run with `--dry-run` to preview.)
+
+---
+
 ## Getting Started
 
 ```bash

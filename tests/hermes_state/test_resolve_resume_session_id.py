@@ -1,42 +1,46 @@
 """Regression guard for #15000: --resume <id> after compression loses messages.
 
 Context compression ends the current session and forks a new child session
-(linked by ``parent_session_id``). The SQLite flush cursor is reset, so
+(linked by ``parent_session_id``). The PG flush cursor is reset, so
 only the latest descendant ends up with rows in the ``messages`` table —
 the parent row has ``message_count = 0``. ``hermes --resume <parent_id>``
 used to load zero rows and show a blank chat.
 
-``SessionDB.resolve_resume_session_id()`` walks the parent → child chain
+``_AsyncSessionDB.resolve_resume_session_id()`` walks the parent → child chain
 and redirects to the first descendant that actually has messages. These
 tests pin that behaviour.
 """
-import time
+from datetime import datetime, timedelta, timezone
 
+import hermes_db
 import pytest
+import pytest_asyncio
 
-from hermes_state import SessionDB
-
-
-@pytest.fixture
-def db(tmp_path):
-    return SessionDB(tmp_path / "state.db")
+from hermes_state import _AsyncSessionDB
 
 
-def _make_chain(db: SessionDB, ids_with_parent):
+@pytest_asyncio.fixture
+async def db(hermes_db_initialized):
+    return _AsyncSessionDB()
+
+
+async def _make_chain(db: _AsyncSessionDB, ids_with_parent):
     """Create sessions in order, forcing started_at so ordering is deterministic."""
-    base = int(time.time()) - 10_000
+    base_dt = datetime.now(timezone.utc) - timedelta(seconds=10_000)
     for i, (sid, parent) in enumerate(ids_with_parent):
-        db.create_session(sid, source="cli", parent_session_id=parent)
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (base + i * 100, sid),
-        )
-    db._conn.commit()
+        await db.create_session(sid, source="cli", parent_session_id=parent)
+        started_at = base_dt + timedelta(seconds=i * 100)
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET started_at = $1 WHERE id = $2",
+                started_at, sid,
+            )
 
 
-def test_redirects_from_empty_head_to_descendant_with_messages(db):
+@pytest.mark.asyncio
+async def test_redirects_from_empty_head_to_descendant_with_messages(db):
     # Reproducer shape from #15000: 6 sessions, only the 5th holds messages.
-    _make_chain(db, [
+    await _make_chain(db, [
         ("head",   None),
         ("mid1",   "head"),
         ("mid2",   "mid1"),
@@ -45,52 +49,59 @@ def test_redirects_from_empty_head_to_descendant_with_messages(db):
         ("tail",   "bulk"),    # empty tail after another compression
     ])
     for i in range(5):
-        db.append_message("bulk", role="user", content=f"msg {i}")
+        await db.append_message("bulk", role="user", content=f"msg {i}")
 
-    assert db.resolve_resume_session_id("head") == "bulk"
-
-
-def test_returns_self_when_session_has_messages(db):
-    _make_chain(db, [("root", None), ("child", "root")])
-    db.append_message("root", role="user", content="hi")
-    assert db.resolve_resume_session_id("root") == "root"
+    assert await db.resolve_resume_session_id("head") == "bulk"
 
 
-def test_returns_self_when_no_descendant_has_messages(db):
-    _make_chain(db, [("root", None), ("child1", "root"), ("child2", "child1")])
-    assert db.resolve_resume_session_id("root") == "root"
+@pytest.mark.asyncio
+async def test_returns_self_when_session_has_messages(db):
+    await _make_chain(db, [("root", None), ("child", "root")])
+    await db.append_message("root", role="user", content="hi")
+    assert await db.resolve_resume_session_id("root") == "root"
 
 
-def test_returns_self_for_isolated_session(db):
-    db.create_session("isolated", source="cli")
-    assert db.resolve_resume_session_id("isolated") == "isolated"
+@pytest.mark.asyncio
+async def test_returns_self_when_no_descendant_has_messages(db):
+    await _make_chain(db, [("root", None), ("child1", "root"), ("child2", "child1")])
+    assert await db.resolve_resume_session_id("root") == "root"
 
 
-def test_returns_self_for_nonexistent_session(db):
-    assert db.resolve_resume_session_id("does_not_exist") == "does_not_exist"
+@pytest.mark.asyncio
+async def test_returns_self_for_isolated_session(db):
+    await db.create_session("isolated", source="cli")
+    assert await db.resolve_resume_session_id("isolated") == "isolated"
 
 
-def test_empty_session_id_passthrough(db):
-    assert db.resolve_resume_session_id("") == ""
-    assert db.resolve_resume_session_id(None) is None
+@pytest.mark.asyncio
+async def test_returns_self_for_nonexistent_session(db):
+    assert await db.resolve_resume_session_id("does_not_exist") == "does_not_exist"
 
 
-def test_walks_from_middle_of_chain(db):
+@pytest.mark.asyncio
+async def test_empty_session_id_passthrough(db):
+    assert await db.resolve_resume_session_id("") == ""
+    assert await db.resolve_resume_session_id(None) is None
+
+
+@pytest.mark.asyncio
+async def test_walks_from_middle_of_chain(db):
     # If the user happens to know an intermediate ID, we still find the msg-bearing descendant.
-    _make_chain(db, [("a", None), ("b", "a"), ("c", "b"), ("d", "c")])
-    db.append_message("d", role="user", content="x")
-    assert db.resolve_resume_session_id("b") == "d"
-    assert db.resolve_resume_session_id("c") == "d"
+    await _make_chain(db, [("a", None), ("b", "a"), ("c", "b"), ("d", "c")])
+    await db.append_message("d", role="user", content="x")
+    assert await db.resolve_resume_session_id("b") == "d"
+    assert await db.resolve_resume_session_id("c") == "d"
 
 
-def test_prefers_most_recent_child_when_fork_exists(db):
+@pytest.mark.asyncio
+async def test_prefers_most_recent_child_when_fork_exists(db):
     # If a session was somehow forked (two children), pick the latest one.
     # In practice, compression only produces single-chain shape, but the helper
     # should degrade gracefully.
-    _make_chain(db, [
+    await _make_chain(db, [
         ("parent", None),
         ("older_fork", "parent"),
         ("newer_fork", "parent"),
     ])
-    db.append_message("newer_fork", role="user", content="x")
-    assert db.resolve_resume_session_id("parent") == "newer_fork"
+    await db.append_message("newer_fork", role="user", content="x")
+    assert await db.resolve_resume_session_id("parent") == "newer_fork"

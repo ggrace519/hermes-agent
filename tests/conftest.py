@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -27,6 +28,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+logger = logging.getLogger(__name__)
 
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -820,3 +823,93 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+# ── Phase 0: PostgreSQL test fixtures ────────────────────────────────────────
+#
+# Uses the docker-compose postgres (noproc variant) so no pg_ctl.exe is
+# required on Windows. Bring it up with: docker compose up -d postgres
+#
+# Connection defaults match docker-compose.yml:
+#   POSTGRES_USER=hermes  POSTGRES_PASSWORD=hermes  POSTGRES_DB=hermes
+# Override via env vars POSTGRES_PORT / POSTGRES_USER / POSTGRES_PASSWORD.
+
+import pytest_asyncio
+import pytest_postgresql.factories as pg_factories
+from alembic import command
+from alembic.config import Config
+
+# ── Pre-session template DB cleanup ──────────────────────────────────────────
+#
+# pytest-postgresql 8.1 creates a template DB (``hermes_tmpl`` here, derived
+# from ``dbname="hermes"`` below) the first time the ``postgresql`` fixture
+# is requested, then clones it for each per-test DB. The template is meant
+# to survive across pytest sessions for speed.
+#
+# An earlier revision of this conftest dropped the template at session start
+# to work around a ``DuplicateDatabase: hermes_tmpl already exists`` error
+# on local reruns against the same Docker cluster — but that ALTERed an empty
+# (or absent) DB which then either raced with pytest-postgresql's own
+# create-template path (CI) or left a hole pytest-postgresql never refilled
+# (caching its template-exists state from the previous session).
+#
+# Current approach: don't pre-emptively drop. CI starts from a fresh
+# postgres container so the template doesn't exist. Local dev with a
+# persistent container handles re-runs because pytest-postgresql 8.1's
+# template creation is idempotent (CREATE DATABASE IF NOT EXISTS-style
+# via DatabaseJanitor at the fixture level). If a stale template is
+# blocking your local run, drop it once by hand:
+#     psql -U hermes -h localhost -c "DROP DATABASE IF EXISTS hermes_tmpl"
+
+
+postgresql_noproc = pg_factories.postgresql_noproc(
+    host="localhost",
+    port=int(os.environ.get("POSTGRES_PORT", "5432")),
+    user=os.environ.get("POSTGRES_USER", "hermes"),
+    password=os.environ.get("POSTGRES_PASSWORD", "hermes"),
+    dbname="hermes",
+)
+# Note: we deliberately don't pass ``dbname="hermes_test"`` here. The
+# ``postgresql`` factory uses ``proc_fixture.dbname`` when ``dbname`` is
+# absent, and that name has already been xdistified by pytest-postgresql
+# to include the per-subprocess worker id (e.g. ``hermesrun_42``). Hard-
+# coding ``hermes_test`` would route every concurrent subprocess onto
+# the same per-test DB name and surface as
+# ``DuplicateDatabase: database "hermes_test" already exists`` when two
+# subprocesses race to create it. Letting the factory inherit the
+# xdistified name keeps each subprocess on its own per-test DB.
+postgresql = pg_factories.postgresql("postgresql_noproc")
+
+
+@pytest.fixture
+def hermes_db_dsn(postgresql):
+    """A freshly-migrated PG DSN for one test.
+
+    Runs Alembic upgrade head against a per-test database created against
+    the docker-compose postgres cluster. Each test gets a clean schema;
+    the cluster keeps running between tests for speed.
+    """
+    info = postgresql.info
+    password_part = f":{info.password}@" if info.password else "@"
+    dsn = f"postgresql://{info.user}{password_part}{info.host}:{info.port}/{info.dbname}"
+    cfg = Config("migrations/alembic.ini")
+    # env.py reads HERMES_PG_DSN to build the SQLAlchemy URL.
+    prev = os.environ.get("HERMES_PG_DSN")
+    os.environ["HERMES_PG_DSN"] = dsn
+    try:
+        command.upgrade(cfg, "head")
+        yield dsn
+    finally:
+        if prev is None:
+            os.environ.pop("HERMES_PG_DSN", None)
+        else:
+            os.environ["HERMES_PG_DSN"] = prev
+
+
+@pytest_asyncio.fixture
+async def hermes_db_initialized(hermes_db_dsn):
+    """Convenience fixture: also calls hermes_db.init() / close()."""
+    import hermes_db
+    await hermes_db.init(hermes_db_dsn)
+    yield hermes_db_dsn
+    await hermes_db.close()

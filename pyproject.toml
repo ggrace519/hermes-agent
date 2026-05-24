@@ -64,6 +64,10 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
+  # PostgreSQL async driver for Phase 0 migration (Hermes SQLite → PG).
+  "asyncpg==0.31.0",
+  # Database migrations for PostgreSQL schema management.
+  "alembic==1.18.4",
 ]
 
 [project.optional-dependencies]
@@ -84,7 +88,20 @@ modal = ["modal==1.3.4"]
 daytona = ["daytona==0.155.0"]
 vercel = ["vercel==0.5.7"]
 hindsight = ["hindsight-client==0.6.1"]
-dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "pytest-timeout==2.4.0", "mcp==1.26.0", "ty==0.0.21", "ruff==0.15.10"]
+dev = [
+  "debugpy==1.8.20",
+  "pytest==9.0.2",
+  "pytest-asyncio==1.3.0",
+  "pytest-timeout==2.4.0",
+  "pytest-postgresql==8.1.0",
+  # psycopg-binary ships libpq as a bundled wheel — required by pytest-postgresql
+  # on Windows where no system libpq is installed. Pin matches the psycopg version
+  # already pulled in transitively by pytest-postgresql (3.3.4).
+  "psycopg-binary==3.3.4",
+  "mcp==1.26.0",
+  "ty==0.0.21",
+  "ruff==0.15.10",
+]
 messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py[voice]==2.7.1", "aiohttp==3.13.3", "brotlicffi==1.2.0.1", "slack-bolt==1.27.0", "slack-sdk==3.40.1", "qrcode==7.4.2"]
 cron = []  # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt==1.27.0", "slack-sdk==3.40.1", "aiohttp==3.13.3"]
@@ -212,7 +229,7 @@ hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
-py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils"]
+py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_db", "hermes_state", "hermes_time", "hermes_logging", "utils"]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
@@ -238,6 +255,15 @@ markers = [
 # file a fresh Python interpreter; pytest-timeout catches Python-level
 # hangs within a file.
 addopts = "-m 'not integration' --timeout=30 --timeout-method=signal"
+# Why not ``--postgresql-drop-test-database``? With per-subprocess worker
+# ids (PYTEST_XDIST_WORKER injected by scripts/run_tests_parallel.py),
+# each subprocess gets its own template DB name (e.g. ``hermesrun_42_tmpl``)
+# that never pre-exists. The drop flag tries to ``ALTER DATABASE … allow_
+# connections false`` before init(), which raises
+# ``InvalidCatalogName: database "…_tmpl" does not exist`` and kills the
+# session before any test runs. Skipping the upfront drop is safe because
+# pytest-postgresql calls CREATE DATABASE in ``with janitor:`` itself and
+# the per-subprocess names never collide.
 
 [tool.ty.environment]
 python-version = "3.13"

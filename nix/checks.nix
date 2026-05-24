@@ -95,8 +95,30 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           export HOME=$(mktemp -d)
 
           echo "=== Checking hermes --help ==="
-          ${hermes-agent}/bin/hermes --help 2>&1 | grep -q "gateway" || (echo "FAIL: gateway subcommand missing"; exit 1)
-          ${hermes-agent}/bin/hermes --help 2>&1 | grep -q "config" || (echo "FAIL: config subcommand missing"; exit 1)
+          # Capture output once so a missing subcommand prints the full --help
+          # transcript and any traceback for debugging — `grep -q` discarded
+          # the evidence that we needed in CI logs.
+          HELP_OUT=$(${hermes-agent}/bin/hermes --help 2>&1) || {
+            rc=$?
+            echo "--- hermes --help exited $rc ---"
+            echo "$HELP_OUT"
+            echo "--- end transcript ---"
+            exit 1
+          }
+          echo "$HELP_OUT" | grep -q "gateway" || {
+            echo "FAIL: gateway subcommand missing"
+            echo "--- full hermes --help transcript ---"
+            echo "$HELP_OUT"
+            echo "--- end transcript ---"
+            exit 1
+          }
+          echo "$HELP_OUT" | grep -q "config" || {
+            echo "FAIL: config subcommand missing"
+            echo "--- full hermes --help transcript ---"
+            echo "$HELP_OUT"
+            echo "--- end transcript ---"
+            exit 1
+          }
           echo "PASS: All subcommands accessible"
 
           echo "=== All CLI checks passed ==="

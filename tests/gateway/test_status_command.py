@@ -53,7 +53,8 @@ def _make_runner(session_entry: SessionEntry, *, platform: Platform = Platform.T
     runner._session_run_generation = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = MagicMock()
+    # After Task 22 cutover, _session_db methods are async; use AsyncMock.
+    runner._session_db = AsyncMock()
     runner._session_db.get_session_title.return_value = None
     # Default: no DB row → /status reports 0 tokens.  Tests that exercise
     # the populated path override this.

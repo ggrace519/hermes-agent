@@ -8,9 +8,15 @@ from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch
 
+import hermes_db
 from acp_adapter import session as acp_session
 from acp_adapter.session import SessionManager, SessionState
 from hermes_state import SessionDB
+
+
+def _sync(coro):
+    """Tiny shim — wrap an async SessionDB call so tests stay sync-shaped."""
+    return hermes_db.run_sync(coro)
 
 
 def _mock_agent():
@@ -210,7 +216,7 @@ class TestListAndCleanup:
         manager.save_session(state.session_id)
 
         db = manager._get_db()
-        messages = db.get_messages_as_conversation(state.session_id)
+        messages = _sync(db.get_messages_as_conversation(state.session_id))
         assert messages == [{"role": "user", "content": "original"}]
 
     def test_cleanup_clears_all(self, manager):
@@ -279,11 +285,13 @@ class TestPersistence:
         state = manager.create_session(cwd="/project")
         db = manager._get_db()
         assert db is not None
-        row = db.get_session(state.session_id)
+        row = _sync(db.get_session(state.session_id))
         assert row is not None
         assert row["source"] == "acp"
-        # cwd stored in model_config JSON
-        mc = json.loads(row["model_config"])
+        # cwd stored in model_config JSON (or already-decoded dict via codec)
+        mc = row["model_config"]
+        if isinstance(mc, str):
+            mc = json.loads(mc)
         assert mc["cwd"] == "/project"
 
     def test_get_session_restores_from_db(self, manager):
@@ -316,26 +324,26 @@ class TestPersistence:
         manager.save_session(state.session_id)
 
         db = manager._get_db()
-        messages = db.get_messages_as_conversation(state.session_id)
+        messages = _sync(db.get_messages_as_conversation(state.session_id))
         assert len(messages) == 1
         assert messages[0]["content"] == "test"
 
     def test_remove_session_deletes_from_db(self, manager):
         state = manager.create_session()
         db = manager._get_db()
-        assert db.get_session(state.session_id) is not None
+        assert _sync(db.get_session(state.session_id)) is not None
         manager.remove_session(state.session_id)
-        assert db.get_session(state.session_id) is None
+        assert _sync(db.get_session(state.session_id)) is None
 
     def test_cleanup_removes_all_from_db(self, manager):
         s1 = manager.create_session()
         s2 = manager.create_session()
         db = manager._get_db()
-        assert db.get_session(s1.session_id) is not None
-        assert db.get_session(s2.session_id) is not None
+        assert _sync(db.get_session(s1.session_id)) is not None
+        assert _sync(db.get_session(s2.session_id)) is not None
         manager.cleanup()
-        assert db.get_session(s1.session_id) is None
-        assert db.get_session(s2.session_id) is None
+        assert _sync(db.get_session(s1.session_id)) is None
+        assert _sync(db.get_session(s2.session_id)) is None
 
     def test_list_sessions_includes_db_only(self, manager):
         """Sessions only in DB (not in memory) appear in list_sessions."""
@@ -376,12 +384,12 @@ class TestPersistence:
         state.history.append({"role": "user", "content": "Investigate broken ACP history in Zed"})
         manager.save_session(state.session_id)
         db = manager._get_db()
-        db.set_session_title(state.session_id, "Fix Zed ACP history")
+        _sync(db.set_session_title(state.session_id, "Fix Zed ACP history"))
 
         listing = manager.list_sessions(cwd="/named")
         assert listing[0]["title"] == "Fix Zed ACP history"
 
-        db.set_session_title(state.session_id, "")
+        _sync(db.set_session_title(state.session_id, ""))
         listing = manager.list_sessions(cwd="/named")
         assert listing[0]["title"].startswith("Investigate broken ACP history")
 
@@ -428,27 +436,29 @@ class TestPersistence:
 
         # Should also be persisted in DB.
         db = manager._get_db()
-        row = db.get_session(sid)
-        mc = json.loads(row["model_config"])
+        row = _sync(db.get_session(sid))
+        mc = row["model_config"]
+        if isinstance(mc, str):
+            mc = json.loads(mc)
         assert mc["cwd"] == "/new"
 
     def test_only_restores_acp_sessions(self, manager):
         """get_session should not restore non-ACP sessions from DB."""
         db = manager._get_db()
         # Manually create a CLI session in the DB.
-        db.create_session(session_id="cli-session-123", source="cli", model="test")
+        _sync(db.create_session(session_id="cli-session-123", source="cli", model="test"))
         # Should not be found via ACP SessionManager.
         assert manager.get_session("cli-session-123") is None
 
     def test_sessions_searchable_via_fts(self, manager):
-        """ACP sessions stored in SessionDB are searchable via FTS5."""
+        """ACP sessions stored in SessionDB are searchable via PG tsvector + pg_trgm."""
         state = manager.create_session()
         state.history.append({"role": "user", "content": "how do I configure nginx"})
         state.history.append({"role": "assistant", "content": "Here is the nginx config..."})
         manager.save_session(state.session_id)
 
         db = manager._get_db()
-        results = db.search_messages("nginx")
+        results = _sync(db.search_messages("nginx"))
         assert len(results) > 0
         session_ids = {r["session_id"] for r in results}
         assert state.session_id in session_ids

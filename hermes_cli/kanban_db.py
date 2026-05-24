@@ -1,26 +1,15 @@
-"""SQLite-backed Kanban board for multi-profile, multi-project collaboration.
+"""PostgreSQL-backed Kanban board for multi-profile, multi-project collaboration (Phase 0+).
 
-In a fresh install the board lives at ``<root>/kanban.db`` where
-``<root>`` is the **shared Hermes root** (the parent of any active
-profile). Profiles intentionally collapse onto a shared board: it IS
-the cross-profile coordination primitive. A worker spawned with
-``hermes -p <profile>`` joins the same board as the dispatcher that
-claimed the task. The same applies to ``<root>/kanban/workspaces/`` and
-``<root>/kanban/logs/``.
+All kanban data lives in PostgreSQL 17 (via the shared asyncpg pool from
+hermes_db). Each board is identified by a ``slug`` stored in the
+``kanban_boards`` table; all task/event rows carry a ``board_slug`` column
+for isolation. The ``_PgConnection`` shim presents a sqlite3-compatible
+interface so query functions work unchanged.
 
 **Multiple boards (projects):** users can create additional boards to
 separate unrelated streams of work (e.g. one per project / repo / domain).
-Each board is a directory under ``<root>/kanban/boards/<slug>/`` with
-its own ``kanban.db``, ``workspaces/``, and ``logs/``. All boards share
-the profile's Hermes home but are otherwise isolated: a worker spawned
-for a task on board ``atm10-server`` sees only that board's tasks,
-cannot enumerate other boards, and its dispatcher ticks don't touch
-other boards' DBs.
-
-The first (and for single-project users, only) board is ``default``.
-For back-compat its on-disk DB is ``<root>/kanban.db`` (not
-``boards/default/kanban.db``), so installs that predate the boards
-feature keep working with zero migration. See :func:`kanban_db_path`.
+Each board is isolated by its slug; a worker spawned for a task on board
+``atm10-server`` sees only that board's tasks.
 
 Board resolution order (highest precedence first, all optional):
 
@@ -29,43 +18,20 @@ Board resolution order (highest precedence first, all optional):
   ``?board=...`` query param).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
 
-In standard installs ``<root>`` is ``~/.hermes``. In Docker / custom
-deployments where ``HERMES_HOME`` points outside ``~/.hermes`` (e.g.
-``/opt/hermes``), ``<root>`` is ``HERMES_HOME``. Legacy env-var
-overrides still work:
+Schema is managed entirely by Alembic (see ``migrations/``). The
+``workspace_kind`` field decouples coordination from git worktrees so
+that research / ops / digital-twin workloads work alongside coding
+workloads.
 
-* ``HERMES_KANBAN_DB`` — pin the database file path directly.
-* ``HERMES_KANBAN_WORKSPACES_ROOT`` — pin the workspaces root directly.
-* ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
-  paths. Useful for tests and unusual deployments.
-
-The dispatcher injects ``HERMES_KANBAN_DB``,
-``HERMES_KANBAN_WORKSPACES_ROOT``, and ``HERMES_KANBAN_BOARD`` into
-worker subprocess env so workers converge on the exact DB the
-dispatcher used to claim their task — even under unusual symlink or
-Docker layouts.
-
-Schema is intentionally small: tasks, task_links, task_comments,
-task_events.  The ``workspace_kind`` field decouples coordination from git
-worktrees so that research / ops / digital-twin workloads work alongside
-coding workloads.  See ``docs/hermes-kanban-v1-spec.pdf`` for the full
-design specification.
-
-Concurrency strategy: WAL mode + ``BEGIN IMMEDIATE`` for write
-transactions + compare-and-swap (CAS) updates on ``tasks.status`` and
-``tasks.claim_lock``.  SQLite serializes writers via its WAL lock, so at
-most one claimer can win any given task.  Losers observe zero affected
-rows and move on -- no retry loops, no distributed-lock machinery.
-The CAS coordination is **per-board** — each board is a separate DB,
-so multi-board installs get the same atomicity guarantees without any
-new locking.
+Concurrency strategy: ``BEGIN``/``COMMIT`` on the asyncpg connection +
+compare-and-swap (CAS) updates on ``tasks.status`` and ``tasks.claim_lock``.
+PG serializes concurrent writers via MVCC + row-level locking, so at most
+one claimer can win any given task. Losers observe zero affected rows and
+move on — no retry loops, no distributed-lock machinery.
 """
 
 from __future__ import annotations
@@ -75,7 +41,6 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -88,6 +53,432 @@ from typing import Any, Iterable, Optional
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL connection layer (Phase 0 port)
+# ---------------------------------------------------------------------------
+# When HERMES_PG_DSN is set, kanban_db uses the shared asyncpg pool via
+# hermes_db instead of per-board SQLite files.  The _PgCursor and
+# _PgConnection shim classes present a sqlite3-compatible interface to the
+# rest of this module so all existing query functions work without changes.
+#
+# Table mapping (all kanban tables are prefixed to avoid collisions):
+#   tasks            -> kanban_tasks         (+ board_slug column)
+#   task_links       -> kanban_task_links    (+ board_slug column)
+#   task_comments    -> kanban_task_comments (+ board_slug column)
+#   task_events      -> kanban_task_events   (+ board_slug column)
+#   task_runs        -> kanban_task_runs     (+ board_slug column)
+#   kanban_notify_subs -> kanban_notify_subs (already prefixed, + board_slug)
+#
+# The _PgConnection always carries a board_slug and injects it into every
+# query as an extra WHERE clause / INSERT column.
+# ---------------------------------------------------------------------------
+
+# SQLite → PG table name mapping
+_TABLE_MAP: dict[str, str] = {
+    "tasks": "kanban_tasks",
+    "task_links": "kanban_task_links",
+    "task_comments": "kanban_task_comments",
+    "task_events": "kanban_task_events",
+    "task_runs": "kanban_task_runs",
+    "kanban_notify_subs": "kanban_notify_subs",
+}
+
+_PARAM_RE = re.compile(r"\?")
+
+
+def _translate_sql(sql: str, board_slug: str, params: tuple) -> tuple[str, list]:
+    """Translate SQLite SQL to PG SQL for this module.
+
+    * Replaces ? placeholders with $1, $2, ...
+    * Rewrites table names to their pg prefixed versions
+    * Translates SQLite-specific syntax to PG equivalents
+
+    Returns (pg_sql, pg_params).
+    """
+    # Map table names first (word-boundary aware)
+    for old, new in _TABLE_MAP.items():
+        sql = re.sub(rf"\b{re.escape(old)}\b", new, sql)
+
+    # INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+    # We strip OR IGNORE here; the ON CONFLICT clause is appended by
+    # _inject_board_slug after board_slug is added to the column list.
+    _had_or_ignore = bool(re.search(r"\bINSERT\s+OR\s+IGNORE\b", sql, re.IGNORECASE))
+    sql = re.sub(
+        r"\bINSERT\s+OR\s+IGNORE\s+INTO\b",
+        "INSERT INTO",
+        sql,
+        flags=re.IGNORECASE,
+    )
+
+    # Replace ? with $N positional parameters
+    out_params = list(params)
+    counter = [0]
+
+    def _replace_param(m):
+        counter[0] += 1
+        return f"${counter[0]}"
+
+    sql = _PARAM_RE.sub(_replace_param, sql)
+
+    # SQLite `IS ?` for NULL-safe equality → PG `IS NOT DISTINCT FROM $N`
+    sql = re.sub(r"\bIS\s+(\$\d+)\b", r"IS NOT DISTINCT FROM \1", sql)
+
+    # Tag for ON CONFLICT handling downstream
+    if _had_or_ignore:
+        # Append a sentinel comment that _inject_board_slug can detect
+        sql = sql.rstrip() + " /*__OR_IGNORE__*/"
+
+    return sql, out_params
+
+
+class _PgCursor:
+    """Minimal sqlite3.Cursor-like wrapper around an asyncpg query result."""
+
+    def __init__(self, rows: list[dict], rowcount: int, lastrowid: Optional[int] = None):
+        self._rows = rows
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self) -> Optional[dict]:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[dict]:
+        return self._rows
+
+    def keys(self) -> list[str]:
+        return list(self._rows[0].keys()) if self._rows else []
+
+
+class _PgRow:
+    """sqlite3.Row-like wrapper around a dict from asyncpg."""
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d: dict):
+        self._d = d
+
+    def __getitem__(self, key):
+        return self._d[key]
+
+    def keys(self):
+        return list(self._d.keys())
+
+    def __contains__(self, key):
+        return key in self._d
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
+
+
+def _wrap_rows(rows) -> list[_PgRow]:
+    if rows is None:
+        return []
+    return [_PgRow(dict(r)) for r in rows]
+
+
+def _unwrap_row(row) -> Optional[_PgRow]:
+    if row is None:
+        return None
+    return _PgRow(dict(row))
+
+
+class _PgConnection:
+    """Sync sqlite3.Connection-like wrapper backed by asyncpg.
+
+    All operations (execute, begin, commit, rollback) run on a single
+    dedicated event loop that is created once and reused for the lifetime
+    of this connection.  This avoids the asyncpg "connection tied to loop"
+    issue that arises when calling run_until_complete on separate loops.
+
+    Each instance is bound to a board_slug. All query methods inject
+    board_slug into queries automatically.
+    """
+
+    def __init__(self, conn, board_slug: str):
+        self._conn = conn          # asyncpg.Connection
+        self._board_slug = board_slug
+        self._in_txn = False
+        self._txn = None           # asyncpg Transaction object when active
+        self.row_factory = None    # compat; ignored
+
+    # ------------------------------------------------------------------ #
+    # Sync execution bridge                                                #
+    # ------------------------------------------------------------------ #
+
+    def _run(self, coro):
+        """Run a coroutine on the pool's event loop synchronously."""
+        import hermes_db
+        return hermes_db.run_sync(coro)
+
+    # ------------------------------------------------------------------ #
+    # Core execute interface                                               #
+    # ------------------------------------------------------------------ #
+
+    def execute(self, sql: str, params: tuple = ()) -> "_PgCursor":
+        return self._run(self._async_execute(sql, params))
+
+    async def _async_execute(self, sql: str, params: tuple) -> "_PgCursor":
+        sql_pg, pg_params = _translate_sql(sql, self._board_slug, params)
+        sql_upper = sql_pg.lstrip().upper()
+
+        # Auto-add RETURNING id for tables with BIGSERIAL id
+        if sql_upper.startswith("INSERT"):
+            for tbl in _RETURNING_ID_TABLES:
+                if tbl in sql_pg and "RETURNING" not in sql_upper and "/*__OR_IGNORE__*/" not in sql_pg:
+                    sql_pg = sql_pg.rstrip().rstrip(";") + " RETURNING id"
+                    sql_upper = sql_pg.lstrip().upper()
+                    break
+
+        # Inject board_slug into board-aware queries
+        sql_pg, pg_params = _inject_board_slug(
+            sql_pg, sql_upper, pg_params, self._board_slug
+        )
+
+        _log.debug("PG execute: %s | params=%s", sql_pg.strip(), pg_params)
+        try:
+            if sql_upper.startswith("SELECT") or sql_upper.startswith("WITH"):
+                rows = await self._conn.fetch(sql_pg, *pg_params)
+                return _PgCursor(_wrap_rows(rows), len(rows))
+            elif "RETURNING" in sql_upper:
+                rows = await self._conn.fetch(sql_pg, *pg_params)
+                wrapped = _wrap_rows(rows)
+                lastrowid = int(wrapped[0]["id"]) if wrapped and "id" in wrapped[0]._d else None
+                return _PgCursor(wrapped, len(rows), lastrowid)
+            else:
+                result = await self._conn.execute(sql_pg, *pg_params)
+                rowcount = _parse_command_tag(result)
+                return _PgCursor([], rowcount)
+        except Exception as e:
+            _log.debug("PG execute error: %s\nSQL: %s\nParams: %s", e, sql_pg, pg_params)
+            raise
+
+    def executemany(self, sql: str, seq: list) -> None:
+        for params in seq:
+            self.execute(sql, params)
+
+    def executescript(self, script: str) -> None:
+        # In PG mode, schema is managed by Alembic. This is a no-op.
+        pass
+
+    # ------------------------------------------------------------------ #
+    # Transaction helpers (called via write_txn context manager)          #
+    # ------------------------------------------------------------------ #
+
+    def _begin(self) -> None:
+        async def _start():
+            self._txn = self._conn.transaction()
+            await self._txn.start()
+        self._run(_start())
+        self._in_txn = True
+
+    def _commit(self) -> None:
+        async def _do():
+            if self._txn is not None:
+                await self._txn.commit()
+                self._txn = None
+        self._run(_do())
+        self._in_txn = False
+
+    def _rollback(self) -> None:
+        async def _do():
+            if self._txn is not None:
+                await self._txn.rollback()
+                self._txn = None
+        self._run(_do())
+        self._in_txn = False
+
+    def close(self) -> None:
+        # Connection lifecycle managed by _pg_connect; this is a no-op.
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _parse_command_tag(tag: str) -> int:
+    """Parse asyncpg command tag like 'UPDATE 3' or 'INSERT 0 1' -> int."""
+    if not tag:
+        return 0
+    parts = tag.split()
+    if not parts:
+        return 0
+    try:
+        return int(parts[-1])
+    except ValueError:
+        return 0
+
+
+# ------------------------------------------------------------------ #
+# Board-slug injection logic                                           #
+# ------------------------------------------------------------------ #
+
+# Tables that carry board_slug
+_BOARD_SCOPED_TABLES = {
+    "kanban_tasks",
+    "kanban_task_links",
+    "kanban_task_comments",
+    "kanban_task_events",
+    "kanban_task_runs",
+    "kanban_notify_subs",
+}
+
+# Tables that use BIGSERIAL id and support RETURNING id
+_RETURNING_ID_TABLES = {
+    "kanban_task_comments",
+    "kanban_task_events",
+    "kanban_task_runs",
+}
+
+
+def _inject_board_slug(sql: str, sql_upper: str, params: list, board_slug: str) -> tuple[str, list]:
+    """Inject board_slug into INSERT/UPDATE/DELETE/SELECT for board-scoped tables.
+
+    Strategy:
+    - INSERT: shift all $N -> $(N+1), prepend board_slug as $1
+    - SELECT/UPDATE/DELETE: append board_slug as $N+1, add to WHERE clause
+
+    Only acts on tables in _BOARD_SCOPED_TABLES. Skips if board_slug already
+    present in the SQL (idempotent).
+    """
+    # Don't double-inject
+    if "board_slug" in sql.lower():
+        return sql, params
+
+    params = list(params)
+
+    # Find the primary table being operated on
+    table_m = re.search(
+        r"\b(?:FROM|UPDATE|INTO|JOIN)\s+(kanban_\w+)\b",
+        sql,
+        re.IGNORECASE,
+    )
+    if not table_m:
+        return sql, params
+    table = table_m.group(1)
+    if table not in _BOARD_SCOPED_TABLES:
+        return sql, params
+
+    stripped = sql_upper.lstrip()
+
+    if stripped.startswith("INSERT"):
+        # Detect OR IGNORE sentinel
+        had_or_ignore = "/*__OR_IGNORE__*/" in sql
+        sql_clean = sql.replace("/*__OR_IGNORE__*/", "").rstrip()
+
+        # Shift existing $N → $(N+1) then prepend board_slug as $1
+        def _shift(m):
+            return f"${int(m.group(1)) + 1}"
+        shifted_sql = re.sub(r"\$(\d+)", _shift, sql_clean)
+
+        # Find the column list and value list in the (possibly shifted) SQL
+        m = re.match(
+            r"(.*?INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+\w+\s*\()(.*?)(\)\s*VALUES\s*\()(.*?)(\)(?:\s*RETURNING\s+\w+)?.*)",
+            shifted_sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            prefix   = m.group(1)   # "INSERT INTO kanban_tasks ("
+            cols     = m.group(2)   # "id, title, ..."
+            mid      = m.group(3)   # ") VALUES ("
+            vals     = m.group(4)   # "$2, $3, ..."
+            suffix   = m.group(5)   # ") RETURNING id" or ")"
+
+            new_cols = f"board_slug, {cols}"
+            new_vals = f"$1, {vals}"
+            sql = f"{prefix}{new_cols}{mid}{new_vals}{suffix}"
+            # Append ON CONFLICT DO NOTHING after the closing paren if OR IGNORE
+            if had_or_ignore and "ON CONFLICT" not in sql.upper():
+                # Find position after the closing ) of VALUES (...)
+                # suffix contains the closing ) + optional RETURNING
+                if "RETURNING" in suffix.upper():
+                    # Insert ON CONFLICT before RETURNING
+                    sql = re.sub(
+                        r"\)\s*(RETURNING\s+\w+)",
+                        r") ON CONFLICT DO NOTHING \1",
+                        sql,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+                else:
+                    sql = sql.rstrip().rstrip(")") + ") ON CONFLICT DO NOTHING"
+            params = [board_slug] + params
+        return sql, params
+
+    # Detect table alias: "FROM kanban_tasks t" → alias is "t"
+    # so we reference "t.board_slug" rather than "kanban_tasks.board_slug"
+    alias_m = re.search(
+        rf"\b{re.escape(table)}\s+(?:AS\s+)?(\w+)\b",
+        sql,
+        re.IGNORECASE,
+    )
+    # Use alias if found AND alias is not a keyword
+    _SQL_KEYWORDS = {"WHERE", "SET", "ON", "JOIN", "INNER", "LEFT", "RIGHT",
+                     "FULL", "OUTER", "CROSS", "GROUP", "ORDER", "LIMIT",
+                     "HAVING", "UNION", "EXCEPT", "INTERSECT", "VALUES",
+                     "SELECT", "FROM", "UPDATE", "DELETE", "INTO"}
+    if alias_m and alias_m.group(1).upper() not in _SQL_KEYWORDS:
+        table_ref = alias_m.group(1)  # use alias
+    else:
+        table_ref = table  # use full table name
+
+    # SELECT / UPDATE / DELETE: append board_slug as last param
+    n = len(params) + 1
+    params.append(board_slug)
+
+    if stripped.startswith("SELECT") or stripped.startswith("WITH"):
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE {table_ref}.board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        elif re.search(r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b", sql, re.IGNORECASE):
+            sql = re.sub(
+                r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b",
+                f"WHERE {table_ref}.board_slug = ${n} \\1",
+                sql, count=1, flags=re.IGNORECASE,
+            )
+        else:
+            sql = sql.rstrip() + f" WHERE {table_ref}.board_slug = ${n}"
+
+    elif stripped.startswith("UPDATE"):
+        # UPDATE statements don't use aliases in PostgreSQL the same way
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        else:
+            sql = sql.rstrip() + f" WHERE board_slug = ${n}"
+
+    elif stripped.startswith("DELETE"):
+        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+            sql = re.sub(r"\bWHERE\b", f"WHERE board_slug = ${n} AND", sql, count=1, flags=re.IGNORECASE)
+        else:
+            sql = sql.rstrip() + f" WHERE board_slug = ${n}"
+
+    return sql, params
+
+
+# ------------------------------------------------------------------ #
+# PG connect() entry point                                             #
+# ------------------------------------------------------------------ #
+
+@contextlib.contextmanager
+def _pg_connect(board_slug: str) -> "_PgConnection":
+    """Open a PG connection scoped to board_slug.
+
+    All async operations run via hermes_db.run_sync so they share the same
+    event loop that owns the pool.  This satisfies asyncpg's requirement
+    that connections are only used from the loop they were created on.
+    """
+    import hermes_db
+
+    raw_conn = hermes_db.run_sync(hermes_db.pool().acquire())
+    try:
+        pg_conn = _PgConnection(raw_conn, board_slug)
+        yield pg_conn
+    finally:
+        hermes_db.run_sync(hermes_db.pool().release(raw_conn))
 
 
 # ---------------------------------------------------------------------------
@@ -296,17 +687,23 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board has persisted metadata or a DB on disk.
+    """Return True if the board exists in the kanban_boards table.
 
-    ``default`` is considered to always exist — its DB is created
+    ``default`` is considered to always exist — its row is created
     on first :func:`connect` and there's no way for it to be missing
     in a configuration where the kanban feature is usable at all.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
         return True
-    d = board_dir(slug)
-    return (d / "board.json").exists() or (d / "kanban.db").exists()
+    import hermes_db
+    async def _check():
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM kanban_boards WHERE slug = $1", slug
+            )
+            return row is not None
+    return hermes_db.run_sync(_check())
 
 
 def kanban_db_path(board: Optional[str] = None) -> Path:
@@ -480,26 +877,35 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
 ) -> dict:
-    """Create a new board directory + DB + metadata. Idempotent.
+    """Create a new board. Idempotent.
 
     Returns the resulting metadata. Raises :class:`ValueError` for a
     malformed slug; returns the existing metadata (not an error) if the
     board already exists — matching ``mkdir -p`` semantics.
+
+    Inserts into kanban_boards table (idempotent via ON CONFLICT).
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
-        normed,
-        name=name,
-        description=description,
-        icon=icon,
-        color=color,
-        default_workdir=default_workdir,
-    )
-    # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
-    return meta
+    import hermes_db
+    async def _create():
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "INSERT INTO kanban_boards (slug) VALUES ($1) ON CONFLICT (slug) DO NOTHING",
+                normed,
+            )
+    hermes_db.run_sync(_create())
+    return {
+        "slug": normed,
+        "name": _default_board_display_name(normed),
+        "description": description or "",
+        "icon": icon or "",
+        "color": color or "",
+        "default_workdir": default_workdir,
+        "created_at": int(time.time()),
+        "archived": False,
+    }
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -658,17 +1064,23 @@ class Task:
     session_id: Optional[str] = None
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Task":
+    def from_row(cls, row: "_PgRow") -> "Task":
         keys = set(row.keys())
-        # Parse skills JSON blob if present
+        # Parse skills JSON blob if present.
+        # In PG mode skills is already a list (decoded by JSONB codec).
+        # In SQLite mode skills is a JSON string that needs parsing.
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
-            try:
-                parsed = json.loads(row["skills"])
-                if isinstance(parsed, list):
-                    skills_value = [str(s) for s in parsed if s]
-            except Exception:
-                skills_value = None
+            raw_skills = row["skills"]
+            if isinstance(raw_skills, list):
+                skills_value = [str(s) for s in raw_skills if s]
+            else:
+                try:
+                    parsed = json.loads(raw_skills)
+                    if isinstance(parsed, list):
+                        skills_value = [str(s) for s in parsed if s]
+                except Exception:
+                    skills_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -757,9 +1169,13 @@ class Run:
     error: Optional[str]
 
     @classmethod
-    def from_row(cls, row: sqlite3.Row) -> "Run":
+    def from_row(cls, row: "_PgRow") -> "Run":
         try:
-            meta = json.loads(row["metadata"]) if row["metadata"] else None
+            raw_meta = row["metadata"] if row["metadata"] else None
+            if isinstance(raw_meta, dict):
+                meta = raw_meta  # PG JSONB already decoded
+            else:
+                meta = json.loads(raw_meta) if raw_meta else None
         except Exception:
             meta = None
         return cls(
@@ -999,7 +1415,7 @@ def _validate_sqlite_header(path: Path) -> None:
         signature = " (TLS record header detected at byte offset 5)"
     elif _looks_like_tls_record_at(head, 0):
         signature = " (TLS record header detected at byte offset 0)"
-    raise sqlite3.DatabaseError(
+    raise RuntimeError(
         "file is not a database: invalid SQLite header for "
         f"{path}{signature}; first_32={head[:32].hex(' ')}"
     )
@@ -1009,95 +1425,43 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
-    """Open (and initialize if needed) the kanban DB.
+) -> "_PgConnection":
+    """Open a kanban connection backed by the shared asyncpg pool.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    Returns a _PgConnection context manager. The ``db_path`` parameter is
+    accepted for call-site compatibility but ignored in PG mode.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
-
-    Path resolution:
-
-    * ``db_path`` explicit → used as-is (legacy callers, tests).
-    * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+    Board selection uses the same resolution chain as before; the PG
+    version uses board_slug as a WHERE clause on every query.
     """
-    if db_path is not None:
-        path = db_path
-    else:
-        path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _validate_sqlite_header(path)
-    resolved = str(path.resolve())
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
-    try:
-        conn.row_factory = sqlite3.Row
-        with _INIT_LOCK:
-            # WAL activation can take an exclusive lock while SQLite creates the
-            # sidecar files for a fresh database. Keep it in the same process-local
-            # critical section as schema initialization so concurrent gateway
-            # startup threads do not race before _INITIALIZED_PATHS is populated.
-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-            # falls back to DELETE with one WARNING so kanban stays usable there.
-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-            from hermes_state import apply_wal_with_fallback
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            needs_init = resolved not in _INITIALIZED_PATHS
-            if needs_init:
-                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
-                conn.executescript(SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
-                _INITIALIZED_PATHS.add(resolved)
-    except Exception:
-        conn.close()
-        raise
-    return conn
+    slug = _normalize_board_slug(board) or get_current_board()
+    return _pg_connect(slug)
 
 
 def init_db(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> Path:
-    """Create the schema if it doesn't exist; return the path used.
+) -> str:
+    """Ensure the board exists in kanban_boards; return the board slug.
 
-    Kept as a public entry point so CLI ``hermes kanban init`` and the
-    daemon have something explicit to call. Unlike :func:`connect`'s
-    first-time auto-init (which caches by path), ``init_db`` always
-    re-runs the migration pass. Callers that know the on-disk schema
-    may have drifted — tests that write legacy event kinds directly,
-    external tools that upgrade an old DB file — can call this to
-    force re-migration.
+    Idempotent (ON CONFLICT DO NOTHING). The ``db_path`` parameter is
+    accepted for call-site compatibility but ignored in PG mode.
     """
-    if db_path is not None:
-        path = db_path
-    else:
-        path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
-    # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
-    with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
-        pass
-    return path
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    import hermes_db
+    async def _ensure():
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "INSERT INTO kanban_boards (slug) VALUES ($1) ON CONFLICT (slug) DO NOTHING",
+                slug,
+            )
+    hermes_db.run_sync(_ensure())
+    return slug
 
 
 def _add_column_if_missing(
-    conn: sqlite3.Connection, table: str, column: str, ddl: str
+    conn: _PgConnection, table: str, column: str, ddl: str
 ) -> bool:
     """Run ``ALTER TABLE <table> ADD COLUMN <ddl>``, idempotent across races.
 
@@ -1109,17 +1473,20 @@ def _add_column_if_missing(
     try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
         return True
-    except sqlite3.OperationalError as exc:
+    except Exception as exc:
         if "duplicate column name" in str(exc).lower():
             return False
         raise
 
 
-def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+def _migrate_add_optional_columns(conn: "_PgConnection") -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
+    In PG mode: Alembic handles all schema migrations; this is a no-op.
     """
+    if isinstance(conn, _PgConnection):
+        return  # PG schema managed entirely by Alembic
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -1334,21 +1701,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
-    """Context manager for an IMMEDIATE write transaction.
+def write_txn(conn: "_PgConnection"):
+    """Context manager for a write transaction.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
+    Uses BEGIN/COMMIT/ROLLBACK on the asyncpg connection. A claim CAS
+    inside this context is atomic via PG row-level locking on UPDATE.
     """
-    conn.execute("BEGIN IMMEDIATE")
+    conn._begin()
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        conn._rollback()
         raise
     else:
-        conn.execute("COMMIT")
+        conn._commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1392,7 +1758,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
 
 def create_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     title: str,
     body: Optional[str] = None,
@@ -1563,6 +1929,8 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                # skills is JSONB in PG so pass the list directly.
+                skills_val = skills_list
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1587,7 +1955,7 @@ def create_task(
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
-                        json.dumps(skills_list) if skills_list is not None else None,
+                        skills_val,
                         int(max_retries) if max_retries is not None else None,
                         session_id,
                     ),
@@ -1611,7 +1979,9 @@ def create_task(
                     },
                 )
             return task_id
-        except sqlite3.IntegrityError:
+        except Exception as _e:
+            if "unique" not in str(_e).lower() and "duplicate" not in str(_e).lower():
+                raise
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -1619,7 +1989,7 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
-def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
+def _find_missing_parents(conn: _PgConnection, parents: Iterable[str]) -> list[str]:
     parents = list(parents)
     if not parents:
         return []
@@ -1632,7 +2002,7 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     return [p for p in parents if p not in present]
 
 
-def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+def get_task(conn: _PgConnection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
@@ -1652,7 +2022,7 @@ VALID_SORT_ORDERS: dict[str, str] = {
 
 
 def list_tasks(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     assignee: Optional[str] = None,
     status: Optional[str] = None,
@@ -1703,7 +2073,7 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(conn: _PgConnection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -1740,7 +2110,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def link_tasks(conn: _PgConnection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -1770,7 +2140,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         )
 
 
-def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def _would_cycle(conn: _PgConnection, parent_id: str, child_id: str) -> bool:
     """Return True if adding parent->child creates a cycle.
 
     A cycle exists iff ``parent_id`` is already a descendant of
@@ -1793,7 +2163,7 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(conn: _PgConnection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -1814,7 +2184,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return removed
 
 
-def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+def parent_ids(conn: _PgConnection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
         (task_id,),
@@ -1822,7 +2192,7 @@ def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["parent_id"] for r in rows]
 
 
-def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+def child_ids(conn: _PgConnection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
         (task_id,),
@@ -1830,7 +2200,7 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["child_id"] for r in rows]
 
 
-def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
+def parent_results(conn: _PgConnection, task_id: str) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
         """
@@ -1850,7 +2220,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: _PgConnection, task_id: str, author: str, body: str
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -1871,7 +2241,7 @@ def add_comment(
         return int(cur.lastrowid or 0)
 
 
-def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
+def list_comments(conn: _PgConnection, task_id: str) -> list[Comment]:
     rows = conn.execute(
         "SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at ASC",
         (task_id,),
@@ -1888,7 +2258,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
     ]
 
 
-def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
+def list_events(conn: _PgConnection, task_id: str) -> list[Event]:
     rows = conn.execute(
         "SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ASC, id ASC",
         (task_id,),
@@ -1896,7 +2266,11 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     out = []
     for r in rows:
         try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
+            raw_pl = r["payload"] if r["payload"] else None
+            if isinstance(raw_pl, dict):
+                payload = raw_pl  # PG JSONB already decoded
+            else:
+                payload = json.loads(raw_pl) if raw_pl else None
         except Exception:
             payload = None
         out.append(
@@ -1913,7 +2287,7 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
 
 
 def _append_event(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     kind: str,
     payload: Optional[dict] = None,
@@ -1928,16 +2302,16 @@ def _append_event(
     and the row carries NULL.
     """
     now = int(time.time())
-    pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    # asyncpg JSONB codec handles dict -> jsonb directly.
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        (task_id, run_id, kind, payload, now),
     )
 
 
 def _end_run(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     outcome: str,
@@ -1962,6 +2336,7 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    meta_val = metadata  # asyncpg JSONB codec handles dict -> jsonb directly.
     conn.execute(
         """
         UPDATE task_runs
@@ -1982,7 +2357,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            meta_val,
             now,
             run_id,
         ),
@@ -1993,7 +2368,7 @@ def _end_run(
     return run_id
 
 
-def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+def _current_run_id(conn: _PgConnection, task_id: str) -> Optional[int]:
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
@@ -2001,7 +2376,7 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
 
 
 def _synthesize_ended_run(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     outcome: str,
@@ -2031,6 +2406,7 @@ def _synthesize_ended_run(
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    meta_val = metadata  # asyncpg JSONB codec handles dict -> jsonb directly.
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -2044,7 +2420,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            meta_val,
             now, now,
         ),
     )
@@ -2055,7 +2431,7 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
-def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
+def _has_sticky_block(conn: _PgConnection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
 
@@ -2093,7 +2469,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def recompute_ready(conn: sqlite3.Connection) -> int:
+def recompute_ready(conn: _PgConnection) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
@@ -2154,7 +2530,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 def claim_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
@@ -2268,7 +2644,7 @@ def claim_task(
 
 
 def claim_review_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
@@ -2343,7 +2719,7 @@ def claim_review_task(
 
 
 def heartbeat_claim(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
@@ -2374,7 +2750,7 @@ def heartbeat_claim(
 
 
 def release_stale_claims(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     signal_fn=None,
 ) -> int:
@@ -2487,7 +2863,7 @@ def release_stale_claims(
 
 
 def reclaim_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     reason: Optional[str] = None,
@@ -2556,7 +2932,7 @@ def reclaim_task(
 
 
 def reassign_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     profile: Optional[str],
     *,
@@ -2587,7 +2963,7 @@ def reassign_task(
 
 
 def _verify_created_cards(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     completing_task_id: str,
     claimed_ids: Iterable[str],
 ) -> tuple[list[str], list[str]]:
@@ -2668,7 +3044,7 @@ _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
 
 
 def _scan_prose_for_phantom_ids(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     text: str,
 ) -> list[str]:
     """Regex-scan free-form text for ``t_<hex>`` references; return the
@@ -2719,7 +3095,7 @@ class HallucinatedCardsError(ValueError):
 
 
 def complete_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     result: Optional[str] = None,
@@ -2904,7 +3280,7 @@ def complete_task(
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(conn: _PgConnection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
@@ -2935,7 +3311,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
-def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_worker_tmux(conn: _PgConnection, task_id: str) -> None:
     """Kill the tmux session associated with a task's assignee, if dead."""
     try:
         row = conn.execute(
@@ -2962,7 +3338,7 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def edit_completed_task_result(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     result: str,
@@ -3029,7 +3405,7 @@ def edit_completed_task_result(
 
 
 def block_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     reason: Optional[str] = None,
@@ -3083,7 +3459,7 @@ def block_task(
         return True
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: _PgConnection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -3140,7 +3516,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def specify_triage_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     title: Optional[str] = None,
@@ -3231,7 +3607,7 @@ def specify_triage_task(
 
 
 def decompose_triage_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     root_assignee: Optional[str],
@@ -3431,7 +3807,7 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(conn: _PgConnection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -3457,7 +3833,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
-def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def delete_archived_task(conn: _PgConnection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
     Safety guard: only archived tasks can be deleted. Active / blocked / done
@@ -3483,7 +3859,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def delete_task(conn: _PgConnection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
@@ -3575,7 +3951,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 
 
 def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
+    conn: _PgConnection, task_id: str, path: Path | str
 ) -> None:
     with write_txn(conn):
         conn.execute(
@@ -3586,7 +3962,7 @@ def set_workspace_path(
 
 # ---------------------------------------------------------------------------
 def schedule_task(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     reason: Optional[str] = None,
@@ -3904,7 +4280,7 @@ def _terminate_reclaimed_worker(
 
 
 def heartbeat_worker(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     note: Optional[str] = None,
@@ -3955,7 +4331,7 @@ def heartbeat_worker(
 
 
 def enforce_max_runtime(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     signal_fn=None,
 ) -> list[str]:
@@ -4075,7 +4451,7 @@ _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
 def detect_stale_running(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
@@ -4195,7 +4571,7 @@ def detect_stale_running(
 
 
 def set_max_runtime(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     seconds: Optional[int],
 ) -> bool:
@@ -4220,7 +4596,7 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(conn: _PgConnection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -4359,7 +4735,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
 
 def _record_task_failure(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     error: str,
     *,
@@ -4515,7 +4891,7 @@ def _record_task_failure(
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
 def _record_spawn_failure(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     error: str,
     *,
@@ -4530,7 +4906,7 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _set_worker_pid(conn: _PgConnection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
@@ -4551,7 +4927,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+def _clear_failure_counter(conn: _PgConnection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
     Called from ``complete_task`` on successful completion — a fresh
@@ -4573,7 +4949,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def check_respawn_guard(conn: _PgConnection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
@@ -4642,7 +5018,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(conn: _PgConnection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -4674,7 +5050,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(conn: _PgConnection) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -4700,7 +5076,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 
 
 def dispatch_once(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
@@ -5494,7 +5870,7 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+def build_worker_context(conn: _PgConnection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
     Order:
@@ -5700,7 +6076,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 # Stats + SLA helpers
 # ---------------------------------------------------------------------------
 
-def board_stats(conn: sqlite3.Connection) -> dict:
+def board_stats(conn: _PgConnection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
     """
@@ -5787,7 +6163,7 @@ def task_age(task: Task) -> dict:
 # ---------------------------------------------------------------------------
 
 def add_notify_sub(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -5823,7 +6199,7 @@ def add_notify_sub(
 
 
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: _PgConnection, task_id: Optional[str] = None,
 ) -> list[dict]:
     if task_id is not None:
         rows = conn.execute(
@@ -5835,7 +6211,7 @@ def list_notify_subs(
 
 
 def remove_notify_sub(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -5852,7 +6228,7 @@ def remove_notify_sub(
 
 
 def unseen_events_for_sub(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -5901,7 +6277,7 @@ def unseen_events_for_sub(
 
 
 def claim_unseen_events_for_sub(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -5952,7 +6328,7 @@ def claim_unseen_events_for_sub(
 
 
 def advance_notify_cursor(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -5969,7 +6345,7 @@ def advance_notify_cursor(
 
 
 def rewind_notify_cursor(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     *,
     task_id: str,
     platform: str,
@@ -6002,7 +6378,7 @@ def rewind_notify_cursor(
 # ---------------------------------------------------------------------------
 
 def gc_events(
-    conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
+    conn: _PgConnection, *, older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
@@ -6127,7 +6503,7 @@ def list_profiles_on_disk() -> list[str]:
     return sorted(names)
 
 
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
+def known_assignees(conn: _PgConnection) -> list[dict]:
     """Return every assignee name known to the board or on disk.
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
@@ -6167,7 +6543,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def list_runs(
-    conn: sqlite3.Connection,
+    conn: _PgConnection,
     task_id: str,
     *,
     include_active: bool = True,
@@ -6201,14 +6577,14 @@ def list_runs(
     return [Run.from_row(r) for r in rows]
 
 
-def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
+def get_run(conn: _PgConnection, run_id: int) -> Optional[Run]:
     row = conn.execute(
         "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
 
 
-def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+def active_run(conn: _PgConnection, task_id: str) -> Optional[Run]:
     """Return the currently-open run for ``task_id`` (``ended_at IS NULL``)."""
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? AND ended_at IS NULL "
@@ -6218,7 +6594,7 @@ def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
-def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+def latest_run(conn: _PgConnection, task_id: str) -> Optional[Run]:
     """Return the most recent run regardless of outcome (active or closed)."""
     row = conn.execute(
         "SELECT * FROM task_runs WHERE task_id = ? "
@@ -6228,7 +6604,7 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
     return Run.from_row(row) if row else None
 
 
-def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def latest_summary(conn: _PgConnection, task_id: str) -> Optional[str]:
     """Return the latest non-null ``task_runs.summary`` for ``task_id``.
 
     The kanban-worker skill writes its handoff to ``task_runs.summary``
@@ -6251,7 +6627,7 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 
 
 def latest_summaries(
-    conn: sqlite3.Connection, task_ids: Iterable[str]
+    conn: _PgConnection, task_ids: Iterable[str]
 ) -> dict[str, str]:
     """Batch-fetch latest non-null summaries for a list of task ids.
 

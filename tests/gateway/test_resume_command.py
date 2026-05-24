@@ -4,9 +4,11 @@ Tests the _handle_resume_command handler (switch to a previously-named session)
 across gateway messenger platforms.
 """
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
@@ -73,14 +75,14 @@ class TestHandleResumeCommand:
         assert "not available" in result.lower()
 
     @pytest.mark.asyncio
-    async def test_list_named_sessions_when_no_arg(self, tmp_path):
+    async def test_list_named_sessions_when_no_arg(self, hermes_db_initialized):
         """With no argument, lists recently titled sessions."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("sess_001", "telegram")
-        db.create_session("sess_002", "telegram")
-        db.set_session_title("sess_001", "Research")
-        db.set_session_title("sess_002", "Coding")
+        db = SessionDB()
+        await db.create_session("sess_001", "telegram")
+        await db.create_session("sess_002", "telegram")
+        await db.set_session_title("sess_001", "Research")
+        await db.set_session_title("sess_002", "Coding")
 
         event = _make_event(text="/resume")
         runner = _make_runner(session_db=db, event=event)
@@ -88,30 +90,28 @@ class TestHandleResumeCommand:
         assert "Research" in result
         assert "Coding" in result
         assert "Named Sessions" in result
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_list_shows_usage_when_no_titled(self, tmp_path):
+    async def test_list_shows_usage_when_no_titled(self, hermes_db_initialized):
         """With no arg and no titled sessions, shows instructions."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("sess_001", "telegram")  # No title
+        db = SessionDB()
+        await db.create_session("sess_001", "telegram")  # No title
 
         event = _make_event(text="/resume")
         runner = _make_runner(session_db=db, event=event)
         result = await runner._handle_resume_command(event)
         assert "No named sessions" in result
         assert "/title" in result
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_by_name(self, tmp_path):
+    async def test_resume_by_name(self, hermes_db_initialized):
         """Resolves a title and switches to that session."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("old_session_abc", "telegram")
-        db.set_session_title("old_session_abc", "My Project")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("old_session_abc", "telegram")
+        await db.set_session_title("old_session_abc", "My Project")
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume My Project")
         runner = _make_runner(session_db=db, current_session_id="current_session_001",
@@ -124,46 +124,43 @@ class TestHandleResumeCommand:
         runner.session_store.switch_session.assert_called_once()
         call_args = runner.session_store.switch_session.call_args
         assert call_args[0][1] == "old_session_abc"
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_nonexistent_name(self, tmp_path):
+    async def test_resume_nonexistent_name(self, hermes_db_initialized):
         """Returns error for unknown session name."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume Nonexistent Session")
         runner = _make_runner(session_db=db, event=event)
         result = await runner._handle_resume_command(event)
         assert "No session found" in result
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_already_on_session(self, tmp_path):
+    async def test_resume_already_on_session(self, hermes_db_initialized):
         """Returns friendly message when already on the requested session."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("current_session_001", "telegram")
-        db.set_session_title("current_session_001", "Active Project")
+        db = SessionDB()
+        await db.create_session("current_session_001", "telegram")
+        await db.set_session_title("current_session_001", "Active Project")
 
         event = _make_event(text="/resume Active Project")
         runner = _make_runner(session_db=db, current_session_id="current_session_001",
                               event=event)
         result = await runner._handle_resume_command(event)
         assert "Already on session" in result
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_auto_lineage(self, tmp_path):
+    async def test_resume_auto_lineage(self, hermes_db_initialized):
         """Asking for 'My Project' when 'My Project #2' exists gets the latest."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("sess_v1", "telegram")
-        db.set_session_title("sess_v1", "My Project")
-        db.create_session("sess_v2", "telegram")
-        db.set_session_title("sess_v2", "My Project #2")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("sess_v1", "telegram")
+        await db.set_session_title("sess_v1", "My Project")
+        await db.create_session("sess_v2", "telegram")
+        await db.set_session_title("sess_v2", "My Project #2")
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume My Project")
         runner = _make_runner(session_db=db, current_session_id="current_session_001",
@@ -174,20 +171,19 @@ class TestHandleResumeCommand:
         # Should resolve to #2 (latest in lineage)
         call_args = runner.session_store.switch_session.call_args
         assert call_args[0][1] == "sess_v2"
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_follows_compression_continuation(self, tmp_path):
+    async def test_resume_follows_compression_continuation(self, hermes_db_initialized):
         """Gateway /resume should reopen the live descendant after compression."""
         from hermes_state import SessionDB
 
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("compressed_root", "telegram")
-        db.set_session_title("compressed_root", "Compressed Work")
-        db.end_session("compressed_root", "compression")
-        db.create_session("compressed_child", "telegram", parent_session_id="compressed_root")
-        db.append_message("compressed_child", "user", "hello from continuation")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("compressed_root", "telegram")
+        await db.set_session_title("compressed_root", "Compressed Work")
+        await db.end_session("compressed_root", "compression")
+        await db.create_session("compressed_child", "telegram", parent_session_id="compressed_root")
+        await db.append_message("compressed_child", "user", "hello from continuation")
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume Compressed Work")
         runner = _make_runner(
@@ -208,16 +204,15 @@ class TestHandleResumeCommand:
         call_args = runner.session_store.switch_session.call_args
         assert call_args[0][1] == "compressed_child"
         runner.session_store.load_transcript.assert_called_with("compressed_child")
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_clears_running_agent(self, tmp_path):
+    async def test_resume_clears_running_agent(self, hermes_db_initialized):
         """Switching sessions clears any cached running agent."""
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("old_session", "telegram")
-        db.set_session_title("old_session", "Old Work")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("old_session", "telegram")
+        await db.set_session_title("old_session", "Old Work")
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume Old Work")
         runner = _make_runner(session_db=db, current_session_id="current_session_001",
@@ -229,21 +224,19 @@ class TestHandleResumeCommand:
         await runner._handle_resume_command(event)
 
         assert real_key not in runner._running_agents
-        db.close()
 
     @pytest.mark.asyncio
-    async def test_resume_evicts_cached_agent(self, tmp_path):
+    async def test_resume_evicts_cached_agent(self, hermes_db_initialized):
         """Gateway /resume evicts the cached AIAgent so the next message
         rebuilds with the correct session_id end-to-end — mirrors /branch
         and /reset. Without this, the cached agent's memory provider keeps
         writing into the wrong session. See #6672.
         """
-        import threading
         from hermes_state import SessionDB
-        db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("old_session", "telegram")
-        db.set_session_title("old_session", "Old Work")
-        db.create_session("current_session_001", "telegram")
+        db = SessionDB()
+        await db.create_session("old_session", "telegram")
+        await db.set_session_title("old_session", "Old Work")
+        await db.create_session("current_session_001", "telegram")
 
         event = _make_event(text="/resume Old Work")
         runner = _make_runner(session_db=db, current_session_id="current_session_001",
@@ -256,4 +249,3 @@ class TestHandleResumeCommand:
         await runner._handle_resume_command(event)
 
         assert real_key not in runner._agent_cache
-        db.close()

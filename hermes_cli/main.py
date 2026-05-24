@@ -780,9 +780,10 @@ def _resolve_last_session(source: str = "cli") -> Optional[str]:
     db = None
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
-        sessions = db.search_sessions(source=source, limit=1)
+        sessions = _hermes_db.run_sync(db.search_sessions(source=source, limit=1))
         return sessions[0]["id"] if sessions else None
     except Exception:
         pass
@@ -919,23 +920,24 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     """
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
 
         # Try as exact session ID first
-        session = db.get_session(name_or_id)
+        session = _hermes_db.run_sync(db.get_session(name_or_id))
         resolved_id: Optional[str] = None
         if session:
             resolved_id = session["id"]
         else:
             # Try as title (with auto-latest for lineage)
-            resolved_id = db.resolve_session_by_title(name_or_id)
+            resolved_id = _hermes_db.run_sync(db.resolve_session_by_title(name_or_id))
 
         if resolved_id:
             # Project forward through compression chain so resumes land on
             # the live tip instead of a dead compressed parent.
             try:
-                resolved_id = db.get_compression_tip(resolved_id) or resolved_id
+                resolved_id = _hermes_db.run_sync(db.get_compression_tip(resolved_id)) or resolved_id
             except Exception:
                 pass
 
@@ -972,13 +974,14 @@ def _print_tui_exit_summary(
     db = None
     try:
         from hermes_state import SessionDB
+        import hermes_db as _hermes_db
 
         db = SessionDB()
-        session = db.get_session(target)
+        session = _hermes_db.run_sync(db.get_session(target))
         if not session:
             return
 
-        title = db.get_session_title(target)
+        title = _hermes_db.run_sync(db.get_session_title(target))
         message_count = int(session.get("message_count") or 0)
         if message_count == 0:
             return  # No real conversation — don't show resume info
@@ -10579,7 +10582,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "cron", "curator", "dashboard", "debug", "doctor",
+        "config", "cron", "curator", "dashboard", "db", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate",
         "model", "pairing", "plugins", "postinstall", "profile", "proxy",
@@ -10849,6 +10852,12 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def main():
     """Main entry point for hermes CLI."""
+    # PG pool initialisation is lazy: ``hermes_db.pool()`` auto-inits from
+    # HERMES_PG_DSN on first use. Subcommands like ``hermes --help`` or
+    # ``hermes version`` that never touch the DB do not require a live
+    # PG connection (or even a configured DSN). This is what lets the Nix
+    # sandbox smoke (`hermes --help | grep gateway`) succeed without PG.
+
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:
         from hermes_cli.stdio import configure_windows_stdio
@@ -12850,6 +12859,7 @@ Examples:
 
         try:
             from hermes_state import SessionDB
+            import hermes_db as _hermes_db
 
             db = SessionDB()
         except Exception as e:
@@ -12863,9 +12873,9 @@ Examples:
         _exclude = None if _source else ["tool"]
 
         if action == "list":
-            sessions = db.list_sessions_rich(
+            sessions = _hermes_db.run_sync(db.list_sessions_rich(
                 source=args.source, exclude_sources=_exclude, limit=args.limit
-            )
+            ))
             if not sessions:
                 print("No sessions found.")
                 return
@@ -12893,11 +12903,11 @@ Examples:
 
         elif action == "export":
             if args.session_id:
-                resolved_session_id = db.resolve_session_id(args.session_id)
+                resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
                 if not resolved_session_id:
                     print(f"Session '{args.session_id}' not found.")
                     return
-                data = db.export_session(resolved_session_id)
+                data = _hermes_db.run_sync(db.export_session(resolved_session_id))
                 if not data:
                     print(f"Session '{args.session_id}' not found.")
                     return
@@ -12910,7 +12920,7 @@ Examples:
                         f.write(line)
                     print(f"Exported 1 session to {args.output}")
             else:
-                sessions = db.export_all(source=args.source)
+                sessions = _hermes_db.run_sync(db.export_all(source=args.source))
                 if args.output == "-":
 
                     for s in sessions:
@@ -12922,7 +12932,7 @@ Examples:
                     print(f"Exported {len(sessions)} sessions to {args.output}")
 
         elif action == "delete":
-            resolved_session_id = db.resolve_session_id(args.session_id)
+            resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
             if not resolved_session_id:
                 print(f"Session '{args.session_id}' not found.")
                 return
@@ -12933,7 +12943,7 @@ Examples:
                     print("Cancelled.")
                     return
             sessions_dir = get_hermes_home() / "sessions"
-            if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+            if _hermes_db.run_sync(db.delete_session(resolved_session_id, sessions_dir=sessions_dir)):
                 print(f"Deleted session '{resolved_session_id}'.")
             else:
                 print(f"Session '{args.session_id}' not found.")
@@ -12948,19 +12958,19 @@ Examples:
                     print("Cancelled.")
                     return
             sessions_dir = get_hermes_home() / "sessions"
-            count = db.prune_sessions(
+            count = _hermes_db.run_sync(db.prune_sessions(
                 older_than_days=days, source=args.source, sessions_dir=sessions_dir
-            )
+            ))
             print(f"Pruned {count} session(s).")
 
         elif action == "rename":
-            resolved_session_id = db.resolve_session_id(args.session_id)
+            resolved_session_id = _hermes_db.run_sync(db.resolve_session_id(args.session_id))
             if not resolved_session_id:
                 print(f"Session '{args.session_id}' not found.")
                 return
             title = " ".join(args.title)
             try:
-                if db.set_session_title(resolved_session_id, title):
+                if _hermes_db.run_sync(db.set_session_title(resolved_session_id, title)):
                     print(f"Session '{resolved_session_id}' renamed to: {title}")
                 else:
                     print(f"Session '{args.session_id}' not found.")
@@ -12971,9 +12981,9 @@ Examples:
             limit = getattr(args, "limit", 500) or 500
             source = getattr(args, "source", None)
             _browse_exclude = None if source else ["tool"]
-            sessions = db.list_sessions_rich(
+            sessions = _hermes_db.run_sync(db.list_sessions_rich(
                 source=source, exclude_sources=_browse_exclude, limit=limit
-            )
+            ))
             db.close()
             if not sessions:
                 print("No sessions found.")
@@ -13592,6 +13602,43 @@ Examples:
         help="Filter by component: gateway, agent, tools, cli, cron",
     )
     logs_parser.set_defaults(func=cmd_logs)
+
+    # =========================================================================
+    # db command — Phase 0 database utilities
+    # =========================================================================
+    db_parser = subparsers.add_parser(
+        "db",
+        help="Database utilities (migration, maintenance)",
+        description="Low-level database commands for the Hermes PG backend.",
+    )
+    db_subparsers = db_parser.add_subparsers(dest="db_command")
+
+    db_migrate_sqlite = db_subparsers.add_parser(
+        "migrate-from-sqlite",
+        help="Copy legacy ~/.hermes/state.db into the configured PostgreSQL database",
+        description=(
+            "One-shot migration: reads sessions and messages from a legacy SQLite "
+            "state.db and copies them into the PG schema. Requires HERMES_PG_DSN "
+            "to be set and alembic upgrade head to have been run."
+        ),
+    )
+    db_migrate_sqlite.add_argument(
+        "--sqlite-path",
+        dest="sqlite_path",
+        default=None,
+        metavar="PATH",
+        help="Path to the source SQLite state.db (default: ~/.hermes/state.db)",
+    )
+    db_migrate_sqlite.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Count rows without writing to PG",
+    )
+    from hermes_cli.db_commands import cmd_db, cmd_db_migrate_from_sqlite  # noqa: E402
+    db_migrate_sqlite.set_defaults(func=cmd_db_migrate_from_sqlite)
+    db_parser.set_defaults(func=cmd_db)
 
     # =========================================================================
     # Parse and execute

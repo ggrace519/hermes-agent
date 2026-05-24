@@ -38,6 +38,7 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import subprocess
 import sys
@@ -46,6 +47,27 @@ import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+
+# Per-subprocess worker-id counter for the pytest-postgresql fixture.
+# pytest-postgresql 8.x's ``xdistify_dbname`` appends the value of
+# ``PYTEST_XDIST_WORKER`` to the configured dbname (and the derived
+# ``{dbname}_tmpl`` template) so concurrent workers each get an isolated
+# database. We don't use pytest-xdist (we use one subprocess per file via
+# this runner instead), so the env var is unset by default — every
+# subprocess would then race on the shared ``hermes_tmpl`` template DB and
+# explode with ``InvalidCatalogName: database "hermes_tmpl" does not exist``
+# as one subprocess's session-end teardown drops the template while
+# another is mid-clone. Synthesising a unique id per subprocess routes
+# pytest-postgresql onto a per-worker template (``hermes_tmplrun_N``,
+# ``hermes_run_N``) and removes the race entirely.
+_worker_counter = itertools.count()
+_worker_counter_lock = threading.Lock()
+
+
+def _next_worker_id() -> str:
+    with _worker_counter_lock:
+        return f"run_{next(_worker_counter)}"
 
 
 # Default test discovery roots.
@@ -247,12 +269,19 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    # Inject a unique PYTEST_XDIST_WORKER per subprocess so pytest-postgresql
+    # routes each one onto its own template / test DB (e.g.
+    # ``hermes_tmplrun_42``) instead of racing on the shared ``hermes_tmpl``.
+    # See the module-level _worker_counter doc for the rationale.
+    env = os.environ.copy()
+    env["PYTEST_XDIST_WORKER"] = _next_worker_id()
     proc = subprocess.Popen(
         cmd,
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

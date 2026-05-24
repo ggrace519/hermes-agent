@@ -1,0 +1,82 @@
+name: Claude Review
+
+# Anthropic's Claude Code Action reviews PRs at open / synchronize. The
+# action posts a Markdown review comment summarising correctness, security,
+# performance, and style concerns, and (when applicable) emits inline
+# review comments tied to the diff.
+#
+# Required repository secret:
+#   ANTHROPIC_API_KEY — an API key with access to the Claude model named in
+#   ``model:`` below. The action will silently no-op (with a warning in the
+#   workflow log) if the secret is missing, so forks without the key don't
+#   break PRs.
+#
+# Permissions: we grant ``pull-requests: write`` so the action can post the
+# review comment, ``contents: read`` so it can read the diff and adjacent
+# files, and ``issues: write`` so it can comment on the PR thread (PRs are
+# issues in the GitHub API).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "website/**"
+      - ".github/ISSUE_TEMPLATE/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  # claude-code-action requests an OIDC token to authenticate to GitHub
+  # for the inline-review-comment API. Without ``id-token: write`` the
+  # action fails immediately with "Could not fetch an OIDC token".
+  id-token: write
+
+concurrency:
+  # Only one Claude review per PR ref at a time. A new push cancels the
+  # in-flight review so we always comment on the latest diff.
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts so we don't pay for reviews on work-in-progress PRs.
+    if: ${{ github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out PR HEAD
+        uses: actions/checkout@v4
+        with:
+          # Fetch enough history that the action can diff against the base.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run Claude code review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # v1 schema: model selection goes into ``claude_args`` (passed
+          # through to the underlying ``claude`` CLI). v0's top-level
+          # ``model:`` input was removed.
+          claude_args: --model claude-sonnet-4-5
+          # v1 schema: ``prompt`` replaces v0's ``direct_prompt``.
+          # Pin the review to actionable items so the comment stays useful
+          # for the human reviewer.
+          prompt: |
+            You are reviewing a pull request against ``main``. Produce a
+            short Markdown summary (under 400 words) covering:
+
+            1. **Correctness risks** — concrete bugs, off-by-one errors,
+               broken invariants. Cite file:line. Skip stylistic nits.
+            2. **Security / safety** — auth, secrets, untrusted input,
+               injection, file/network sandboxing. Cite file:line.
+            3. **Tests** — coverage gaps, brittle assertions, flake risks.
+            4. **Migration / compatibility** — schema changes, breaking
+               API edits, data migration safety.
+
+            If the diff is clean, say so in one line. Do NOT restate the
+            PR description.

@@ -1,7 +1,7 @@
 """Regression tests for approval-state cleanup on session boundaries."""
 
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -86,9 +86,18 @@ def _make_resume_runner():
     runner.session_store.get_or_create_session.return_value = current_entry
     runner.session_store.switch_session.return_value = resumed_entry
     runner.session_store.load_transcript.return_value = []
-    runner._session_db = MagicMock()
+    # After Task 22 cutover, all _session_db methods are async. Use AsyncMock.
+    runner._session_db = AsyncMock()
     runner._session_db.resolve_session_by_title.return_value = "resumed-session"
+    runner._session_db.resolve_resume_session_id.return_value = "resumed-session"
+    runner._session_db.get_session.return_value = {
+        "id": "resumed-session",
+        "session_id": "resumed-session",
+        "ended_at": None,
+        "user_id": None,
+    }
     runner._session_db.get_session_title.return_value = "Resumed Work"
+    runner._session_db.list_sessions_rich.return_value = []
     return runner, session_key
 
 
@@ -116,9 +125,23 @@ def _make_branch_runner():
         {"role": "assistant", "content": "world"},
     ]
     runner.session_store.switch_session.return_value = branched_entry
-    runner._session_db = MagicMock()
+    # After Task 22 cutover, all _session_db methods are async. Use AsyncMock
+    # so that gateway/run.py code that does `await self._session_db.foo()` works.
+    runner._session_db = AsyncMock()
     runner._session_db.get_session_title.return_value = "Current Work"
     runner._session_db.get_next_title_in_lineage.return_value = "Current Work #2"
+    runner._session_db.resolve_session_by_title.return_value = "branched-session"
+    runner._session_db.resolve_resume_session_id.return_value = "branched-session"
+    runner._session_db.get_session.return_value = {
+        "id": "branched-session",
+        "session_id": "branched-session",
+        "ended_at": None,
+        "user_id": None,
+    }
+    runner._session_db.list_sessions_rich.return_value = []
+    runner._session_db.create_session.return_value = None
+    runner._session_db.set_session_title.return_value = True
+    runner._session_db.append_message.return_value = None
     return runner, session_key
 
 

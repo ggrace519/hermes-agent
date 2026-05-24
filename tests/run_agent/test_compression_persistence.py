@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 
 # ---------------------------------------------------------------------------
@@ -48,90 +49,129 @@ class TestFlushAfterCompression:
             )
         return agent
 
-    def test_flush_after_compression_with_long_history(self):
+    def test_flush_after_compression_with_long_history(self, hermes_db_dsn):
         """The actual bug: conversation_history longer than compressed messages.
 
         Before the fix, flush_from = max(len(conversation_history), 0) = 200,
         but messages only has ~30 entries, so messages[200:] is empty.
         After the fix, conversation_history is cleared to None after compression,
         so flush_from = max(0, 0) = 0, and ALL compressed messages are written.
+
+        Runs the whole body in a dedicated thread with its own event loop so
+        hermes_db.run_sync() (used internally by _flush_messages_to_session_db)
+        does not conflict with pytest-asyncio's running loop.
         """
-        from hermes_state import SessionDB
+        import threading
+        import hermes_db as _hermes_db
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
+        results = {}
 
-            agent = self._make_agent(db)
+        def _run_in_thread():
+            import asyncio
+            from hermes_state import SessionDB
 
-            # Simulate the original long history (200 messages)
-            original_history = [
-                {"role": "user" if i % 2 == 0 else "assistant",
-                 "content": f"message {i}"}
-                for i in range(200)
-            ]
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_hermes_db.init(hermes_db_dsn))
 
-            # First, flush original messages to the original session
-            agent._flush_messages_to_session_db(original_history, [])
-            original_rows = db.get_messages("original-session")
-            assert len(original_rows) == 200
+                db = SessionDB()
+                agent = self._make_agent(db)
 
-            # Now simulate compression: new session, reset idx, shorter messages
-            agent.session_id = "compressed-session"
-            db.create_session(session_id="compressed-session", source="test")
-            agent._last_flushed_db_idx = 0
+                # Simulate the original long history (200 messages)
+                original_history = [
+                    {"role": "user" if i % 2 == 0 else "assistant",
+                     "content": f"message {i}"}
+                    for i in range(200)
+                ]
 
-            # The compressed messages (summary + tail + new turn)
-            compressed_messages = [
-                {"role": "user", "content": "[CONTEXT COMPACTION] Summary of work..."},
-                {"role": "user", "content": "What should we do next?"},
-                {"role": "assistant", "content": "Let me check..."},
-                {"role": "user", "content": "new question"},
-                {"role": "assistant", "content": "new answer"},
-            ]
+                # Flush original messages to the original session
+                agent._flush_messages_to_session_db(original_history, [])
+                original_rows = loop.run_until_complete(db.get_messages("original-session"))
+                results["original_count"] = len(original_rows)
 
-            # THE BUG: passing the original history as conversation_history
-            # causes flush_from = max(200, 0) = 200, skipping everything.
-            # After the fix, conversation_history should be None.
-            agent._flush_messages_to_session_db(compressed_messages, None)
+                # Simulate compression: new session, reset idx, shorter messages
+                agent.session_id = "compressed-session"
+                loop.run_until_complete(
+                    db.create_session(session_id="compressed-session", source="test")
+                )
+                agent._last_flushed_db_idx = 0
 
-            new_rows = db.get_messages("compressed-session")
-            assert len(new_rows) == 5, (
-                f"Expected 5 compressed messages in new session, got {len(new_rows)}. "
-                f"Compression persistence bug: messages not written to SQLite."
-            )
+                compressed_messages = [
+                    {"role": "user", "content": "[CONTEXT COMPACTION] Summary of work..."},
+                    {"role": "user", "content": "What should we do next?"},
+                    {"role": "assistant", "content": "Let me check..."},
+                    {"role": "user", "content": "new question"},
+                    {"role": "assistant", "content": "new answer"},
+                ]
 
-    def test_flush_with_stale_history_loses_messages(self):
+                agent._flush_messages_to_session_db(compressed_messages, None)
+
+                new_rows = loop.run_until_complete(db.get_messages("compressed-session"))
+                results["compressed_count"] = len(new_rows)
+            finally:
+                loop.run_until_complete(_hermes_db.close())
+                loop.close()
+
+        t = threading.Thread(target=_run_in_thread)
+        t.start()
+        t.join(timeout=30)
+        assert not t.is_alive(), "DB thread timed out"
+
+        assert results.get("original_count") == 200
+        assert results.get("compressed_count") == 5, (
+            f"Expected 5 compressed messages in new session, got {results.get('compressed_count')}. "
+            f"Compression persistence bug: messages not written to PG."
+        )
+
+    def test_flush_with_stale_history_loses_messages(self, hermes_db_dsn):
         """Demonstrates the bug condition: stale conversation_history causes data loss."""
-        from hermes_state import SessionDB
+        import threading
+        import hermes_db as _hermes_db
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "test.db"
-            db = SessionDB(db_path=db_path)
+        results = {}
 
-            agent = self._make_agent(db)
+        def _run_in_thread():
+            import asyncio
+            from hermes_state import SessionDB
 
-            # Simulate compression reset
-            agent.session_id = "new-session"
-            db.create_session(session_id="new-session", source="test")
-            agent._last_flushed_db_idx = 0
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_hermes_db.init(hermes_db_dsn))
 
-            compressed = [
-                {"role": "user", "content": "summary"},
-                {"role": "assistant", "content": "continuing..."},
-            ]
+                db = SessionDB()
+                agent = self._make_agent(db)
 
-            # Bug: passing a conversation_history longer than compressed messages
-            stale_history = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
-            agent._flush_messages_to_session_db(compressed, stale_history)
+                agent.session_id = "new-session"
+                loop.run_until_complete(
+                    db.create_session(session_id="new-session", source="test")
+                )
+                agent._last_flushed_db_idx = 0
 
-            rows = db.get_messages("new-session")
-            # With the stale history, flush_from = max(100, 0) = 100
-            # But compressed only has 2 entries → messages[100:] = empty
-            assert len(rows) == 0, (
-                "Expected 0 messages with stale conversation_history "
-                "(this test verifies the bug condition exists)"
-            )
+                compressed = [
+                    {"role": "user", "content": "summary"},
+                    {"role": "assistant", "content": "continuing..."},
+                ]
+
+                stale_history = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
+                agent._flush_messages_to_session_db(compressed, stale_history)
+
+                rows = loop.run_until_complete(db.get_messages("new-session"))
+                results["row_count"] = len(rows)
+            finally:
+                loop.run_until_complete(_hermes_db.close())
+                loop.close()
+
+        t = threading.Thread(target=_run_in_thread)
+        t.start()
+        t.join(timeout=30)
+        assert not t.is_alive(), "DB thread timed out"
+
+        assert results.get("row_count") == 0, (
+            "Expected 0 messages with stale conversation_history "
+            "(this test verifies the bug condition exists)"
+        )
 
 
 # ---------------------------------------------------------------------------
