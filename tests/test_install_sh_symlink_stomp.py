@@ -99,18 +99,20 @@ def test_re_running_setup_path_block_preserves_pip_entry_point(tmp_path: Path) -
     assert shim_path.is_symlink()
 
     block = _extract_setup_path_shim_block()
-    # Drive the block with the real env vars setup_path() sets. CLI_NAME and
-    # link_dir are both bash locals in setup_path(); the shim's
-    # `export HERMES_HOME=...` and HERMES_PG_DSN lines reference those vars,
-    # so set dummy values to keep the heredoc expansion well-formed.
+    # Drive the block with the real env vars setup_path() sets. The extracted
+    # block now contains a `local pg_dsn=...` line between the rm and the cat
+    # (substrate-edition added HERMES_PG_DSN injection to the launcher), so
+    # wrap the block in a function — `local` is illegal at script scope.
     script = (
         "set -e\n"
         f"HERMES_BIN={pip_entry!s}\n"
-        f"link_dir={link_dir!s}\n"
-        f"CLI_NAME={cli_name}\n"
         f"HERMES_HOME={tmp_path!s}/hermes_home\n"
-        f"pg_dsn=postgresql://hermes:hermes@localhost:5432/hermes\n"
+        "_run_shim_block() {\n"
+        f"  local link_dir={link_dir!s}\n"
+        f"  local CLI_NAME={cli_name}\n"
         f"{block}\n"
+        "}\n"
+        "_run_shim_block\n"
     )
     result = subprocess.run(
         ["bash", "-c", script],
