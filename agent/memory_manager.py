@@ -255,19 +255,30 @@ class MemoryManager:
 
     # -- Registration --------------------------------------------------------
 
+    # Provider names treated as built-in (not counted against the
+    # one-external-provider invariant). Phase C added "substrate" — the
+    # substrate-backed provider registers alongside any external plugin
+    # provider (Honcho, Hindsight, etc.) rather than displacing one.
+    _BUILTIN_PROVIDER_NAMES = frozenset({"builtin", "substrate"})
+
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a memory provider.
 
-        Built-in provider (name ``"builtin"``) is always accepted.
-        Only **one** external (non-builtin) provider is allowed — a second
+        Providers in ``_BUILTIN_PROVIDER_NAMES`` (``"builtin"`` from
+        the in-process memory tool path, ``"substrate"`` from the
+        Phase C SubstrateMemoryProvider) are always accepted — they
+        ship with Hermes and don't count against the one-external cap.
+        Only **one** external (plugin) provider is allowed — a second
         attempt is rejected with a warning.
         """
-        is_builtin = provider.name == "builtin"
+        is_builtin = provider.name in self._BUILTIN_PROVIDER_NAMES
 
         if not is_builtin:
             if self._has_external:
                 existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
+                    (p.name for p in self._providers
+                     if p.name not in self._BUILTIN_PROVIDER_NAMES),
+                    "unknown",
                 )
                 logger.warning(
                     "Rejected memory provider '%s' — external provider '%s' is "

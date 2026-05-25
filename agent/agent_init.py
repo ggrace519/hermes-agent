@@ -1058,18 +1058,53 @@ def init_agent(
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
+    #
+    # Phase C: a SubstrateMemoryProvider is registered alongside any
+    # external plugin when the substrate has booted. The provider's
+    # prefetch is gated by HERMES_SUBSTRATE_RECALL (default 0) so user-
+    # facing behavior is unchanged unless the operator opts in.
     agent._memory_manager = None
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-            if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
-                from plugins.memory import load_memory_provider as _load_mem
+            # Build the memory manager when EITHER the substrate is booted
+            # (so the substrate provider can attach) OR an external plugin
+            # is configured. Either path means there's something to manage.
+            from agent.memory_manager import MemoryManager as _MemoryManager
+            try:
+                from substrate import get_bound_substrate as _get_sub
+                _substrate_booted = _get_sub() is not None
+            except Exception:
+                _substrate_booted = False
+
+            _has_external_plugin = bool(_mem_provider_name and _mem_provider_name.strip())
+
+            if _substrate_booted or _has_external_plugin:
                 agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
+
+                # Phase C: substrate provider first (so it's resolved
+                # before any external plugin in prefetch_all ordering).
+                if _substrate_booted:
+                    try:
+                        from agent.memory_providers.substrate import (
+                            SubstrateMemoryProvider as _SubProv,
+                        )
+                        _sub_provider = _SubProv()
+                        if _sub_provider.is_available():
+                            agent._memory_manager.add_provider(_sub_provider)
+                    except Exception as _spe:
+                        _ra().logger.warning(
+                            "SubstrateMemoryProvider registration failed: %s", _spe
+                        )
+
+                # External plugin (Honcho / Mem0 / Hindsight / ...) per
+                # config. Unchanged from pre-Phase-C.
+                if _has_external_plugin:
+                    from plugins.memory import load_memory_provider as _load_mem
+                    _mp = _load_mem(_mem_provider_name)
+                    if _mp and _mp.is_available():
+                        agent._memory_manager.add_provider(_mp)
                 if agent._memory_manager.providers:
                     _init_kwargs = {
                         "session_id": agent.session_id,
@@ -1111,9 +1146,15 @@ def init_agent(
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    _provider_names = ",".join(p.name for p in agent._memory_manager.providers)
+                    _ra().logger.info(
+                        "Memory provider(s) activated: %s", _provider_names
+                    )
                 else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+                    _ra().logger.debug(
+                        "No memory providers registered (plugin=%r, substrate=%s)",
+                        _mem_provider_name, _substrate_booted,
+                    )
                     agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
