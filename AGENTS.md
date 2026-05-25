@@ -25,7 +25,8 @@ hermes-agent/
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
 ├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
-├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
+├── hermes_state.py       # SessionDB — async PG-backed session store (substrate edition; SQLite upstream)
+├── substrate/            # Cognitive substrate (perception sink + Curator + recall) — fork-only
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
@@ -855,6 +856,55 @@ Isolation model:
   loops.
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
+
+---
+
+## Cognitive Substrate (this fork only)
+
+`substrate/` ships a PostgreSQL-backed perception + memory layer that runs
+alongside the conversation loop. Phases A–C are shipped:
+
+- **Phase A** — perception sink. `Substrate.boot()` carves monthly partitions
+  on `substrate_slices`, auto-registers 15 streams (per-source user-message
+  streams + self-action/self-state + `substrate.self_state`), and spawns
+  three sub-agents: Sentinel (200 ms tick, pass-through stub),
+  force-reject (10 s TTL sweep), partition-maintenance (24 h).
+- **Phase B** — Curator (`substrate/agents/curator.py`). Continuous decay +
+  release loop with per-decision self-state emissions. Tombstone policies
+  (`thin`/`full`/`none`) on `substrate_decay_profiles` decide what survives
+  release. Pathological-forgetting alarms bump salience to keep slices alive
+  past the consolidation window.
+- **Phase C** — Recall API (`substrate/recall/api.py`) +
+  `SubstrateMemoryProvider` (`agent/memory_providers/substrate.py`) +
+  pgvector 1536-d embeddings backfilled by the Curator. Gated by
+  `HERMES_SUBSTRATE_RECALL` (default off in this fork). Composite score:
+  similarity + keyword Jaccard + salience + recency, ranked under a token
+  budget.
+
+**Discipline:**
+
+- **Substrate failures must be non-fatal.** Hooks under
+  `substrate/events/hermes_hooks.py` and the recall API wrap all I/O in
+  try/except — slice writes and recall calls never propagate to the
+  conversation loop. Recall returns an empty `RecallProjection` with
+  `empty_reason` set rather than raising.
+- **No SQLite paths anywhere in this fork.** Session / kanban / substrate
+  state all live in PostgreSQL via `hermes_db`'s asyncpg pool. The
+  `hermes_state.SessionDB` class is the async PG-backed store; the old
+  `state.db` SQLite path is gone.
+- **All substrate tests run against `postgres-test` (port 5433), never the
+  real `hermes` DB on 5432.** The test runner uses `pytest-postgresql` with
+  per-worker DB names derived from `PYTEST_XDIST_WORKER`. Direct `pytest`
+  invocations must set `PYTEST_XDIST_WORKER=run_<unique-id>` and point at
+  the test container. See `tests/conftest.py:_TEST_PG_PORT`.
+
+CLI surface: `hermes-substrate substrate inspect [streams | slices | pending |
+profiles | curator | recall]`. Operator-facing playbook is the bundled
+`substrate` skill (`skills/substrate/SKILL.md`).
+
+Design rationale lives in the
+[`llm-cognitive-thought`](https://github.com/ggrace519/llm-cognitive-thought)
+spec repo — do NOT write new substrate design docs in this repo.
 
 ---
 
