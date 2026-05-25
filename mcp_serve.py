@@ -219,9 +219,9 @@ class EventBridge:
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
-        # mtime cache — skip expensive work when files haven't changed
+        # mtime cache — skip expensive work when sessions.json hasn't changed.
+        # Phase 0: the state.db mtime cache is gone; see _poll_once.
         self._sessions_json_mtime: float = 0.0
-        self._state_db_mtime: float = 0.0
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -346,36 +346,34 @@ class EventBridge:
     def _poll_once(self, db):
         """Check for new messages across all sessions.
 
-        Uses mtime checks on sessions.json and state.db to skip work
-        when nothing has changed — makes 200ms polling essentially free.
+        Uses an mtime check on sessions.json to skip work when nothing has
+        changed — makes 200ms polling essentially free. The historic
+        secondary ``state.db`` mtime check is gone: Phase 0 moved the
+        session store from a per-process sqlite file to the shared PG
+        cluster, so there's no on-disk file whose mtime we can sample
+        without a PG round-trip. The gateway updates sessions.json
+        whenever it persists a message, so that mtime alone is a
+        sufficient change signal under PG.
         """
-        # Check if sessions.json has changed (mtime check is ~1μs)
+        # Snapshot sessions.json mtime BEFORE we update self._sessions_json_mtime,
+        # so the skip-gate below sees whether THIS poll had a change. Mutating
+        # the field first (as the original code did) made the gate always think
+        # nothing changed, masking new messages on the very first poll under PG
+        # where state.db doesn't exist to act as the secondary trigger.
         sessions_file = _get_sessions_dir() / "sessions.json"
         try:
             sj_mtime = sessions_file.stat().st_mtime if sessions_file.exists() else 0.0
         except OSError:
             sj_mtime = 0.0
 
-        if sj_mtime != self._sessions_json_mtime:
+        sj_changed = sj_mtime != self._sessions_json_mtime
+        if sj_changed:
             self._sessions_json_mtime = sj_mtime
             self._cached_sessions_index = _load_sessions_index()
 
-        # Check if state.db has changed
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-
-        try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            db_mtime = 0.0
-
-        if db_mtime == self._state_db_mtime and sj_mtime == self._sessions_json_mtime:
+        if not sj_changed:
             return  # Nothing changed since last poll — skip entirely
 
-        self._state_db_mtime = db_mtime
         entries = self._cached_sessions_index
 
         for session_key, entry in entries.items():
@@ -394,18 +392,21 @@ class EventBridge:
             if not messages:
                 continue
 
-            # Normalize timestamps to float for comparison
+            # Normalize timestamps to float for comparison.
+            # Phase 0: asyncpg returns timestamp columns as Python ``datetime``
+            # objects, so handle those directly before the str/int paths.
             def _ts_float(ts) -> float:
+                from datetime import datetime as _dt
+                if isinstance(ts, _dt):
+                    return ts.timestamp()
                 if isinstance(ts, (int, float)):
                     return float(ts)
                 if isinstance(ts, str) and ts:
                     try:
                         return float(ts)
                     except ValueError:
-                        # ISO string — parse to epoch
                         try:
-                            from datetime import datetime
-                            return datetime.fromisoformat(ts).timestamp()
+                            return _dt.fromisoformat(ts).timestamp()
                         except Exception:
                             return 0.0
                 return 0.0
@@ -599,11 +600,12 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             if role in {"user", "assistant"}:
                 content = _extract_message_content(msg)
                 if content:
+                    ts = msg.get("timestamp", "")
                     filtered.append({
                         "id": str(msg.get("id", "")),
                         "role": role,
                         "content": content[:2000],
-                        "timestamp": msg.get("timestamp", ""),
+                        "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else (ts or ""),
                     })
 
         messages = filtered[-limit:]

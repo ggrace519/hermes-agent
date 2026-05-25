@@ -12,7 +12,6 @@ import asyncio
 import inspect
 import json
 import os
-import sqlite3
 import time
 import threading
 from pathlib import Path
@@ -122,56 +121,48 @@ def populated_sessions_dir(sessions_dir, sample_sessions):
     return sessions_dir
 
 
-def _create_test_db(db_path, session_id, messages):
-    """Create a minimal SQLite DB mimicking hermes_state schema."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            source TEXT DEFAULT 'cli',
-            started_at TEXT,
-            message_count INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT,
-            tool_call_id TEXT,
-            tool_calls TEXT,
-            tool_name TEXT,
-            timestamp TEXT,
-            token_count INTEGER DEFAULT 0,
-            finish_reason TEXT,
-            reasoning TEXT,
-            reasoning_details TEXT,
-            codex_reasoning_items TEXT
-        )
-    """)
-    conn.execute(
-        "INSERT OR IGNORE INTO sessions (id, source, started_at, message_count) VALUES (?, 'gateway', ?, ?)",
-        (session_id, "2026-03-29T12:00:00", len(messages)),
-    )
+def _seed_session_db(session_id, messages):
+    """Seed messages into the real PG-backed ``_AsyncSessionDB``.
+
+    Phase 0: the sqlite scaffolding that used to build a per-test sqlite
+    file is gone — ``messages_read`` in ``mcp_serve.py`` drives the async
+    SessionDB through ``hermes_db.run_sync(db.get_messages(...))``, which
+    would crash against a sync mock. So we seed real rows into the
+    per-test PG database via the same async API production uses.
+    """
+    import hermes_db
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    hermes_db.run_sync(db.create_session(session_id=session_id, source="gateway"))
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, (list, dict)):
             content = json.dumps(content)
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp, tool_calls) VALUES (?, ?, ?, ?, ?)",
-            (session_id, msg["role"], content,
-             msg.get("timestamp", "2026-03-29T12:00:00"),
-             json.dumps(msg["tool_calls"]) if msg.get("tool_calls") else None),
+        hermes_db.run_sync(
+            db.append_message(
+                session_id=session_id,
+                role=msg["role"],
+                content=content,
+                tool_calls=msg.get("tool_calls"),
+                tool_name=msg.get("tool_name"),
+                tool_call_id=msg.get("tool_call_id"),
+            )
         )
-    conn.commit()
-    conn.close()
+    return db
 
 
 @pytest.fixture
-def mock_session_db(tmp_path, populated_sessions_dir):
-    """Create a real SQLite DB with test messages and wire it up."""
-    db_path = tmp_path / "state.db"
+def mock_session_db(tmp_path, populated_sessions_dir, hermes_db_initialized_sync):
+    """Seed test messages into the per-test PG SessionDB and return the handle.
+
+    ``hermes_db_initialized_sync`` runs Alembic upgrade head against the
+    per-test database and binds the asyncpg pool to it. ``_seed_session_db``
+    then writes rows through the same async API production reads with —
+    so ``mcp_serve.messages_read``'s ``hermes_db.run_sync(db.get_messages(...))``
+    sees real rows instead of crashing on a sync mock and returning
+    ``{"error": "Failed to read messages: ..."}``.
+    """
     messages = [
         {"role": "user", "content": "Hello Alice!", "timestamp": "2026-03-29T12:00:01"},
         {"role": "assistant", "content": "Hi! How can I help?", "timestamp": "2026-03-29T12:00:05"},
@@ -182,30 +173,7 @@ def mock_session_db(tmp_path, populated_sessions_dir):
         {"role": "tool", "content": '{"result": "ok"}', "timestamp": "2026-03-29T12:01:15"},
         {"role": "user", "content": "Thanks!", "timestamp": "2026-03-29T12:02:00"},
     ]
-    _create_test_db(db_path, "20260329_120000_abc123", messages)
-
-    # Create a mock SessionDB that reads from our test DB
-    class TestSessionDB:
-        def __init__(self):
-            self._db_path = db_path
-
-        def get_messages(self, session_id):
-            conn = sqlite3.connect(str(self._db_path))
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                (session_id,),
-            ).fetchall()
-            conn.close()
-            result = []
-            for r in rows:
-                d = dict(r)
-                if d.get("tool_calls"):
-                    d["tool_calls"] = json.loads(d["tool_calls"])
-                result.append(d)
-            return result
-
-    return TestSessionDB()
+    return _seed_session_db("20260329_120000_abc123", messages)
 
 
 class _FakeTool:
@@ -1059,15 +1027,16 @@ class TestEdgeCases:
 class TestEventBridgePollE2E:
     """End-to-end tests for the EventBridge polling loop with real files."""
 
-    def test_poll_detects_new_messages(self, tmp_path, monkeypatch):
-        """Write to SQLite + sessions.json, verify EventBridge picks it up."""
+    def test_poll_detects_new_messages(
+        self, tmp_path, monkeypatch, hermes_db_initialized_sync
+    ):
+        """Seed the PG SessionDB + sessions.json, verify EventBridge picks it up."""
         import mcp_serve
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
 
         session_id = "20260329_150000_poll_test"
-        db_path = tmp_path / "state.db"
 
         # Write sessions.json
         sessions_data = {
@@ -1083,32 +1052,19 @@ class TestEventBridgePollE2E:
         }
         (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
 
-        # Write messages to SQLite
+        # Seed messages into the real PG SessionDB.
         messages = [
             {"role": "user", "content": "First message",
              "timestamp": "2026-03-29T15:00:01"},
             {"role": "assistant", "content": "Reply",
              "timestamp": "2026-03-29T15:00:03"},
         ]
-        _create_test_db(db_path, session_id, messages)
-
-        # Create a mock SessionDB that reads our test DB
-        class TestDB:
-            def get_messages(self, sid):
-                conn = sqlite3.connect(str(db_path))
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
-                ).fetchall()
-                conn.close()
-                return [dict(r) for r in rows]
-
-        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: TestDB())
+        db = _seed_session_db(session_id, messages)
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: db)
 
         bridge = mcp_serve.EventBridge()
         # Run one poll cycle manually
-        bridge._poll_once(TestDB())
+        bridge._poll_once(db)
 
         # Should have found the messages
         result = bridge.poll_events(after_cursor=0)
@@ -1117,7 +1073,9 @@ class TestEventBridgePollE2E:
         assert result["events"][0]["content"] == "First message"
         assert result["events"][1]["role"] == "assistant"
 
-    def test_poll_skips_when_unchanged(self, tmp_path, monkeypatch):
+    def test_poll_skips_when_unchanged(
+        self, tmp_path, monkeypatch, hermes_db_initialized_sync
+    ):
         """Second poll with no file changes should be a no-op."""
         import mcp_serve
         sessions_dir = tmp_path / "sessions"
@@ -1125,7 +1083,6 @@ class TestEventBridgePollE2E:
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
 
         session_id = "20260329_150000_skip_test"
-        db_path = tmp_path / "state.db"
 
         sessions_data = {
             "agent:main:telegram:dm:skip": {
@@ -1137,26 +1094,22 @@ class TestEventBridgePollE2E:
             }
         }
         (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
-        _create_test_db(db_path, session_id, [
+        real_db = _seed_session_db(session_id, [
             {"role": "user", "content": "Hello", "timestamp": "2026-03-29T15:00:01"},
         ])
 
-        class TestDB:
-            def __init__(self):
+        # Wrap the real DB to count get_messages invocations — that's what the
+        # "skip when unchanged" assertion needs to observe.
+        class _CountingDB:
+            def __init__(self, inner):
+                self._inner = inner
                 self.call_count = 0
 
             def get_messages(self, sid):
                 self.call_count += 1
-                conn = sqlite3.connect(str(db_path))
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
-                ).fetchall()
-                conn.close()
-                return [dict(r) for r in rows]
+                return self._inner.get_messages(sid)
 
-        db = TestDB()
+        db = _CountingDB(real_db)
         bridge = mcp_serve.EventBridge()
 
         # First poll — should process
@@ -1169,15 +1122,17 @@ class TestEventBridgePollE2E:
         assert db.call_count == first_calls, \
             "Second poll should skip DB queries when files unchanged"
 
-    def test_poll_detects_new_message_after_db_write(self, tmp_path, monkeypatch):
-        """Write a new message to the DB after first poll, verify it's detected."""
+    def test_poll_detects_new_message_after_db_write(
+        self, tmp_path, monkeypatch, hermes_db_initialized_sync
+    ):
+        """Write a new message via the async SessionDB after first poll, verify it's detected."""
+        import hermes_db
         import mcp_serve
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
 
         session_id = "20260329_150000_new_msg"
-        db_path = tmp_path / "state.db"
 
         sessions_data = {
             "agent:main:telegram:dm:new": {
@@ -1189,22 +1144,10 @@ class TestEventBridgePollE2E:
             }
         }
         (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
-        _create_test_db(db_path, session_id, [
+        db = _seed_session_db(session_id, [
             {"role": "user", "content": "First", "timestamp": "2026-03-29T15:00:01"},
         ])
 
-        class TestDB:
-            def get_messages(self, sid):
-                conn = sqlite3.connect(str(db_path))
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                    (sid,),
-                ).fetchall()
-                conn.close()
-                return [dict(r) for r in rows]
-
-        db = TestDB()
         bridge = mcp_serve.EventBridge()
 
         # First poll
@@ -1212,18 +1155,16 @@ class TestEventBridgePollE2E:
         r1 = bridge.poll_events(after_cursor=0)
         assert len(r1["events"]) == 1
 
-        # Add a new message to the DB
-        conn = sqlite3.connect(str(db_path))
-        conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (session_id, "assistant", "New reply!", "2026-03-29T15:00:10"),
+        # Add a new message via the async session DB (the production write path).
+        hermes_db.run_sync(
+            db.append_message(
+                session_id=session_id,
+                role="assistant",
+                content="New reply!",
+            )
         )
-        conn.commit()
-        conn.close()
-        # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
-        os.utime(db_path, None)
 
-        # Update sessions.json updated_at to trigger re-check
+        # Update sessions.json updated_at to trigger re-check (mtime gate).
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
         (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
 
