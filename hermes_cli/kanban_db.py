@@ -6419,10 +6419,16 @@ def unseen_events_for_sub(
     out: list[Event] = []
     max_id = cursor
     for r in rows:
-        try:
-            payload = json.loads(r["payload"]) if r["payload"] else None
-        except Exception:
-            payload = None
+        # asyncpg's jsonb codec returns dicts/lists already-decoded; legacy
+        # sqlite rows came back as JSON strings. Accept both.
+        raw_payload = r["payload"]
+        if isinstance(raw_payload, (dict, list)) or raw_payload is None:
+            payload = raw_payload
+        else:
+            try:
+                payload = json.loads(raw_payload)
+            except Exception:
+                payload = None
         out.append(Event(
             id=r["id"], task_id=r["task_id"], kind=r["kind"],
             payload=payload, created_at=r["created_at"],
