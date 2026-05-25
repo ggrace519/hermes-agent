@@ -36,12 +36,18 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def fresh_home(tmp_path, monkeypatch):
+def fresh_home(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """Isolated HERMES_HOME with no prior kanban state.
 
     The autouse hermetic conftest already nukes credentials + TZ; this
     fixture layers a per-test HERMES_HOME plus a path-init cache reset
     so each test sees a truly empty board set.
+
+    Depends on ``hermes_db_initialized_sync`` so the PG pool is bound
+    to the persistent sync loop AND the kanban schema is migrated
+    before any ``kb.*`` call. Phase 0 moved kanban_db from SQLite to
+    PG; the table lives in the per-test PG database now (not
+    ``~/.hermes/kanban.db``).
     """
     home = tmp_path / "hermes_home"
     home.mkdir()
@@ -484,6 +490,20 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
 
 
 class TestCLI:
+    @pytest.fixture(autouse=True)
+    def _wire_pg(self, hermes_db_initialized_sync):
+        """Auto-wire the per-test PG init for every TestCLI test.
+
+        The CLI subprocesses these tests spawn (``python -m
+        hermes_cli.main kanban …``) inherit ``HERMES_PG_DSN`` from the
+        parent's ``os.environ``. ``hermes_db_initialized_sync`` sets
+        that env var via the underlying ``hermes_db_dsn`` fixture, so
+        the subprocess can lazy-init the pool against the per-test PG.
+        Without this, every test hits ``RuntimeError: hermes_db.init()
+        not called`` in the subprocess.
+        """
+        yield
+
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         res = _cli(["boards", "list", "--json"], env_extra=env)

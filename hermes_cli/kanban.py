@@ -805,6 +805,23 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     Returns a shell-style exit code (0 on success, non-zero on error).
     """
+    # Ensure the asyncpg pool is initialised before any kanban operation
+    # touches the DB. Sub-commands like ``boards create`` call into
+    # ``board_exists`` which uses ``hermes_db.run_sync(connection())``;
+    # ``connection()`` reaches ``pool()`` from INSIDE the driving event
+    # loop, and the lazy-init path in ``pool()`` only fires when the
+    # loop isn't already running. Without explicit init here every
+    # subprocess-driven kanban CLI test (which doesn't have hermes_db
+    # pre-initialised) crashes with ``RuntimeError: hermes_db.init()
+    # not called``. ``ensure_pool_sync()`` is idempotent.
+    try:
+        import hermes_db
+        hermes_db.ensure_pool_sync()
+    except Exception:
+        # No DSN configured / connection failure — let the inner kanban
+        # op raise its own concrete error rather than crashing here.
+        pass
+
     action = getattr(args, "kanban_action", None)
     if not action:
         # No subaction given: print help via the stored parser reference.
