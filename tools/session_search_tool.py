@@ -175,7 +175,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
             "results": results,
             "count": len(results),
             "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
-        }, ensure_ascii=False)
+        }, ensure_ascii=False, default=str)
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
@@ -302,7 +302,7 @@ def _scroll(
     }
     if rebind_warning:
         response["warning"] = rebind_warning
-    return json.dumps(response, ensure_ascii=False)
+    return json.dumps(response, ensure_ascii=False, default=str)
 
 
 def _discover(
@@ -337,7 +337,7 @@ def _discover(
             "results": [],
             "count": 0,
             "message": "No matching sessions found.",
-        }, ensure_ascii=False)
+        }, ensure_ascii=False, default=str)
 
     current_lineage_root = _resolve_to_parent(db, current_session_id) if current_session_id else None
 
@@ -403,7 +403,7 @@ def _discover(
         "results": results,
         "count": len(results),
         "sessions_searched": len(seen_sessions),
-    }, ensure_ascii=False)
+    }, ensure_ascii=False, default=str)
 
 
 def session_search(

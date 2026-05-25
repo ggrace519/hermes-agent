@@ -809,8 +809,12 @@ class _AsyncSessionDB:
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
                 LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
             """
-            # WHERE params apply twice: once in the CTE seed, once in the outer select.
-            all_params = params + params + [limit, offset]
+            # WHERE params apply twice in the SQL — once in the CTE seed,
+            # once in the outer SELECT — but PG ``$N`` placeholders are
+            # positional (one value serves every reference). Pass once.
+            # (SQLite's ``?`` placeholders are positional-positional and
+            # consume one arg per ``?``; this was the legacy shape.)
+            all_params = params + [limit, offset]
         else:
             query = f"""
                 SELECT s.*,
