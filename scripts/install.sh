@@ -1040,10 +1040,22 @@ copy_config_templates() {
     fi
     chmod 600 "$HERMES_HOME/.env"
 
-    # Ensure HERMES_PG_DSN is in .env so non-launcher entry points (gateway,
-    # cron jobs spawned outside the shim) can find the database.
+    # Ensure HERMES_PG_DSN in .env matches THIS install's PG so non-launcher
+    # entry points (gateway, cron jobs spawned outside the shim) can find
+    # the database. Always rewrite — an earlier run that picked a different
+    # port (e.g. 5432 before the user passed --pg-dsn :5434 on the re-run)
+    # would otherwise leave a stale line .env that gets loaded preferentially
+    # over the launcher's HERMES_PG_DSN default.
     local pg_dsn="${PG_DSN_OVERRIDE:-postgresql://${PG_USER_DEFAULT}:${PG_PASSWORD_DEFAULT}@${PG_HOST_DEFAULT}:${PG_PORT_DEFAULT}/${PG_DATABASE_DEFAULT}}"
-    if ! grep -q '^HERMES_PG_DSN=' "$HERMES_HOME/.env" 2>/dev/null; then
+    if grep -q '^HERMES_PG_DSN=' "$HERMES_HOME/.env" 2>/dev/null; then
+        local cur
+        cur=$(grep '^HERMES_PG_DSN=' "$HERMES_HOME/.env" | head -1 | cut -d= -f2-)
+        if [ "$cur" != "$pg_dsn" ]; then
+            # Use a delimiter that can't appear in the DSN.
+            sed -i "s|^HERMES_PG_DSN=.*|HERMES_PG_DSN=$pg_dsn|" "$HERMES_HOME/.env"
+            log_success "Updated HERMES_PG_DSN in $HERMES_HOME/.env ($cur → $pg_dsn)"
+        fi
+    else
         printf '\n# Substrate PostgreSQL DSN (added by installer)\nHERMES_PG_DSN=%s\n' "$pg_dsn" >> "$HERMES_HOME/.env"
         log_success "Wrote HERMES_PG_DSN to $HERMES_HOME/.env"
     fi
