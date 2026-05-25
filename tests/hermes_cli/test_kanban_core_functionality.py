@@ -26,6 +26,20 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban import run_slash
 
 
+def _decode_payload(p):
+    """Normalize a task_events.payload value to a Python object.
+
+    Phase 0 moved the kanban store to PostgreSQL where jsonb columns are
+    auto-decoded by asyncpg into Python dicts, so the historic sqlite
+    ``json.loads(row['payload'])`` pattern now hits a TypeError on dicts.
+    This helper accepts both shapes so the tests don't have to special-case.
+    """
+    if isinstance(p, (dict, list)) or p is None:
+        return p
+    import json as _json
+    return _json.loads(p)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -1227,7 +1241,13 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         conn.close()
 
 
-def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
+@pytest.mark.skip(
+    reason="Phase 0 (sqlite→PG): legacy task_events kind rename only ran on "
+    "sqlite databases that had the old vocab. PG schemas are created fresh "
+    "by Alembic without the legacy state, so the rename pass is intentionally "
+    "skipped in PG mode (see hermes_cli/kanban_db.py:_migrate_add_optional_columns)."
+)
+def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """A DB created with the old vocab must have its event rows renamed
     in place on init_db()."""
     home = tmp_path / ".hermes"
@@ -1301,7 +1321,7 @@ def test_list_profiles_on_disk_custom_root(tmp_path, monkeypatch):
     assert names == ["default", "researcher", "writer"]
 
 
-def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
+def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """known_assignees unions profiles on disk with currently-assigned
     names, and reports per-status counts."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -1698,6 +1718,12 @@ def test_build_worker_context_uses_parent_run_summary(kanban_home):
         conn.close()
 
 
+@pytest.mark.skip(
+    reason="Phase 0 (sqlite→PG): legacy-DB inflight-run backfill only ran "
+    "against sqlite databases that pre-dated the task_runs table. PG "
+    "schemas are created fresh by Alembic with task_runs present, so "
+    "there's no orphan-inflight state to backfill in PG mode."
+)
 def test_migration_backfills_inflight_run_for_legacy_db(kanban_home):
     """An existing 'running' task from before task_runs existed should
     get a synthesized run row so subsequent operations (complete,
@@ -2189,17 +2215,24 @@ def test_claim_task_recovers_from_invariant_leak(kanban_home):
 # Live-test findings (Apr 2026 third pass: auto-init, show --json carries runs)
 # -------------------------------------------------------------------------
 
-def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
-    """First CLI action on an empty HERMES_HOME must not error with
-    'no such table: tasks' — init_db auto-runs now."""
+def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """First CLI action on a fresh HERMES_HOME must succeed end-to-end —
+    auto-init runs on the kanban schema and the task is created.
+
+    Phase 0 moved the kanban store from a sqlite ``kanban.db`` file to
+    PostgreSQL, so the legacy "DB file exists" assertion no longer applies.
+    The behavior under test is still valuable: a subprocess CLI invocation
+    on a per-test PG database must not 500 with a missing-table error.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    # Sanity: kanban.db does NOT exist yet.
     import subprocess as _sp
     import sys as _sys
     worktree_root = Path(__file__).resolve().parents[2]
+    # Propagate HERMES_PG_DSN (set by hermes_db_initialized_sync) so the
+    # subprocess connects to the per-test database, not the real one.
     env = {**os.environ, "HERMES_HOME": str(home),
            "PYTHONPATH": str(worktree_root)}
     r = _sp.run(
@@ -2211,11 +2244,9 @@ def test_cli_create_on_fresh_home_auto_inits(tmp_path, monkeypatch):
     import json as _json
     out = _json.loads(r.stdout)
     assert out["status"] == "ready"
-    # DB file exists now.
-    assert (home / "kanban.db").exists()
 
 
-def test_connect_auto_inits_fresh_db(tmp_path, monkeypatch):
+def test_connect_auto_inits_fresh_db(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """Calling connect() on a fresh HERMES_HOME must create the
     schema. Previously callers had to remember kb.init_db() first."""
     home = tmp_path / ".hermes"
@@ -2324,7 +2355,13 @@ def test_unblock_normal_path_no_spurious_run(kanban_home):
         conn.close()
 
 
-def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
+@pytest.mark.skip(
+    reason="Phase 0 (sqlite→PG): the idempotency guarantee being tested "
+    "(re-running init_db on a legacy sqlite DB with an orphan-inflight task "
+    "installs exactly ONE backfilled run row, not N) is specific to the "
+    "sqlite legacy-DB backfill pass that's intentionally skipped in PG mode."
+)
+def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """init_db must be safe to re-run repeatedly. Each call should leave
     at most one run row per in-flight task, even if called while a
     dispatcher is simultaneously claiming."""
@@ -3714,8 +3751,7 @@ def test_complete_with_created_cards_all_verified_records_manifest(kanban_home):
         ))
         completed = [e for e in evs if e["kind"] == "completed"]
         assert len(completed) == 1
-        import json as _json
-        payload = _json.loads(completed[0]["payload"])
+        payload = _decode_payload(completed[0]["payload"])
         assert payload.get("verified_cards") == [c1, c2]
     finally:
         conn.close()
@@ -3805,13 +3841,12 @@ def test_complete_accepts_cross_worker_card_when_linked_as_child(kanban_home):
         )
         assert ok is True
         # The card should appear in the completed event's verified_cards list.
-        import json as _json
         row = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
             (parent,),
         ).fetchone()
-        payload = _json.loads(row["payload"])
+        payload = _decode_payload(row["payload"])
         assert other in payload.get("verified_cards", [])
     finally:
         conn.close()
@@ -3905,9 +3940,8 @@ def test_complete_prose_scan_flags_nonexistent_ids(kanban_home):
         ))
         kinds = [r["kind"] for r in kinds_and_payloads]
         assert "suspected_hallucinated_references" in kinds
-        import json as _json
         susp = [
-            _json.loads(r["payload"])
+            _decode_payload(r["payload"])
             for r in kinds_and_payloads
             if r["kind"] == "suspected_hallucinated_references"
         ][0]
@@ -3992,9 +4026,8 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert row["claim_lock"] is None
         assert row["worker_pid"] is None
 
-        import json as _json
         reclaim_evs = [
-            _json.loads(r["payload"])
+            _decode_payload(r["payload"])
             for r in conn.execute(
                 "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed'",
                 (t,),
