@@ -8,7 +8,7 @@ conversation with correct formatting, truncation, and config behavior.
 import os
 import sys
 from io import StringIO
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import cli as cli_mod
@@ -520,11 +520,37 @@ class TestPreloadResumedSession:
         cli._session_db = None
         assert cli._preload_resumed_session() is False
 
+    def _make_async_session_db(
+        self,
+        *,
+        session=None,
+        messages=None,
+        resolved_id=None,
+    ):
+        """Build a session_db mock with async methods that match the
+        ``_AsyncSessionDB`` surface used by ``_preload_resumed_session``.
+
+        Phase 0 moved sessions from sqlite (sync ``conn.execute``) to PG
+        (async coroutines driven through ``hermes_db.run_sync``), so a
+        plain ``MagicMock`` produces ``MagicMock`` objects where the
+        production code expects coroutines and run_sync raises
+        ``TypeError: An asyncio.Future, a coroutine or an awaitable is
+        required``.
+        """
+        mock_db = MagicMock()
+        mock_db.get_session = AsyncMock(return_value=session)
+        mock_db.get_messages_as_conversation = AsyncMock(
+            return_value=messages if messages is not None else []
+        )
+        mock_db.resolve_resume_session_id = AsyncMock(
+            return_value=resolved_id
+        )
+        mock_db.reopen_session = AsyncMock(return_value=None)
+        return mock_db
+
     def test_returns_false_when_session_not_found(self):
         cli = _make_cli(resume="nonexistent_session")
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = None
-        cli._session_db = mock_db
+        cli._session_db = self._make_async_session_db(session=None)
 
         buf = StringIO()
         cli.console.file = buf
@@ -536,10 +562,10 @@ class TestPreloadResumedSession:
 
     def test_returns_false_when_session_has_no_messages(self):
         cli = _make_cli(resume="empty_session")
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = {"id": "empty_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = []
-        cli._session_db = mock_db
+        cli._session_db = self._make_async_session_db(
+            session={"id": "empty_session", "title": None},
+            messages=[],
+        )
 
         buf = StringIO()
         cli.console.file = buf
@@ -552,10 +578,10 @@ class TestPreloadResumedSession:
     def test_loads_session_successfully(self):
         cli = _make_cli(resume="good_session")
         messages = _simple_history()
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = {"id": "good_session", "title": "Test Session"}
-        mock_db.get_messages_as_conversation.return_value = messages
-        cli._session_db = mock_db
+        cli._session_db = self._make_async_session_db(
+            session={"id": "good_session", "title": "Test Session"},
+            messages=messages,
+        )
 
         buf = StringIO()
         cli.console.file = buf
@@ -572,22 +598,20 @@ class TestPreloadResumedSession:
     def test_reopens_session_in_db(self):
         cli = _make_cli(resume="reopen_session")
         messages = [{"role": "user", "content": "hi"}]
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = {"id": "reopen_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = messages
-        mock_conn = MagicMock()
-        mock_db._conn = mock_conn
+        mock_db = self._make_async_session_db(
+            session={"id": "reopen_session", "title": None},
+            messages=messages,
+        )
         cli._session_db = mock_db
 
         buf = StringIO()
         cli.console.file = buf
         cli._preload_resumed_session()
 
-        # Should have executed UPDATE to clear ended_at
-        mock_conn.execute.assert_called_once()
-        call_args = mock_conn.execute.call_args
-        assert "ended_at = NULL" in call_args[0][0]
-        mock_conn.commit.assert_called_once()
+        # Phase 0: production code now calls the async ``reopen_session``
+        # via ``hermes_db.run_sync`` instead of poking ``_conn.execute``
+        # with a raw UPDATE — see cli.py:_preload_resumed_session.
+        mock_db.reopen_session.assert_awaited_once_with("reopen_session")
 
     def test_singular_user_message_grammar(self):
         """1 user message should say 'message' not 'messages'."""
@@ -596,11 +620,10 @@ class TestPreloadResumedSession:
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         ]
-        mock_db = MagicMock()
-        mock_db.get_session.return_value = {"id": "one_msg_session", "title": None}
-        mock_db.get_messages_as_conversation.return_value = messages
-        mock_db._conn = MagicMock()
-        cli._session_db = mock_db
+        cli._session_db = self._make_async_session_db(
+            session={"id": "one_msg_session", "title": None},
+            messages=messages,
+        )
 
         buf = StringIO()
         cli.console.file = buf
