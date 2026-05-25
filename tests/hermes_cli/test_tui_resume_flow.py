@@ -874,7 +874,9 @@ def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, ca
     import hermes_cli.main as main_mod
 
     class _FakeDB:
-        def get_session(self, session_id):
+        # Phase 0: production wraps these in ``hermes_db.run_sync(...)`` —
+        # async coroutines are what ``run_until_complete`` expects.
+        async def get_session(self, session_id):
             assert session_id == "20260409_000001_abc123"
             return {
                 "message_count": 2,
@@ -885,7 +887,7 @@ def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, ca
                 "reasoning_tokens": 1,
             }
 
-        def get_session_title(self, _session_id):
+        async def get_session_title(self, _session_id):
             return "demo title"
 
         def close(self):
@@ -912,7 +914,7 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     seen = []
 
     class _FakeDB:
-        def get_session(self, session_id):
+        async def get_session(self, session_id):
             seen.append(session_id)
             return {
                 "message_count": 1,
@@ -923,7 +925,7 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
                 "reasoning_tokens": 0,
             }
 
-        def get_session_title(self, _session_id):
+        async def get_session_title(self, _session_id):
             return "actual"
 
         def close(self):
