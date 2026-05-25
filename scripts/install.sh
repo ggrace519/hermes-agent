@@ -799,7 +799,24 @@ install_deps() {
 # other than our container, bump to the next free port and pin everything
 # downstream to that port.
 choose_pg_port() {
-    if [ "$SKIP_POSTGRES" = true ] || [ -n "${PG_DSN_OVERRIDE:-}" ]; then
+    if [ "$SKIP_POSTGRES" = true ]; then
+        return 0
+    fi
+
+    # If --pg-dsn was passed, extract its host:port and use that for compose
+    # binding too. The DSN tells us where to *connect*; if it points at
+    # localhost:5434, our docker container must also bind to host port 5434
+    # or alembic will hit a closed socket.
+    if [ -n "${PG_DSN_OVERRIDE:-}" ]; then
+        # Parse port from postgresql://user:pw@host:PORT/db. Tolerates missing
+        # port (postgresql defaults to 5432) and missing user/pw segments.
+        local dsn_port
+        dsn_port=$(echo "$PG_DSN_OVERRIDE" | sed -nE 's|.*@[^:/]+:([0-9]+)/.*|\1|p')
+        if [ -n "$dsn_port" ]; then
+            PG_PORT_DEFAULT="$dsn_port"
+            export POSTGRES_PORT="$dsn_port"
+            log_info "PostgreSQL: --pg-dsn pins host port $dsn_port"
+        fi
         return 0
     fi
 
