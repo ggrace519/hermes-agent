@@ -156,7 +156,13 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 #   additive — no substrate-owned tables touched — so the substrate is
 #   safe to boot against it. Listed so the head check stops rejecting
 #   freshly-migrated databases.
-_EXPECTED_REVISIONS = frozenset({"20260523_0003", "20260524_0004"})
+# - ``20260525_0005`` — Phase C substrate_recall_log observability table.
+#   Strictly additive — only the recall pipeline reads/writes this table.
+# - ``20260525_0006`` — Phase C substrate_slices.embedding column + ivfflat
+#   index. Adds a NULLable column; pre-Phase-C code paths ignore it.
+_EXPECTED_REVISIONS = frozenset(
+    {"20260523_0003", "20260524_0004", "20260525_0005", "20260525_0006"}
+)
 
 
 # Shutdown timeout — Phase A spec §8.2.
