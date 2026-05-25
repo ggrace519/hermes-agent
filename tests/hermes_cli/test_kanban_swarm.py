@@ -9,7 +9,8 @@ from hermes_cli.kanban_swarm import (
 )
 
 
-def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
+def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path, hermes_db_initialized_sync):
+    kb.init_db()
     conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
@@ -43,7 +44,8 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         conn.close()
 
 
-def test_swarm_blackboard_merges_structured_updates(tmp_path):
+def test_swarm_blackboard_merges_structured_updates(tmp_path, hermes_db_initialized_sync):
+    kb.init_db()
     conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
@@ -77,7 +79,8 @@ def test_swarm_blackboard_merges_structured_updates(tmp_path):
         conn.close()
 
 
-def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
+def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path, hermes_db_initialized_sync):
+    kb.init_db()
     conn = kb.connect(tmp_path / "kanban.db")
     try:
         created = create_swarm(
