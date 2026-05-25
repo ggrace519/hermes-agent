@@ -20,7 +20,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -94,19 +94,61 @@ class InsightsEngine:
     """
     Analyzes session history and produces usage insights.
 
-    Works directly with a SessionDB instance (or raw sqlite3 connection)
-    to query session and message data.
+    Works against the process-wide asyncpg pool managed by
+    ``hermes_db``. The ``db`` argument is accepted for call-site
+    compatibility (the legacy sqlite ``_AsyncSessionDB`` ancestor used
+    to expose ``_conn``) but ignored — all queries route through
+    ``hermes_db.run_sync`` so the engine can stay synchronously
+    callable from CLI / gateway code.
     """
 
     def __init__(self, db):
-        """
-        Initialize with a SessionDB instance.
-
-        Args:
-            db: A SessionDB instance (from hermes_state.py)
-        """
+        """Initialize with a SessionDB-like reference (Phase 0: unused)."""
         self.db = db
-        self._conn = db._conn
+
+    # ------------------------------------------------------------------ #
+    # PG query helper                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _translate(sql: str) -> str:
+        """Translate sqlite ``?`` placeholders to asyncpg ``$N``.
+
+        Counts ``?`` left-to-right and replaces each with ``$1``,
+        ``$2``, etc. so existing sqlite-shaped queries can run against
+        PostgreSQL unchanged.
+        """
+        out: list[str] = []
+        n = 0
+        for ch in sql:
+            if ch == "?":
+                n += 1
+                out.append(f"${n}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def _fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Synchronous wrapper: run a SELECT and return list-of-dicts."""
+        import hermes_db
+        sql_pg = self._translate(sql)
+
+        async def _do():
+            async with hermes_db.connection() as conn:
+                rows = await conn.fetch(sql_pg, *params)
+                return [dict(r) for r in rows]
+        return hermes_db.run_sync(_do())
+
+    def _fetchone(self, sql: str, params: tuple = ()) -> Optional[dict]:
+        """Synchronous wrapper: run a SELECT and return first row as dict."""
+        import hermes_db
+        sql_pg = self._translate(sql)
+
+        async def _do():
+            async with hermes_db.connection() as conn:
+                row = await conn.fetchrow(sql_pg, *params)
+                return dict(row) if row is not None else None
+        return hermes_db.run_sync(_do())
 
     def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
         """
@@ -197,12 +239,25 @@ class InsightsEngine:
     )
 
     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
-        """Fetch sessions within the time window."""
+        """Fetch sessions within the time window.
+
+        ``started_at`` / ``ended_at`` come back from PG as ``datetime``
+        (TIMESTAMPTZ); downstream insight code expects epoch floats so
+        ``end - start``, ``sum(...) / 3600`` etc. still work. We
+        normalise here so the call sites stay unchanged.
+        """
+        from datetime import datetime, timezone
+        cutoff_dt = datetime.fromtimestamp(cutoff, timezone.utc)
         if source:
-            cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
+            rows = self._fetchall(self._GET_SESSIONS_WITH_SOURCE, (cutoff_dt, source))
         else:
-            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
-        return [dict(row) for row in cursor.fetchall()]
+            rows = self._fetchall(self._GET_SESSIONS_ALL, (cutoff_dt,))
+        for r in rows:
+            for key in ("started_at", "ended_at"):
+                v = r.get(key)
+                if isinstance(v, datetime):
+                    r[key] = v.timestamp()
+        return rows
 
     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
         """Get tool call counts from messages.
@@ -214,9 +269,12 @@ class InsightsEngine:
         """
         tool_counts = Counter()
 
+        from datetime import datetime, timezone
+        cutoff_dt = datetime.fromtimestamp(cutoff, timezone.utc)
+
         # Source 1: explicit tool_name on tool response messages
         if source:
-            cursor = self._conn.execute(
+            rows = self._fetchall(
                 """SELECT m.tool_name, COUNT(*) as count
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
@@ -224,10 +282,10 @@ class InsightsEngine:
                      AND m.role = 'tool' AND m.tool_name IS NOT NULL
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff, source),
+                (cutoff_dt, source),
             )
         else:
-            cursor = self._conn.execute(
+            rows = self._fetchall(
                 """SELECT m.tool_name, COUNT(*) as count
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
@@ -235,34 +293,34 @@ class InsightsEngine:
                      AND m.role = 'tool' AND m.tool_name IS NOT NULL
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff,),
+                (cutoff_dt,),
             )
-        for row in cursor.fetchall():
+        for row in rows:
             tool_counts[row["tool_name"]] += row["count"]
 
         # Source 2: extract from tool_calls JSON on assistant messages
         # (covers CLI sessions where tool_name is NULL on tool responses)
         if source:
-            cursor2 = self._conn.execute(
+            rows2 = self._fetchall(
                 """SELECT m.tool_calls
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
+                (cutoff_dt, source),
             )
         else:
-            cursor2 = self._conn.execute(
+            rows2 = self._fetchall(
                 """SELECT m.tool_calls
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
+                (cutoff_dt,),
             )
 
         tool_calls_counts = Counter()
-        for row in cursor2.fetchall():
+        for row in rows2:
             try:
                 calls = row["tool_calls"]
                 if isinstance(calls, str):
@@ -298,28 +356,30 @@ class InsightsEngine:
 
     def _get_skill_usage(self, cutoff: float, source: str = None) -> List[Dict]:
         """Extract per-skill usage from assistant tool calls."""
+        from datetime import datetime, timezone
+        cutoff_dt = datetime.fromtimestamp(cutoff, timezone.utc)
         skill_counts: Dict[str, Dict[str, Any]] = {}
 
         if source:
-            cursor = self._conn.execute(
+            rows = self._fetchall(
                 """SELECT m.tool_calls, m.timestamp
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff, source),
+                (cutoff_dt, source),
             )
         else:
-            cursor = self._conn.execute(
+            rows = self._fetchall(
                 """SELECT m.tool_calls, m.timestamp
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?
                      AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
-                (cutoff,),
+                (cutoff_dt,),
             )
 
-        for row in cursor.fetchall():
+        for row in rows:
             try:
                 calls = row["tool_calls"]
                 if isinstance(calls, str):
@@ -329,7 +389,12 @@ class InsightsEngine:
             except (json.JSONDecodeError, TypeError):
                 continue
 
+            # messages.timestamp is TIMESTAMPTZ in PG; normalise to epoch
+            # float so the entry["last_used_at"] comparisons stay numeric.
             timestamp = row["timestamp"]
+            from datetime import datetime as _dt
+            if isinstance(timestamp, _dt):
+                timestamp = timestamp.timestamp()
             for call in calls:
                 if not isinstance(call, dict):
                     continue
@@ -374,8 +439,10 @@ class InsightsEngine:
 
     def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
         """Get aggregate message statistics."""
+        from datetime import datetime, timezone
+        cutoff_dt = datetime.fromtimestamp(cutoff, timezone.utc)
         if source:
-            cursor = self._conn.execute(
+            row = self._fetchone(
                 """SELECT
                      COUNT(*) as total_messages,
                      SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
@@ -384,10 +451,10 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ? AND s.source = ?""",
-                (cutoff, source),
+                (cutoff_dt, source),
             )
         else:
-            cursor = self._conn.execute(
+            row = self._fetchone(
                 """SELECT
                      COUNT(*) as total_messages,
                      SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
@@ -396,10 +463,9 @@ class InsightsEngine:
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
                    WHERE s.started_at >= ?""",
-                (cutoff,),
+                (cutoff_dt,),
             )
-        row = cursor.fetchone()
-        return dict(row) if row else {
+        return row if row else {
             "total_messages": 0, "user_messages": 0,
             "assistant_messages": 0, "tool_messages": 0,
         }
