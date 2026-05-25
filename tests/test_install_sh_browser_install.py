@@ -5,6 +5,7 @@ half-installed just because Playwright's managed Chromium download hangs on an
 unsupported distribution.
 """
 
+import re
 from pathlib import Path
 
 
@@ -17,14 +18,28 @@ def test_install_script_skips_playwright_download_when_system_browser_exists() -
 
     assert "find_system_browser()" in text
     assert "google-chrome google-chrome-stable chromium chromium-browser chrome" in text
-    assert "Skipping Playwright browser download; Hermes will use the system browser." in text
+    # When a system Chrome/Chromium is found, the installer must not also kick
+    # off Playwright's managed Chromium download. The log message phrasing has
+    # changed across rewrites; pin behaviour via the "skipping Chromium
+    # download" phrase rather than the exact log line.
+    assert re.search(r"skipping Chromium download", text), (
+        "Expected install.sh to announce skipping the Chromium download when "
+        "a system browser is detected."
+    )
 
 
 def test_install_script_persists_system_browser_for_agent_browser() -> None:
     text = INSTALL_SH.read_text()
 
     assert "configure_browser_env_from_system_browser()" in text
-    assert "AGENT_BROWSER_EXECUTABLE_PATH=$browser_path" in text
+    # The detected browser path must be persisted to .env as
+    # AGENT_BROWSER_EXECUTABLE_PATH. The exact write mechanism (raw redirect
+    # vs printf format string) is incidental — assert the variable name is
+    # written with the browser_path value.
+    assert re.search(r"AGENT_BROWSER_EXECUTABLE_PATH=(\$browser_path|%s)", text), (
+        "Expected install.sh to persist AGENT_BROWSER_EXECUTABLE_PATH using "
+        "$browser_path (raw) or %s (printf format)."
+    )
 
 
 def test_playwright_installs_are_timeout_guarded() -> None:
@@ -46,7 +61,11 @@ def test_install_script_supports_skip_browser_flag() -> None:
     assert "--skip-browser|--no-playwright)" in text
     assert "SKIP_BROWSER=true" in text
     assert 'if [ "$SKIP_BROWSER" = true ]; then' in text
-    assert "--skip-browser Skip Playwright/Chromium install" in text
+    # Help text formatting (spacing between flag and description) is
+    # incidental — match the flag and its purpose with a regex.
+    assert re.search(r"--skip-browser\s+Skip Playwright/Chromium install", text), (
+        "Expected --skip-browser to be documented in the help text."
+    )
 
 
 def test_install_script_skips_with_deps_when_no_sudo() -> None:
