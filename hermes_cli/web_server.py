@@ -32,6 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+from hermes_cli.cli_name import cli_name
 from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
@@ -2837,7 +2838,7 @@ def _resolve_profile_dir(name: str) -> Path:
 def _profile_setup_command(name: str) -> str:
     """Return the shell command used to configure a profile in the CLI."""
     _resolve_profile_dir(name)
-    return "hermes setup" if name == "default" else f"{name} setup"
+    return f"{cli_name()} setup" if name == "default" else f"{name} setup"
 
 
 @app.get("/api/profiles")

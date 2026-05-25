@@ -15,6 +15,8 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
+from hermes_cli.cli_name import cli_name
+
 
 # ---------------------------------------------------------------------------
 # Curses-based interactive picker (same pattern as hermes tools)
@@ -106,7 +108,7 @@ def _install_dependencies(provider_name: str) -> None:
     if not uv_path:
         print(f"  ⚠ uv not found — cannot install dependencies")
         print(f"  Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh")
-        print(f"  Then re-run: hermes memory setup")
+        print(f"  Then re-run: {cli_name()} memory setup")
         return
 
     try:
@@ -196,7 +198,7 @@ def cmd_setup_provider(provider_name: str) -> None:
 
     if not match:
         print(f"\n  Memory provider '{provider_name}' not found.")
-        print("  Run 'hermes memory setup' to see available providers.\n")
+        print(f"  Run '{cli_name()} memory setup' to see available providers.\n")
         return
 
     name, _, provider = match

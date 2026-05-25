@@ -8,6 +8,9 @@ Usage:
     hermes pairing clear-pending     # Clear all expired/pending codes
 """
 
+from hermes_cli.cli_name import cli_name
+
+
 def pairing_command(args):
     """Handle hermes pairing subcommands."""
     from gateway.pairing import PairingStore
@@ -24,8 +27,8 @@ def pairing_command(args):
     elif action == "clear-pending":
         _cmd_clear_pending(store)
     else:
-        print("Usage: hermes pairing {list|approve|revoke|clear-pending}")
-        print("Run 'hermes pairing --help' for details.")
+        print(f"Usage: {cli_name()} pairing {{list|approve|revoke|clear-pending}}")
+        print(f"Run '{cli_name()} pairing --help' for details.")
 
 
 def _cmd_list(store):
@@ -93,7 +96,7 @@ def _cmd_approve(store, platform: str, code: str):
         )
     else:
         print(f"\n  Code '{code}' not found or expired for platform '{platform}'.")
-        print("  Run 'hermes pairing list' to see pending codes.\n")
+        print(f"  Run '{cli_name()} pairing list' to see pending codes.\n")
 
 
 def _cmd_revoke(store, platform: str, user_id: str):

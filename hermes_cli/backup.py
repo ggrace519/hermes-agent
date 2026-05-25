@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.cli_name import cli_name
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,7 @@ def run_backup(args) -> None:
         if len(errors) > 10:
             print(f"  ... and {len(errors) - 10} more")
 
-    print(f"\nRestore with: hermes import {out_path.name}")
+    print(f"\nRestore with: {cli_name()} import {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -446,19 +447,19 @@ def run_import(args) -> None:
                 # hermes_cli.profiles might not be available (fresh install)
                 if any(profiles_dir.iterdir()):
                     print(f"\n  Profiles detected but aliases could not be created.")
-                    print(f"  Run: hermes profile list  (after installing hermes)")
+                    print(f"  Run: {cli_name()} profile list  (after installing {cli_name()})")
 
         # Guidance
         print()
         if not (hermes_root / "hermes-agent").is_dir():
             print("Note: The hermes-agent codebase was not included in the backup.")
-            print("  If this is a fresh install, run: hermes update")
+            print(f"  If this is a fresh install, run: {cli_name()} update")
 
         if restored_profiles:
             gw_profiles = [n for n, _ in restored_profiles]
             print("\nTo re-enable gateway services for profiles:")
             for pname in gw_profiles:
-                print(f"  hermes -p {pname} gateway install")
+                print(f"  {cli_name()} -p {pname} gateway install")
 
         print("Done. Your Hermes configuration has been restored.")
 

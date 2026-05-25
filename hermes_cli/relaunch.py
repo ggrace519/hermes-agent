@@ -17,6 +17,7 @@ from hermes_cli._parser import (
     PRE_ARGPARSE_INHERITED_FLAGS,
     build_top_level_parser,
 )
+from hermes_cli.cli_name import cli_name
 
 
 def _build_inherited_flag_table() -> list[tuple[str, bool]]:
@@ -82,7 +83,9 @@ def resolve_hermes_bin() -> Optional[str]:
 
     Priority:
       1. ``sys.argv[0]`` if it resolves to a real executable.
-      2. ``shutil.which("hermes")`` on PATH.
+      2. ``shutil.which(cli_name())`` on PATH (the launcher name the user
+         actually invoked, e.g. ``hermes-substrate``), falling back to
+         ``hermes`` for compatibility.
       3. ``None`` → caller should fall back to ``python -m hermes_cli.main``.
 
     Windows note: ``os.access(path, os.X_OK)`` returns True for ``.py`` and
@@ -113,8 +116,12 @@ def resolve_hermes_bin() -> Optional[str]:
             if not (_is_windows and _is_python_script(abs_path)):
                 return abs_path
 
-    # PATH lookup
-    path_bin = shutil.which("hermes")
+    # PATH lookup — honor the actual launcher name so a side-by-side install
+    # (e.g. hermes-substrate) re-execs itself, not whatever ``hermes`` resolves
+    # to on PATH (which may be a different/upstream install).
+    path_bin = shutil.which(cli_name())
+    if not path_bin and cli_name() != "hermes":
+        path_bin = shutil.which("hermes")
     if path_bin:
         return path_bin
 

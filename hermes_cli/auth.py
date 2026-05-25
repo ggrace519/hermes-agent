@@ -47,6 +47,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import httpx
 import yaml
 
+from hermes_cli.cli_name import cli_name
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from utils import atomic_replace, atomic_yaml_write, is_truthy_value
@@ -6162,9 +6163,9 @@ def _save_model_choice(model_id: str) -> None:
 
 def login_command(args) -> None:
     """Deprecated: use 'hermes model' or 'hermes setup' instead."""
-    print("The 'hermes login' command has been removed.")
-    print("Use 'hermes auth' to manage credentials,")
-    print("'hermes model' to select a provider, or 'hermes setup' for full setup.")
+    print(f"The '{cli_name()} login' command has been removed.")
+    print(f"Use '{cli_name()} auth' to manage credentials,")
+    print(f"'{cli_name()} model' to select a provider, or '{cli_name()} setup' for full setup.")
     raise SystemExit(0)
 
 
@@ -7248,7 +7249,7 @@ def _nous_device_code_login(
             print("Your Nous Portal account does not have an active subscription.")
             print(f"  Subscribe here: {portal_url}/billing")
             print()
-            print("After subscribing, run `hermes model` again to finish setup.")
+            print(f"After subscribing, run `{cli_name()} model` again to finish setup.")
             raise SystemExit(1)
         raise
 
@@ -7417,7 +7418,7 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 _save_auth_store(auth_store)
             print()
             print("No provider change. Nous credentials saved for future use.")
-            print("  Run `hermes model` again to switch to Nous Portal.")
+            print(f"  Run `{cli_name()} model` again to switch to Nous Portal.")
             return
 
         config_path = _update_config_for_provider(
@@ -7461,7 +7462,7 @@ def logout_command(args) -> None:
         if should_reset_config and os.getenv("OPENROUTER_API_KEY"):
             print("Hermes will use OpenRouter for inference.")
         elif should_reset_config:
-            print("Run `hermes model` or configure an API key to use Hermes.")
+            print(f"Run `{cli_name()} model` or configure an API key to use Hermes.")
         else:
             print("Model provider configuration was unchanged.")
     else:

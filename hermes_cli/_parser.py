@@ -12,6 +12,8 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 
 import argparse
 
+from hermes_cli.cli_name import cli_name
+
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
@@ -37,45 +39,53 @@ def _inherited_flag(parser, *args, **kwargs):
     return action
 
 
-_EPILOGUE = """
+def _build_epilogue(cli: str) -> str:
+    """Render the --help examples block using the actual launcher name.
+
+    ``cli`` is whatever the user invoked the CLI as (``hermes`` upstream,
+    or a side-by-side fork name like ``hermes-substrate``). Note the
+    ``hermes-agent-dev`` toolset name below is data, not the command, and is
+    intentionally left unchanged.
+    """
+    return f"""
 Examples:
-    hermes                        Start interactive chat
-    hermes chat -q "Hello"        Single query mode
-    hermes -c                     Resume the most recent session
-    hermes -c "my project"        Resume a session by name (latest in lineage)
-    hermes --resume <session_id>  Resume a specific session by ID
-    hermes setup                  Run setup wizard
-    hermes logout                 Clear stored authentication
-    hermes auth add <provider>    Add a pooled credential
-    hermes auth list              List pooled credentials
-    hermes auth remove <p> <t>    Remove pooled credential by index, id, or label
-    hermes auth reset <provider>  Clear exhaustion status for a provider
-    hermes model                  Select default model
-    hermes fallback [list]        Show fallback provider chain
-    hermes fallback add           Add a fallback provider (same picker as `hermes model`)
-    hermes fallback remove        Remove a fallback provider from the chain
-    hermes config                 View configuration
-    hermes config edit            Edit config in $EDITOR
-    hermes config set model gpt-4 Set a config value
-    hermes gateway                Run messaging gateway
-    hermes -s hermes-agent-dev,github-auth
-    hermes -w                     Start in isolated git worktree
-    hermes gateway install        Install gateway background service
-    hermes sessions list          List past sessions
-    hermes sessions browse        Interactive session picker
-    hermes sessions rename ID T   Rename/title a session
-    hermes logs                   View agent.log (last 50 lines)
-    hermes logs -f                Follow agent.log in real time
-    hermes logs errors            View errors.log
-    hermes logs --since 1h        Lines from the last hour
-    hermes debug share             Upload debug report for support
-    hermes update                 Update to latest version
-    hermes dashboard              Start web UI dashboard (port 9119)
-    hermes dashboard --stop       Stop running dashboard processes
-    hermes dashboard --status     List running dashboard processes
+    {cli}                        Start interactive chat
+    {cli} chat -q "Hello"        Single query mode
+    {cli} -c                     Resume the most recent session
+    {cli} -c "my project"        Resume a session by name (latest in lineage)
+    {cli} --resume <session_id>  Resume a specific session by ID
+    {cli} setup                  Run setup wizard
+    {cli} logout                 Clear stored authentication
+    {cli} auth add <provider>    Add a pooled credential
+    {cli} auth list              List pooled credentials
+    {cli} auth remove <p> <t>    Remove pooled credential by index, id, or label
+    {cli} auth reset <provider>  Clear exhaustion status for a provider
+    {cli} model                  Select default model
+    {cli} fallback [list]        Show fallback provider chain
+    {cli} fallback add           Add a fallback provider (same picker as `{cli} model`)
+    {cli} fallback remove        Remove a fallback provider from the chain
+    {cli} config                 View configuration
+    {cli} config edit            Edit config in $EDITOR
+    {cli} config set model gpt-4 Set a config value
+    {cli} gateway                Run messaging gateway
+    {cli} -s hermes-agent-dev,github-auth
+    {cli} -w                     Start in isolated git worktree
+    {cli} gateway install        Install gateway background service
+    {cli} sessions list          List past sessions
+    {cli} sessions browse        Interactive session picker
+    {cli} sessions rename ID T   Rename/title a session
+    {cli} logs                   View agent.log (last 50 lines)
+    {cli} logs -f                Follow agent.log in real time
+    {cli} logs errors            View errors.log
+    {cli} logs --since 1h        Lines from the last hour
+    {cli} debug share             Upload debug report for support
+    {cli} update                 Update to latest version
+    {cli} dashboard              Start web UI dashboard (port 9119)
+    {cli} dashboard --stop       Stop running dashboard processes
+    {cli} dashboard --status     List running dashboard processes
 
 For more help on a command:
-    hermes <command> --help
+    {cli} <command> --help
 """
 
 
@@ -86,11 +96,12 @@ def build_top_level_parser():
     ``chat_parser.set_defaults(func=cmd_chat)`` and continues registering
     other subparsers via ``subparsers.add_parser(...)``.
     """
+    _cli = cli_name()
     parser = argparse.ArgumentParser(
-        prog="hermes",
+        prog=_cli,
         description="Hermes Agent - AI assistant with tool-calling capabilities",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=_EPILOGUE,
+        epilog=_build_epilogue(_cli),
     )
 
     parser.add_argument(

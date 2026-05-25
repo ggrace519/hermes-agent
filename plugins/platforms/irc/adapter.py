@@ -635,9 +635,10 @@ def interactive_setup() -> None:
             save_env_value("IRC_ALLOWED_USERS", "")
             print_info("No nicks allowed — the bot will ignore all messages until you add nicks.")
 
+    from hermes_cli.cli_name import cli_name
     print()
     print_success("IRC configuration saved to ~/.hermes/.env")
-    print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+    print_info(f"Restart the gateway for changes to take effect: {cli_name()} gateway restart")
 
 
 def is_connected(config) -> bool:

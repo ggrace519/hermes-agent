@@ -23,6 +23,7 @@ from hermes_cli.config import (
     cfg_get,
     load_config, save_config, get_env_value, save_env_value,
 )
+from hermes_cli.cli_name import cli_name
 from hermes_cli.colors import Colors, color
 from hermes_cli.nous_subscription import (
     apply_nous_managed_defaults,
@@ -974,7 +975,7 @@ def _run_post_setup(post_setup_key: str):
             from hermes_cli.auth import login_spotify_command
         except Exception as exc:
             _print_warning(f"    Could not load Spotify auth: {exc}")
-            _print_info("    Run manually: hermes auth spotify")
+            _print_info(f"    Run manually: {cli_name()} auth spotify")
             return
         _print_info("    Starting Spotify login...")
         try:
@@ -987,10 +988,10 @@ def _run_post_setup(post_setup_key: str):
             # User aborted the wizard, or OAuth failed — don't fail the
             # toolset enable; they can retry with `hermes auth spotify`.
             _print_warning(f"    Spotify login did not complete: {exc}")
-            _print_info("    Run later: hermes auth spotify")
+            _print_info(f"    Run later: {cli_name()} auth spotify")
         except Exception as exc:
             _print_warning(f"    Spotify login failed: {exc}")
-            _print_info("    Run manually: hermes auth spotify")
+            _print_info(f"    Run manually: {cli_name()} auth spotify")
 
     elif post_setup_key == "xai_grok":
         # Shared credential bootstrap for any picker entry that talks to xAI
@@ -1025,7 +1026,7 @@ def _run_post_setup(post_setup_key: str):
             from hermes_cli.config import save_env_value
         except Exception as exc:
             _print_warning(f"    Could not load setup helpers: {exc}")
-            _print_info("    Run later: hermes auth add xai-oauth   (or set XAI_API_KEY)")
+            _print_info(f"    Run later: {cli_name()} auth add xai-oauth   (or set XAI_API_KEY)")
             return
 
         idx = prompt_choice(

@@ -96,6 +96,7 @@ from agent.markdown_tables import (
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
 from hermes_cli.banner import _format_context_length, format_banner_version_label
+from hermes_cli.cli_name import cli_name
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -4520,7 +4521,7 @@ class HermesCLI:
             session_meta = _hermes_db.run_sync(self._session_db.get_session(self.session_id))
             if not session_meta:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
-                _cprint(f"{_DIM}Use a session ID from a previous CLI run (hermes sessions list).{_RST}")
+                _cprint(f"{_DIM}Use a session ID from a previous CLI run ({cli_name()} sessions list).{_RST}")
                 return False
             # If the requested session is the (empty) head of a compression
             # chain, walk to the descendant that actually holds the messages.
@@ -5394,7 +5395,7 @@ class HermesCLI:
         if _remainder:
             _cprint(f"  {_DIM}Now type your prompt (or use --image in single-query mode): {_remainder}{_RST}")
         elif _is_termux_environment():
-            _cprint(f"  {_DIM}Tip: type your next message, or run hermes chat -q --image {_termux_example_image_path(image_path.name)} \"What do you see?\"{_RST}")
+            _cprint(f"  {_DIM}Tip: type your next message, or run {cli_name()} chat -q --image {_termux_example_image_path(image_path.name)} \"What do you see?\"{_RST}")
 
     def _preprocess_images_with_vision(self, text: str, images: list, *, announce: bool = True) -> str:
         """Analyze attached images via the vision tool and return enriched text.
@@ -5480,7 +5481,7 @@ class HermesCLI:
                     if len(item["tools"]) > 2:
                         tools_str += f", +{len(item['tools'])-2} more"
                     self._console_print(f"   [dim]• {item['name']}[/] [dim italic]({', '.join(item['missing_vars'])})[/]")
-                self._console_print("[dim]   Run 'hermes setup' to configure[/]")
+                self._console_print(f"[dim]   Run '{cli_name()} setup' to configure[/]")
         except Exception:
             pass  # Don't crash on import errors
     
@@ -6261,7 +6262,7 @@ class HermesCLI:
             _hermes_db.run_sync(self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway"))
         except Exception:
             pass
-        _cprint("  Timed out waiting for the gateway. Is `hermes gateway` running?")
+        _cprint(f"  Timed out waiting for the gateway. Is `{cli_name()} gateway` running?")
         _cprint("  Your CLI session is intact.")
         return True
 
@@ -6274,7 +6275,7 @@ class HermesCLI:
             _cprint("  Usage: /resume <session_id_or_title>")
             if self._show_recent_sessions(reason="resume"):
                 return
-            _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
+            _cprint(f"  Tip:   Use /history or `{cli_name()} sessions list` to find sessions.")
             return
 
         if not self._session_db:
@@ -6291,7 +6292,7 @@ class HermesCLI:
         session_meta = _hermes_db.run_sync(self._session_db.get_session(target_id))
         if not session_meta:
             _cprint(f"  Session not found: {target}")
-            _cprint("  Use /history or `hermes sessions list` to see available sessions.")
+            _cprint(f"  Use /history or `{cli_name()} sessions list` to see available sessions.")
             return
 
         # If the target is the empty head of a compression chain, redirect to
@@ -6572,7 +6573,7 @@ class HermesCLI:
                 }, f, indent=2, ensure_ascii=False)
             print(f"(^_^)v Conversation snapshot saved to: {path}")
             if self.session_id:
-                print(f"       Resume the live session with: hermes --resume {self.session_id}")
+                print(f"       Resume the live session with: {cli_name()} --resume {self.session_id}")
         except Exception as e:
             print(f"(x_x) Failed to save: {e}")
     
@@ -11609,10 +11610,11 @@ class HermesCLI:
                 except Exception:
                     pass
 
+            _cli = cli_name()
             print("Resume this session with:")
-            print(f"  hermes --resume {self.session_id}")
+            print(f"  {_cli} --resume {self.session_id}")
             if session_title:
-                print(f"  hermes -c \"{session_title}\"")
+                print(f"  {_cli} -c \"{session_title}\"")
             print()
             print(f"Session:        {self.session_id}")
             if session_title:
