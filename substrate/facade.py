@@ -156,7 +156,13 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 #   additive — no substrate-owned tables touched — so the substrate is
 #   safe to boot against it. Listed so the head check stops rejecting
 #   freshly-migrated databases.
-_EXPECTED_REVISIONS = frozenset({"20260523_0003", "20260524_0004"})
+# - ``20260525_0005`` — Phase C substrate_recall_log observability table.
+#   Strictly additive — only the recall pipeline reads/writes this table.
+# - ``20260525_0006`` — Phase C substrate_slices.embedding column + ivfflat
+#   index. Adds a NULLable column; pre-Phase-C code paths ignore it.
+_EXPECTED_REVISIONS = frozenset(
+    {"20260523_0003", "20260524_0004", "20260525_0005", "20260525_0006"}
+)
 
 
 # Shutdown timeout — Phase A spec §8.2.
@@ -192,6 +198,11 @@ class Substrate:
         # ``from_pool`` get an empty dict; ``shutdown`` handles both.
         self._subagents: dict[str, "object"] = {}
         self._conductor: Optional["object"] = None
+
+        # Phase C: recall log writer. Lazy-attached at boot; tests that
+        # build via ``from_pool`` get ``None`` (the recall API's
+        # ``_safe_enqueue_log`` swallows that case).
+        self.recall_log: Optional["object"] = None
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -280,6 +291,19 @@ class Substrate:
 
             substrate._conductor = StubConductor(substrate)
 
+        # 5b. Phase C: start the recall log writer. Lives alongside the
+        # sub-agents but isn't a SubAgent itself (no tick body — pure
+        # drain loop). Started even when start_subagents=False because
+        # tests that exercise recall() against ``from_pool`` substrates
+        # still want the log writer attached so enqueue() works.
+        from substrate.recall.log import RecallLogWriter
+        from substrate import config as _cfg
+
+        substrate.recall_log = RecallLogWriter(
+            substrate, max_queue_depth=_cfg.RECALL_LOG_QUEUE_DEPTH
+        )
+        substrate.recall_log.start()
+
         # 6. Bind hook module to this substrate instance.
         from substrate.events import hermes_hooks
 
@@ -323,6 +347,16 @@ class Substrate:
             )
             self._subagents.clear()
         self._conductor = None
+
+        # Phase C: stop the recall log writer. In-flight queue contents
+        # are dropped (per the spec — substrate shutdown is bounded).
+        if self.recall_log is not None:
+            try:
+                await self.recall_log.stop()
+            except Exception as exc:
+                self.log.warning("recall_log.stop failed: %s", exc)
+            self.recall_log = None
+
         self.log.info("substrate.shutdown.ok")
 
     # ------------------------------------------------------------------

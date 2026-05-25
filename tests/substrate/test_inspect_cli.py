@@ -200,3 +200,116 @@ async def test_print_profiles_lists_4_seeded(booted_substrate):
     out = buf.getvalue()
     for profile in ("default-text", "default-structured", "default-binary", "default-signal"):
         assert profile in out
+
+
+# ---------------------------------------------------------------------------
+# Phase C: recall inspect subcommand.
+# ---------------------------------------------------------------------------
+
+
+def test_register_subparser_recall_subtree():
+    """The recall subparser tree parses cleanly."""
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    inspect_mod.register_subparser(sub)
+
+    # Default 'recall' → summary.
+    ns = parser.parse_args(["substrate", "inspect", "recall"])
+    assert callable(ns.func)
+
+    # recall recent --limit 5.
+    ns = parser.parse_args(["substrate", "inspect", "recall", "recent", "--limit", "5"])
+    assert ns.limit == 5
+
+    # recall sample requires session-id.
+    ns = parser.parse_args(
+        ["substrate", "inspect", "recall", "sample", "--session-id", "sess-A"]
+    )
+    assert ns.session_id == "sess-A"
+
+    # recall config takes no args.
+    ns = parser.parse_args(["substrate", "inspect", "recall", "config"])
+    assert callable(ns.func)
+
+
+@pytest.mark.asyncio
+async def test_print_recall_summary_empty_substrate(booted_substrate):
+    """With no recall calls yet, summary still produces the right format."""
+    import hermes_db
+    from substrate.recall.cli_inspect import print_summary
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await print_summary(conn)
+    out = buf.getvalue()
+    assert "Recall state" in out
+    assert "calls" in out
+    assert "Embedding coverage" in out
+    assert "total slices" in out
+
+
+@pytest.mark.asyncio
+async def test_print_recall_summary_after_recall(booted_substrate, monkeypatch):
+    """After enqueuing a fake recall log row, summary reflects the count."""
+    import hermes_db
+    from datetime import datetime, timezone
+    from substrate.recall.cli_inspect import print_summary
+
+    async with hermes_db.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO substrate_recall_log
+                (requested_at, session_id, query_excerpt,
+                 candidates_count, composed_count, tokens_used,
+                 duration_ms, timed_out, error_text, metadata)
+            VALUES (now(), 'sess-x', 'hello', 5, 3, 120, 80, false, NULL, $1::jsonb)
+            """,
+            '{"embedding_path": "semantic"}',
+        )
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await print_summary(conn)
+    out = buf.getvalue()
+    assert "calls           1" in out
+
+
+@pytest.mark.asyncio
+async def test_print_recall_recent_after_log_row(booted_substrate):
+    """recent prints any seeded log row with the right session id."""
+    import hermes_db
+    from substrate.recall.cli_inspect import print_recent
+
+    async with hermes_db.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO substrate_recall_log
+                (requested_at, session_id, query_excerpt,
+                 candidates_count, composed_count, tokens_used,
+                 duration_ms, timed_out, error_text, metadata)
+            VALUES (now(), 'sess-recent', 'q', 1, 1, 10, 5, false, NULL, '{}'::jsonb)
+            """
+        )
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await print_recent(conn, limit=10)
+    out = buf.getvalue()
+    assert "sess-recent" in out
+
+
+@pytest.mark.asyncio
+async def test_print_recall_config(booted_substrate):
+    """config dumps the RECALL_* knobs."""
+    import hermes_db
+    from substrate.recall.cli_inspect import print_config
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await print_config(conn)
+    out = buf.getvalue()
+    assert "RECALL_TOKEN_BUDGET" in out
+    assert "RECALL_EMBEDDING_MODEL" in out
+    assert "HERMES_SUBSTRATE_RECALL" in out

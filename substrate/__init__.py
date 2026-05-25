@@ -24,4 +24,22 @@ Task 14 of the Phase A plan).
 
 from substrate.facade import Substrate
 
-__all__ = ["Substrate"]
+
+def get_bound_substrate():
+    """Return the substrate instance currently bound to the perception
+    hook layer, or ``None`` if ``Substrate.boot()`` has not been called
+    yet.
+
+    Phase C surface: the ``SubstrateMemoryProvider`` (registered into
+    Hermes's ``MemoryManager`` at startup) uses this to reach the
+    substrate without holding a hard reference — keeps the provider's
+    import surface independent of Substrate's lifecycle.
+    """
+    # Late import so the hooks module isn't loaded just by importing
+    # the substrate package.
+    from substrate.events.hermes_hooks import _substrate
+
+    return _substrate
+
+
+__all__ = ["Substrate", "get_bound_substrate"]

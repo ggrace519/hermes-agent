@@ -17,7 +17,7 @@ caller-friendly errors.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID, uuid4
 
@@ -31,6 +31,7 @@ from substrate.storage.types import (
 
 if TYPE_CHECKING:  # pragma: no cover
     import asyncpg
+    from substrate.recall.projection import RecallCandidate
 
 
 @dataclass(frozen=True)
@@ -470,6 +471,238 @@ class SliceRepo:
             window_seconds,
         )
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Phase C: recall (read-side window + embedding persistence).
+    # ------------------------------------------------------------------
+
+    async def recall_window(
+        self,
+        conn: "asyncpg.Connection",
+        *,
+        t_now: datetime,
+        time_window: "timedelta",
+        stream_names: list[str],
+        min_salience: float,
+        limit: int,
+    ) -> "list[RecallCandidate]":
+        """Read recent passed slices across the named streams.
+
+        Single statement; PG plans this as a per-partition + per-stream
+        scan using ``substrate_slices_stream_time_idx`` from Phase A.
+        Returns ``RecallCandidate`` instances with payload decoded
+        (text wrappers unwrapped) and the optional ``embedding`` column
+        populated (None when the Curator hasn't backfilled yet).
+
+        Filters:
+          * ``stream_name = ANY($1)`` — caller restricts to one or more
+            registered streams
+          * ``event_time_world IN (t_now - window, t_now]`` — what the
+            agent perceived in this experiential window
+          * ``sentinel_state = 'passed'`` — never surface pending or
+            quarantined slices to recall
+          * ``consolidation_state <> 'released'`` — tombstoned slices
+            stay invisible to the projection
+          * ``salience_score >= min_salience`` — drop trivially-decayed
+            rows before they bloat the candidate set
+
+        Order: ``salience DESC, event_time DESC LIMIT limit``. The
+        ranker (``substrate.recall.projection.rank_candidates``) reorders
+        with the composite score downstream; the SQL ordering is just a
+        principled way to keep the pool of candidates focused.
+        """
+        # Local import — keep the module-level import set lean and avoid
+        # the recall package depending on storage at import time.
+        from substrate.recall.projection import RecallCandidate
+
+        rows = await conn.fetch(
+            """
+            SELECT sl.slice_id, sl.stream_id, st.name AS stream_name,
+                   sl.payload, sl.event_time_world,
+                   sl.time_start_world, sl.time_end_world,
+                   sl.salience_score, sl.trust_score, sl.metadata,
+                   sl.embedding
+              FROM substrate_slices  sl
+              JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE st.name = ANY($1::text[])
+               AND sl.event_time_world > $2::timestamptz - $3::interval
+               AND sl.event_time_world <= $2::timestamptz
+               AND sl.sentinel_state = 'passed'
+               AND sl.consolidation_state <> 'released'
+               AND sl.salience_score >= $4
+             ORDER BY sl.salience_score DESC, sl.event_time_world DESC
+             LIMIT $5
+            """,
+            stream_names,
+            t_now,
+            time_window,
+            min_salience,
+            limit,
+        )
+        candidates: list[RecallCandidate] = []
+        for r in rows:
+            payload = r["payload"]
+            # Unwrap text-modality payloads from {"text": "..."} → "..."
+            # so the composer doesn't see a json blob it has to dig into.
+            # Structured / signal payloads pass through as dicts.
+            if isinstance(payload, dict) and set(payload.keys()) == {"text"} and isinstance(
+                payload.get("text"), str
+            ):
+                payload = payload["text"]
+            candidates.append(
+                RecallCandidate(
+                    slice_id=r["slice_id"],
+                    address=Address(
+                        stream_id=r["stream_id"],
+                        time_start_world=r["time_start_world"],
+                        time_end_world=r["time_end_world"],
+                    ),
+                    stream_name=r["stream_name"],
+                    payload=payload,
+                    event_time_world=r["event_time_world"],
+                    salience_score=float(r["salience_score"]),
+                    trust_score=(
+                        float(r["trust_score"]) if r["trust_score"] is not None else None
+                    ),
+                    metadata=dict(r["metadata"] or {}),
+                    embedding=(
+                        list(r["embedding"]) if r["embedding"] is not None else None
+                    ),
+                )
+            )
+        return candidates
+
+    async def set_embedding(
+        self,
+        conn: "asyncpg.Connection",
+        slice_id: UUID,
+        embedding: list[float],
+    ) -> bool:
+        """Persist an embedding for a slice. Idempotent under concurrent
+        writers via the ``embedding IS NULL`` predicate — the second
+        writer's UPDATE matches no rows and returns ``False``.
+
+        Returns ``True`` if the row was written (this caller "won" the
+        race), ``False`` if the slice already had an embedding or the
+        slice wasn't found.
+        """
+        tag = await conn.execute(
+            """
+            UPDATE substrate_slices
+               SET embedding = $2::vector
+             WHERE slice_id = $1
+               AND embedding IS NULL
+            """,
+            slice_id,
+            embedding,
+        )
+        # asyncpg returns "UPDATE N" — wrote a row iff trailing 1.
+        return tag.endswith(" 1")
+
+    async def list_unembedded(
+        self,
+        conn: "asyncpg.Connection",
+        *,
+        limit: int,
+    ) -> list[dict]:
+        """Return up to ``limit`` rows that need embeddings.
+
+        Filters to ``passed`` (Sentinel-approved), unembedded (column
+        IS NULL), and not already marked failed (``metadata->>'embedding_failed'``
+        not set). Newest-first so freshly-committed slices get embeddings
+        promptly. Returns plain dicts (``slice_id``, ``payload``) — the
+        Curator's emit loop only needs those two fields.
+        """
+        rows = await conn.fetch(
+            """
+            SELECT slice_id, payload
+              FROM substrate_slices
+             WHERE embedding IS NULL
+               AND sentinel_state = 'passed'
+               AND (metadata->>'embedding_failed') IS DISTINCT FROM 'true'
+             ORDER BY ingest_time_world DESC
+             LIMIT $1
+            """,
+            limit,
+        )
+        return [{"slice_id": r["slice_id"], "payload": r["payload"]} for r in rows]
+
+    async def mark_embedding_failed(
+        self,
+        conn: "asyncpg.Connection",
+        slice_id: UUID,
+    ) -> None:
+        """Persist ``metadata.embedding_failed = true`` for a slice that
+        has exhausted its retry budget (Phase C spec §5.7 #5). The
+        ``list_unembedded`` filter excludes such rows so the Curator
+        stops re-trying.
+        """
+        await conn.execute(
+            """
+            UPDATE substrate_slices
+               SET metadata = metadata || jsonb_build_object('embedding_failed', true)
+             WHERE slice_id = $1
+            """,
+            slice_id,
+        )
+
+    async def recall_stats(
+        self,
+        conn: "asyncpg.Connection",
+        *,
+        window: "timedelta",
+    ) -> dict:
+        """Aggregations for the inspect CLI.
+
+        Returns:
+          * total_calls / non_empty_calls / timed_out_calls / error_calls
+            (over the window)
+          * avg_duration_ms / avg_tokens / avg_candidates / avg_composed
+          * total_slices / embedded_slices / unembedded_backlog
+          * semantic_path_count / keyword_path_count / mixed_path_count
+            (over the window — from substrate_recall_log.metadata)
+        """
+        # Recall-log aggregations.
+        log_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*)::int AS total_calls,
+              COUNT(*) FILTER (WHERE composed_count > 0)::int AS non_empty_calls,
+              COUNT(*) FILTER (WHERE timed_out)::int AS timed_out_calls,
+              COUNT(*) FILTER (WHERE error_text IS NOT NULL)::int AS error_calls,
+              COALESCE(AVG(duration_ms)::int, 0) AS avg_duration_ms,
+              COALESCE(AVG(tokens_used)::int, 0) AS avg_tokens,
+              COALESCE(AVG(candidates_count)::int, 0) AS avg_candidates,
+              COALESCE(AVG(composed_count)::int, 0) AS avg_composed,
+              COUNT(*) FILTER (
+                  WHERE metadata->>'embedding_path' = 'semantic'
+              )::int AS semantic_path_count,
+              COUNT(*) FILTER (
+                  WHERE metadata->>'embedding_path' = 'keyword'
+              )::int AS keyword_path_count,
+              COUNT(*) FILTER (
+                  WHERE metadata->>'embedding_path' = 'mixed'
+              )::int AS mixed_path_count
+              FROM substrate_recall_log
+             WHERE requested_at > now() - $1::interval
+            """,
+            window,
+        )
+        # Embedding-coverage aggregations.
+        emb_row = await conn.fetchrow(
+            """
+            SELECT
+              COUNT(*)::int AS total_slices,
+              COUNT(*) FILTER (WHERE embedding IS NOT NULL)::int AS embedded_slices,
+              COUNT(*) FILTER (
+                  WHERE embedding IS NULL
+                    AND sentinel_state = 'passed'
+                    AND (metadata->>'embedding_failed') IS DISTINCT FROM 'true'
+              )::int AS unembedded_backlog
+              FROM substrate_slices
+            """
+        )
+        return {**dict(log_row or {}), **dict(emb_row or {})}
 
     # ------------------------------------------------------------------
     # Force-reject: delete pending slices past their TTL.
