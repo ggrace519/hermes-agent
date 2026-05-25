@@ -374,25 +374,43 @@ def compress_context(
     agent._cached_system_prompt = new_system_prompt
 
     if agent._session_db:
+        # Each DB op is wrapped independently so a single failure can't strand
+        # the session_id rotation. Rotation MUST happen even if persistence fails
+        # — otherwise the new session writes into the old session's slot.
+        old_title = None
         try:
-            # Propagate title to the new session with auto-numbering
             old_title = resolve_maybe_awaitable(
                 agent._session_db.get_session_title(agent.session_id)
             )
-            # Trigger memory extraction on the old session before it rotates.
+        except Exception as e:
+            logger.debug("Could not read old session title on compression: %s", e)
+
+        try:
             agent.commit_memory_session(messages)
+        except Exception as e:
+            logger.warning("Memory extraction on compression failed: %s", e)
+
+        try:
             resolve_maybe_awaitable(
                 agent._session_db.end_session(agent.session_id, "compression")
             )
-            old_session_id = agent.session_id
-            agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-            os.environ["HERMES_SESSION_ID"] = agent.session_id
-            try:
-                from gateway.session_context import _SESSION_ID
-                _SESSION_ID.set(agent.session_id)
-            except Exception:
-                pass
-            agent._session_db_created = False
+        except Exception as e:
+            logger.warning("Could not mark old session ended on compression: %s", e)
+
+        # Unconditional rotation — must happen even if every DB call above raised.
+        old_session_id = agent.session_id
+        agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        os.environ["HERMES_SESSION_ID"] = agent.session_id
+        try:
+            from gateway.session_context import _SESSION_ID
+            _SESSION_ID.set(agent.session_id)
+        except Exception:
+            pass
+        agent._session_db_created = False
+        # Reset flush cursor — new session starts with no messages written
+        agent._last_flushed_db_idx = 0
+
+        try:
             resolve_maybe_awaitable(
                 agent._session_db.create_session(
                     session_id=agent.session_id,
@@ -403,24 +421,26 @@ def compress_context(
                 )
             )
             agent._session_db_created = True
-            # Auto-number the title for the continuation session
-            if old_title:
-                try:
-                    new_title = resolve_maybe_awaitable(
-                        agent._session_db.get_next_title_in_lineage(old_title)
-                    )
-                    resolve_maybe_awaitable(
-                        agent._session_db.set_session_title(agent.session_id, new_title)
-                    )
-                except (ValueError, Exception) as e:
-                    logger.debug("Could not propagate title on compression: %s", e)
+        except Exception as e:
+            logger.warning("Could not create continuation session in DB: %s", e)
+
+        if old_title:
+            try:
+                new_title = resolve_maybe_awaitable(
+                    agent._session_db.get_next_title_in_lineage(old_title)
+                )
+                resolve_maybe_awaitable(
+                    agent._session_db.set_session_title(agent.session_id, new_title)
+                )
+            except Exception as e:
+                logger.debug("Could not propagate title on compression: %s", e)
+
+        try:
             resolve_maybe_awaitable(
                 agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
             )
-            # Reset flush cursor — new session starts with no messages written
-            agent._last_flushed_db_idx = 0
         except Exception as e:
-            logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+            logger.debug("Could not persist system prompt on compression: %s", e)
 
     # Notify the context engine that the session_id rotated because of
     # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use
