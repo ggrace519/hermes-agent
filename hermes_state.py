@@ -560,16 +560,29 @@ class _AsyncSessionDB:
         return cleaned
 
     async def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+        """Set, update, or clear a session's title.
 
-        Returns True if session was found and title was set.
-        Raises ValueError if title is already in use by another session,
-        or if the title fails validation (too long, invalid characters).
-        Empty/whitespace-only strings are normalized to None (returns False).
+        Returns True if the session row was actually touched.
+
+        Raises ValueError if the title is already in use by another
+        session or fails validation (too long, invalid characters).
+
+        Empty/whitespace-only strings clear the existing title — the
+        row's ``title`` column is set to NULL so callers like
+        ``list_sessions_rich`` fall back to the message preview. This
+        is what the dashboard /retitle "" flow and the test
+        ``test_list_sessions_prefers_title_then_preview`` rely on; the
+        pre-Phase-0 sqlite implementation silently no-op'd, which we
+        treat as a bug rather than contract.
         """
         sanitized = self.sanitize_title(title)
         if sanitized is None:
-            return False
+            async with hermes_db.connection() as conn:
+                result = await conn.execute(
+                    "UPDATE sessions SET title = NULL WHERE id = $1",
+                    session_id,
+                )
+            return result.split()[-1] == "1"
 
         async with hermes_db.connection() as conn:
             # Check uniqueness (allow the same session to keep its own title)

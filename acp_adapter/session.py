@@ -85,6 +85,12 @@ def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
 def _format_updated_at(value: Any) -> str | None:
     if value is None:
         return None
+    # Phase 0 (sqlite → PG): asyncpg decodes TIMESTAMPTZ to a ``datetime``
+    # directly, but legacy callers passed epoch ints/floats. Accept both.
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
     if isinstance(value, str) and value.strip():
         return value
     try:
