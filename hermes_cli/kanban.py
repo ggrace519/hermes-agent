@@ -1069,7 +1069,6 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
-    print(f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
