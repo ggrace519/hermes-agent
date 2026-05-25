@@ -8,7 +8,7 @@ from gateway.session import SessionStore
 from gateway.config import GatewayConfig
 
 
-def test_load_transcript_returns_db_messages_when_no_jsonl(tmp_path, hermes_db_initialized):
+def test_load_transcript_returns_db_messages_when_no_jsonl(tmp_path, hermes_db_initialized_sync):
     """Reading a transcript must work from the DB alone — no JSONL fallback needed.
 
     Uses hermes_db.run_sync to set up DB state from a sync test (gateway/session.py

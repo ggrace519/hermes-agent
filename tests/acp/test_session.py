@@ -244,6 +244,22 @@ class TestListAndCleanup:
 class TestPersistence:
     """Verify that sessions are persisted to SessionDB and can be restored."""
 
+    @pytest.fixture(autouse=True)
+    def _ensure_pg(self, hermes_db_initialized_sync):
+        """Auto-wire the per-test PG init for every TestPersistence test.
+
+        Phase 0 moved SessionDB to PG; these tests were written for the
+        SQLite era when ``SessionDB(tmp_path / "state.db")`` was enough.
+        The ``hermes_db_initialized_sync`` fixture (a) runs Alembic
+        upgrade head so the ``sessions`` table exists, and (b) binds
+        the asyncpg pool to the persistent sync loop so the wrapper
+        ``_run_sync`` calls in this test file land cleanly. The
+        ``tmp_path / "state.db"`` arg passed to ``SessionDB`` is now
+        ignored by ``_AsyncSessionDB.__init__`` so the tests don't need
+        further surgery.
+        """
+        yield
+
     def test_create_session_includes_registered_mcp_toolsets(self, tmp_path, monkeypatch):
         captured = {}
 

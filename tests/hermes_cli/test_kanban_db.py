@@ -14,8 +14,15 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+def kanban_home(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    Depends on ``hermes_db_initialized_sync`` so the PG pool is bound
+    to the persistent sync loop AND the schema is migrated before
+    ``kb.init_db()`` runs. Phase 0 moved kanban_db from SQLite to PG;
+    the test used to point at ~/.hermes/kanban.db (a per-test tempdir)
+    but the table lives in the per-test PG database now.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

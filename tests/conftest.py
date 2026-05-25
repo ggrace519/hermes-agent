@@ -928,8 +928,49 @@ def hermes_db_dsn(postgresql):
 
 @pytest_asyncio.fixture
 async def hermes_db_initialized(hermes_db_dsn):
-    """Convenience fixture: also calls hermes_db.init() / close()."""
+    """Pool initialised on pytest-asyncio's per-test event loop.
+
+    Use this in ``@pytest.mark.asyncio`` tests that ``await`` against
+    ``hermes_db.pool()`` / ``connection()`` / ``transaction()`` directly.
+    Don't use it from sync test bodies that bridge via
+    ``hermes_db.run_sync`` — the pool would be bound to pytest-asyncio's
+    loop but ``run_sync`` uses the persistent sync loop, surfacing as
+    ``InterfaceError: cannot perform operation: another operation is
+    in progress``. Sync tests should use :func:`hermes_db_initialized_sync`
+    below.
+    """
     import hermes_db
     await hermes_db.init(hermes_db_dsn)
     yield hermes_db_dsn
     await hermes_db.close()
+
+
+@pytest.fixture
+def hermes_db_initialized_sync(hermes_db_dsn):
+    """Pool initialised on hermes_db's persistent sync loop.
+
+    Use this in **synchronous** test bodies that bridge to async DB
+    calls via ``hermes_db.run_sync(coro)``. The pool's binding loop
+    matches the sync loop, so ``run_sync`` round-trips cleanly. Async
+    tests in pytest-asyncio scope should NOT use this fixture — they
+    should use :func:`hermes_db_initialized` (above) which binds to the
+    per-test asyncio loop.
+
+    Counterpart to ``hermes_db_initialized``: same DSN, same migrated
+    schema, different binding loop. The split exists because asyncpg
+    pools are loop-bound and we have two different "current loop"
+    notions in the test suite — pytest-asyncio's per-test loop vs.
+    ``hermes_db._get_sync_loop()``'s persistent one.
+    """
+    import hermes_db
+
+    # ensure_pool_sync uses hermes_db._get_sync_loop() to run the
+    # asyncpg.create_pool coroutine — binding the pool to that loop.
+    # Subsequent run_sync(coro) calls reuse the same loop, so the
+    # binding matches.
+    assert hermes_db.ensure_pool_sync(), "ensure_pool_sync failed; HERMES_PG_DSN should be set by hermes_db_dsn"
+    try:
+        yield hermes_db_dsn
+    finally:
+        # Close on the same loop the pool was opened on.
+        hermes_db.run_sync(hermes_db.close())

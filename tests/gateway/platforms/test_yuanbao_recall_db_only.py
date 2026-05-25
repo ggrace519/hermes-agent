@@ -10,7 +10,7 @@ from gateway.session import SessionStore
 from gateway.config import GatewayConfig
 
 
-def test_recall_branch_a1_exact_id_match_round_trips_through_db(tmp_path, hermes_db_initialized):
+def test_recall_branch_a1_exact_id_match_round_trips_through_db(tmp_path, hermes_db_initialized_sync):
     """A user message persisted with ``message_id`` must round-trip through
     the DB so recall can find and redact it by exact id (branch A1)."""
     from hermes_state import SessionDB
@@ -51,7 +51,7 @@ def test_recall_branch_a1_exact_id_match_round_trips_through_db(tmp_path, hermes
     assert target["content"] == "sensitive content"
 
 
-def test_recall_branch_a2_content_match_when_no_platform_id(tmp_path, hermes_db_initialized):
+def test_recall_branch_a2_content_match_when_no_platform_id(tmp_path, hermes_db_initialized_sync):
     """Rows that lack a platform_message_id (e.g. agent-processed @bot
     messages) still match by content as a fallback."""
     from hermes_state import SessionDB

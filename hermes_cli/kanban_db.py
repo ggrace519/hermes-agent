@@ -1447,9 +1447,17 @@ def init_db(
 
     Idempotent (ON CONFLICT DO NOTHING). The ``db_path`` parameter is
     accepted for call-site compatibility but ignored in PG mode.
+
+    Ensures the asyncpg pool is initialised before touching the DB —
+    sync call sites (CLI subcommands, kanban_notifier, test fixtures)
+    rely on this implicit initialisation. Without it the first DB
+    operation raises ``RuntimeError: hermes_db.init() not called``.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     import hermes_db
+    # Lazy-bootstrap the pool on the persistent sync loop so subsequent
+    # run_sync calls bind correctly. No-op if pool is already inited.
+    hermes_db.ensure_pool_sync()
     async def _ensure():
         async with hermes_db.connection() as conn:
             await conn.execute(
