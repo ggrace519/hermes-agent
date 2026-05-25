@@ -30,6 +30,19 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ## Quick Install
 
+> **Substrate Edition fork (`ggrace519/hermes-agent`):** this fork ships an
+> additional PostgreSQL-backed cognitive substrate (Phases A–C) on top of
+> upstream Hermes, and replaces SQLite with PostgreSQL for all state. The
+> installer is tuned to coexist with an existing upstream install — defaults
+> are `HERMES_HOME=~/.hermes-substrate`, CLI shim `hermes-substrate`, and a
+> `docker compose` PostgreSQL service on port 5432 with database `hermes`.
+> Override `--cli-name hermes --hermes-home ~/.hermes` if you do **not** have
+> an upstream install. The substrate-edition installer one-liner is:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.sh | bash
+> ```
+
 ### Linux, macOS, WSL2, Termux
 
 ```bash
@@ -65,7 +78,12 @@ hermes              # start chatting!
 
 ## Database setup (Phase 0+)
 
-Hermes uses PostgreSQL 17 with the pgvector extension.
+This fork uses PostgreSQL 17 (with the `vector` and `pg_trgm` extensions)
+as the single source of truth for session transcripts, kanban state, and
+the substrate's perception slices. No SQLite anywhere — `state.db` and
+the kanban SQLite DB from upstream are gone. The substrate-edition
+installer brings up a `docker compose` PG service automatically; the
+section below covers the manual / production paths.
 
 **For local development:**
 
@@ -87,52 +105,82 @@ uv run hermes db migrate-from-sqlite --sqlite-path ~/.hermes/state.db
 
 ---
 
-## Cognitive substrate (Phase A)
+## Cognitive substrate (Phases A–C)
 
-> **Heads up:** Phase A adds an additional `substrate_*` set of tables to your
-> Hermes Postgres database, plus three background asyncio workers (Sentinel,
-> force-reject, partition-maintenance). Hermes continues to behave exactly as
-> before — substrate failures are non-fatal — but the schema migration is
-> permanent. Back up your DB before the first run if you care.
+> **Heads up:** the substrate adds a `substrate_*` set of tables to your
+> Hermes Postgres database, plus four background asyncio workers (Sentinel,
+> Curator, force-reject, partition-maintenance). Hermes continues to behave
+> exactly as before — substrate failures are non-fatal and the recall path
+> is env-gated off by default — but the schema migration is permanent. Back
+> up your DB before the first run if you care.
 
-The substrate is a write-only **L0 perception sink** that runs alongside Hermes:
-every user message, assistant response, tool call/result, sub-agent
-spawn/return, session-lifecycle event, and cron dispatch is emitted as a
-*slice* on a named *stream* (`hermes.world.user_message.cli`,
-`hermes.self_action.assistant_response`, etc.). Slices are stored in
-`substrate_slices` (RANGE-partitioned monthly on ingest time) and decided by a
-stub Sentinel (Phase A passes every slice; real defense lands in Phase B+).
+The substrate is a PostgreSQL-backed **L0 perception sink + recall source**
+that runs alongside Hermes. Every user message, assistant response, tool
+call/result, sub-agent spawn/return, session-lifecycle event, and cron
+dispatch is emitted as a *slice* on a named *stream*
+(`hermes.world.user_message.cli`, `hermes.self_action.assistant_response`,
+etc.). Slices are stored in `substrate_slices` (RANGE-partitioned monthly on
+ingest time) and decided by Sentinel.
 
-**What you get:**
+### Phase A — perception sink
 
-- New schema added via Alembic revision `20260523_0003_substrate_skeleton` —
+- New schema via Alembic revision `20260523_0003_substrate_skeleton` —
   three tables (`substrate_streams`, `substrate_slices`,
   `substrate_decay_profiles`), 15 auto-registered streams, monthly partition
   carving.
-- Background workers spawned on Hermes startup: Sentinel (200 ms tick),
-  force-reject (10 s tick, drops pending slices past their decay-profile TTL),
-  partition-maintenance (24 h tick, keeps a rolling window of 3 monthly
-  partitions ahead of `now()`).
-- A `hermes substrate inspect` CLI for poking at substrate state.
+- Background workers spawned on Hermes startup: Sentinel (200 ms tick,
+  pass-through stub in A; real defense Phase B+), force-reject (10 s tick,
+  drops pending slices past their decay-profile TTL), partition-maintenance
+  (24 h tick, keeps a rolling window of 3 monthly partitions ahead of
+  `now()`).
+- A `hermes-substrate substrate inspect` CLI for poking at substrate state.
 
-**Inspecting substrate state:**
+### Phase B — Curator
+
+- The Curator sub-agent runs a continuous decay + release loop. Slices fade
+  per their decay profile's half-life; below the profile's
+  `min_salience_to_retain` threshold they release per the tombstone policy
+  (`thin` / `full` / `none`). Each decision emits a self-state slice on
+  `substrate.self_state` so Phase E's Reflector can develop calibration.
+- New inspect subtree: `hermes-substrate substrate inspect curator [summary | histogram |
+  recent | pressure]`.
+
+### Phase C — recall API + pgvector embeddings
+
+- New tables: `substrate_recall_log` (append-only audit of every `recall()`
+  call) + the `embedding vector(1536)` column on `substrate_slices`.
+- The Curator backfills semantic embeddings asynchronously using
+  `text-embedding-3-small` (1536-d); recall against missing-embedding slices
+  falls back to keyword Jaccard.
+- A `SubstrateMemoryProvider` is registered into Hermes's `MemoryManager`.
+  Gated by `HERMES_SUBSTRATE_RECALL` (default `0`) — when enabled, the
+  per-turn `<memory-context>` block is composed from substrate slices using
+  a composite score (pgvector similarity + keyword Jaccard + salience +
+  recency, ranked under a 1500-token budget by default). The model also gets
+  a `substrate_recall_more` tool for explicit deeper-search asks.
+- New inspect subtree: `hermes-substrate substrate inspect recall [summary | recent |
+  sample --session-id <id> | config]`.
+
+### Inspecting substrate state
 
 ```bash
-hermes substrate inspect            # default summary (streams, slice counts, pending queue)
-hermes substrate inspect streams    # per-stream slice counts
-hermes substrate inspect slices --stream hermes.world.user_message.cli --limit 20
-hermes substrate inspect pending    # current pending-queue depth + oldest age
-hermes substrate inspect profiles   # the 4 seeded decay profiles
+hermes-substrate substrate inspect            # default summary (streams, slice counts, pending)
+hermes-substrate substrate inspect streams    # per-stream slice counts
+hermes-substrate substrate inspect slices --stream hermes.world.user_message.cli --limit 20
+hermes-substrate substrate inspect pending    # current pending-queue depth + oldest age
+hermes-substrate substrate inspect profiles   # the 4 seeded decay profiles
+hermes-substrate substrate inspect curator    # Curator decay/release activity
+hermes-substrate substrate inspect recall     # recall coverage + recent calls
 ```
 
 If your DB is on an older Alembic revision when Hermes starts, the substrate
 boot raises a `RuntimeError` with the upgrade command to run; set
 `HERMES_AUTO_MIGRATE=1` to upgrade automatically on first boot.
 
-**Out of scope for Phase A** (deferred to later phases): recall API, Curator
-decay loop, LLM-driven sub-agents (Parser, Reflector, …), L1+ layers,
-cross-stream alignment, blob storage, pgvector use. See
-[`PHASE_A_SPEC.md`](PHASE_A_SPEC.md) for the full delivery + non-goals list.
+Procedural operator docs ship as a bundled skill — load with `/substrate` or
+`hermes-substrate -s substrate`. Design rationale + future-phase specs live
+in the [llm-cognitive-thought](https://github.com/ggrace519/llm-cognitive-thought)
+spec repo.
 
 ---
 

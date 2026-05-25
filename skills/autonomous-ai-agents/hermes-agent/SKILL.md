@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [hermes, setup, configuration, multi-agent, spawning, cli, gateway, development]
     homepage: https://github.com/NousResearch/hermes-agent
-    related_skills: [claude-code, codex, opencode]
+    related_skills: [claude-code, codex, opencode, substrate]
 ---
 
 # Hermes Agent
@@ -337,11 +337,17 @@ The registry of record is `hermes_cli/commands.py` — every consumer
 ~/.hermes/.env              API keys and secrets
 $HERMES_HOME/skills/        Installed skills
 ~/.hermes/sessions/         Gateway routing index, request dumps, *.jsonl transcripts (and optional per-session JSON snapshots when sessions.write_json_snapshots: true)
-~/.hermes/state.db          Canonical session store (SQLite + FTS5)
 ~/.hermes/logs/             Gateway and error logs
 ~/.hermes/auth.json         OAuth tokens and credential pools
 ~/.hermes/hermes-agent/     Source code (if git-installed)
 ```
+
+**Substrate Edition (this fork) path differences:** the substrate fork installs
+side-by-side with upstream Hermes by default — `HERMES_HOME` is
+`~/.hermes-substrate/`, the CLI shim is `hermes-substrate`, and session +
+kanban + substrate state all live in **PostgreSQL** (DSN `HERMES_PG_DSN`,
+default `postgresql://hermes:hermes@localhost:5432/hermes`) rather than
+`state.db`. The `state.db` SQLite file no longer exists in this fork.
 
 Profiles use `~/.hermes/profiles/<name>/` with the same layout.
 
@@ -706,6 +712,60 @@ sessions still have zero `kanban_*` schema footprint unless configured.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
 
+### Cognitive Substrate (this fork only)
+
+**Substrate Edition (`ggrace519/hermes-agent`)** adds a PostgreSQL-backed
+perception/memory layer that runs alongside the conversation loop. The
+substrate is **additional** infrastructure — persistent memory, skills,
+session search, and Honcho all keep working exactly as upstream describes;
+the substrate sits underneath them as a unified perception sink + recall
+source. Upstream Hermes does not have this layer.
+
+What runs in the background:
+
+- **Sentinel** — polls the pending slice queue (200 ms tick), decides
+  pass/quarantine on every incoming slice. Phase A stub passes everything
+  through; real defense (prompt-injection, content poisoning) lands later.
+- **Curator** — continuous decay + release loop. Slices fade per their
+  decay profile's half-life, get released below threshold per the
+  profile's tombstone policy, and Curator backfills semantic embeddings
+  (`text-embedding-3-small`, 1536-d) for unembedded passed slices in
+  batches so recall has full vector coverage over time.
+- **Force-reject** — 10 s tick that drops pending slices past their
+  decay-profile TTL so the pending queue stays bounded even if Sentinel
+  falls behind.
+- **Partition-maintenance** — 24 h tick that keeps a rolling window of
+  3 monthly partitions ahead of `now()` on `substrate_slices`.
+
+Perception emission is wired into every user message, assistant response,
+tool call/result, sub-agent spawn/return, session-lifecycle event, and
+cron dispatch — each lands as a *slice* on a named *stream* (e.g.
+`hermes.world.user_message.cli`, `hermes.self_action.assistant_response`).
+Slice writes are non-fatal: substrate failures never break the foreground
+conversation.
+
+**Recall API + memory-context (Phase C, env-gated):** when
+`HERMES_SUBSTRATE_RECALL=1` is set, a `SubstrateMemoryProvider` is
+registered into Hermes's `MemoryManager` and the per-turn
+`<memory-context>` block is composed from substrate slices (composite
+score = pgvector similarity + keyword Jaccard + salience + recency,
+ranked under a token budget). Default is `0` — registration is exercised
+but `prefetch()` returns `""` and the upstream memory path stays
+authoritative. The model also gets a `substrate_recall_more` tool when
+the provider is active for explicit deeper-search asks.
+
+Introspect:
+
+```bash
+hermes-substrate substrate inspect            # streams + slice counts + pending queue
+hermes-substrate substrate inspect streams    # per-stream counts
+hermes-substrate substrate inspect curator    # decay/release activity
+hermes-substrate substrate inspect recall     # recall coverage + recent calls
+```
+
+Deeper operator workflow lives in the **substrate** bundled skill —
+load it with `/substrate` or `hermes -s substrate`.
+
 ---
 
 ## Windows-Specific Quirks
@@ -868,7 +928,7 @@ hermes config set auxiliary.vision.model <model_name>
 | Env variables | `hermes config env-path` or [Env vars reference](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) |
 | CLI commands | `hermes --help` or [CLI reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) |
 | Gateway logs | `~/.hermes/logs/gateway.log` |
-| Session files | `hermes sessions browse` (reads state.db) |
+| Session files | `hermes sessions browse` (reads PostgreSQL `sessions` table; upstream reads `state.db`) |
 | Source code | `~/.hermes/hermes-agent/` |
 
 ---
@@ -885,7 +945,7 @@ hermes-agent/
 ├── model_tools.py        # Tool discovery and dispatch
 ├── toolsets.py           # Toolset definitions
 ├── cli.py                # Interactive CLI (HermesCLI)
-├── hermes_state.py       # SQLite session store
+├── hermes_state.py       # Session store (PostgreSQL in this fork; SQLite upstream)
 ├── agent/                # Prompt builder, context compression, memory, model routing, credential pooling, skill dispatch
 ├── hermes_cli/           # CLI subcommands, config, setup, commands
 │   ├── commands.py       # Slash command registry (CommandDef)
