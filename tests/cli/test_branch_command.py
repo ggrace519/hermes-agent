@@ -19,12 +19,27 @@ import pytest
 
 
 @pytest.fixture
-def session_db(tmp_path):
-    """Create a real SessionDB for testing."""
+def session_db(tmp_path, hermes_db_initialized_sync):
+    """Sync-wrapped PG SessionDB for /branch test assertions.
+
+    Test BODIES call ``session_db.get_session(...)``, ``get_session_title``,
+    etc. as if they were sync — so this fixture returns a ``SyncSessionDB``
+    that auto-runs coroutines via ``hermes_db.run_sync``.
+
+    Notice that ``cli_instance`` below assigns a DIFFERENT object to
+    ``cli._session_db`` — that one is the raw ``_AsyncSessionDB`` so the
+    production ``_handle_branch_command`` under test (which does its own
+    ``run_sync(db.x(...))``) gets actual coroutines back from ``db.x(...)``.
+
+    Same underlying PG database; two different facades for the two
+    different call-site shapes.
+    """
     os.environ["HERMES_HOME"] = str(tmp_path / ".hermes")
     os.makedirs(tmp_path / ".hermes", exist_ok=True)
-    from hermes_state import SessionDB
-    db = SessionDB(db_path=tmp_path / ".hermes" / "test_sessions.db")
+    from hermes_state import _AsyncSessionDB
+
+    from tests._helpers.sync_session_db import SyncSessionDB
+    db = SyncSessionDB(_AsyncSessionDB())
     yield db
     db.close()
 
@@ -36,7 +51,13 @@ def cli_instance(tmp_path, session_db):
     from unittest.mock import MagicMock
 
     cli = MagicMock()
-    cli._session_db = session_db
+    # The production _handle_branch_command does its own
+    # ``hermes_db.run_sync(db.x(...))`` so it expects ``cli._session_db``
+    # to be the raw async _AsyncSessionDB. Use the SyncSessionDB's
+    # ``.async_db`` escape hatch to hand the production code the right
+    # shape while keeping the test BODIES' sync assertions working
+    # against the same underlying PG.
+    cli._session_db = session_db.async_db
     cli.session_id = "20260403_120000_abc123"
     cli.model = "anthropic/claude-sonnet-4.6"
     cli.max_turns = 90
@@ -52,7 +73,7 @@ def cli_instance(tmp_path, session_db):
         {"role": "assistant", "content": "def sort_list(lst): return sorted(lst)"},
     ]
 
-    # Create the original session in the DB
+    # Create the original session in the DB via the sync facade.
     session_db.create_session(
         session_id=cli.session_id,
         source="cli",
