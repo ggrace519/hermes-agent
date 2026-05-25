@@ -120,6 +120,39 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Per-stream salience pressure (Conductor opportunity-forecast inputs)",
     ).set_defaults(func=_cmd_inspect_curator_pressure)
 
+    # ── Phase C: recall subtree ───────────────────────────────────────
+    inspect_recall = inspect_sub.add_parser(
+        "recall",
+        help="Inspect recall pipeline state (Phase C)",
+        description="Show recent recall calls + embedding coverage + config.",
+    )
+    inspect_recall_sub = inspect_recall.add_subparsers(dest="recall_subcommand")
+    inspect_recall.set_defaults(func=_cmd_inspect_recall_summary)
+
+    inspect_recall_sub.add_parser(
+        "summary", help="Recall summary (default) — last 1h call stats + coverage"
+    ).set_defaults(func=_cmd_inspect_recall_summary)
+
+    recall_recent = inspect_recall_sub.add_parser(
+        "recent", help="Recent recall calls (substrate_recall_log)"
+    )
+    recall_recent.add_argument(
+        "--limit", type=int, default=20, help="Max log rows to show (default 20)"
+    )
+    recall_recent.set_defaults(func=_cmd_inspect_recall_recent)
+
+    recall_sample = inspect_recall_sub.add_parser(
+        "sample", help="Last recall log row for a given session"
+    )
+    recall_sample.add_argument(
+        "--session-id", required=True, help="Hermes session id"
+    )
+    recall_sample.set_defaults(func=_cmd_inspect_recall_sample)
+
+    inspect_recall_sub.add_parser(
+        "config", help="Dump RECALL_* config knobs"
+    ).set_defaults(func=_cmd_inspect_recall_config)
+
     substrate_parser.set_defaults(func=_cmd_substrate_help)
 
 
@@ -177,6 +210,35 @@ def _cmd_inspect_curator_recent(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_curator_pressure(args: argparse.Namespace) -> int:
     return _run_inspect(_print_curator_pressure)
+
+
+# ── Phase C: recall command dispatchers ──────────────────────────────
+
+
+def _cmd_inspect_recall_summary(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import print_summary
+
+    return _run_inspect(print_summary)
+
+
+def _cmd_inspect_recall_recent(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import print_recent
+
+    return _run_inspect(lambda conn: print_recent(conn, limit=args.limit))
+
+
+def _cmd_inspect_recall_sample(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import print_sample
+
+    return _run_inspect(
+        lambda conn: print_sample(conn, session_id=args.session_id)
+    )
+
+
+def _cmd_inspect_recall_config(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import print_config
+
+    return _run_inspect(print_config)
 
 
 def _run_inspect(action) -> int:
