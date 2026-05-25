@@ -14,8 +14,16 @@ import pytest
 
 
 @pytest.fixture
-def hermes_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME so SessionDB.state_meta writes don't clobber the real one."""
+def hermes_home(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """Isolated HERMES_HOME so SessionDB.state_meta writes don't clobber the real one.
+
+    Phase 0: depends on ``hermes_db_initialized_sync`` so the per-test
+    PG database is migrated and the asyncpg pool is bound to the
+    persistent sync loop before any GoalManager method (which routes
+    through SessionDB.state_meta in PG) is called. Without this the
+    ``state_meta`` table is in a different DB and persistence reads
+    return None.
+    """
     from pathlib import Path
 
     home = tmp_path / ".hermes"
