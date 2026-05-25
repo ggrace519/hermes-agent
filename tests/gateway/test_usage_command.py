@@ -213,10 +213,17 @@ class TestUsageAccountSection:
     async def test_usage_command_uses_persisted_provider_when_agent_not_running(self, monkeypatch):
         runner = _make_runner(SK)
         runner._session_db = MagicMock()
-        runner._session_db.get_session.return_value = {
+        # Phase 0: SessionDB.get_session is async. The production
+        # ``_handle_usage_command`` wraps it in ``hermes_db.run_sync`` —
+        # a plain MagicMock returns a MagicMock (not a coroutine) and
+        # run_sync raises TypeError, which the handler then catches and
+        # falls through to the no-billing-info branch, leaving ``calls``
+        # empty (hence the KeyError: 'args').
+        from unittest.mock import AsyncMock
+        runner._session_db.get_session = AsyncMock(return_value={
             "billing_provider": "openai-codex",
             "billing_base_url": "https://chatgpt.com/backend-api/codex",
-        }
+        })
         session_entry = MagicMock()
         session_entry.session_id = "sess-1"
         runner.session_store.get_or_create_session.return_value = session_entry

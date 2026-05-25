@@ -2,7 +2,7 @@
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from cli import HermesCLI
 from hermes_cli.commands import resolve_command
@@ -21,8 +21,12 @@ def _make_cli():
     cli_obj.provider = "openai"
     cli_obj.session_start = datetime(2026, 4, 9, 19, 24)
     cli_obj._agent_running = False
+    # Phase 0: SessionDB.get_session is an async coroutine. Production
+    # code wraps it in hermes_db.run_sync; a plain MagicMock returns a
+    # MagicMock (not a coroutine) and run_sync raises TypeError. AsyncMock
+    # produces an awaitable that run_sync can resolve.
     cli_obj._session_db = MagicMock()
-    cli_obj._session_db.get_session.return_value = None
+    cli_obj._session_db.get_session = AsyncMock(return_value=None)
     return cli_obj
 
 
@@ -65,10 +69,10 @@ def test_show_session_status_prints_gateway_style_summary():
         session_total_tokens=321,
         session_api_calls=4,
     )
-    cli_obj._session_db.get_session.return_value = {
+    cli_obj._session_db.get_session = AsyncMock(return_value={
         "title": "My titled session",
         "started_at": 1775791440,
-    }
+    })
 
     with patch("cli.display_hermes_home", return_value="~/.hermes"):
         cli_obj._show_session_status()
