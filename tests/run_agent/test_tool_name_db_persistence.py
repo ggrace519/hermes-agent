@@ -3,7 +3,7 @@
 make_tool_result_message() sets tool_name on every tool-result dict at construction
 time. This test verifies that the value survives the flush path into the session DB.
 """
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from run_agent import AIAgent
 from agent.tool_dispatch_helpers import make_tool_result_message
@@ -27,8 +27,18 @@ def _make_agent(session_db):
 
 def test_tool_name_persisted_to_session_db():
     """tool_name set by make_tool_result_message must be passed through to
-    append_message so the column is populated on first flush to the session DB."""
+    append_message so the column is populated on first flush to the session DB.
+
+    Phase 0: ``_AsyncSessionDB.append_message`` / ``create_session`` are
+    coroutines and ``run_agent`` wraps each call with ``hermes_db.run_sync``.
+    Use ``AsyncMock`` for those methods so the wrapper sees an awaitable
+    instead of a plain ``MagicMock`` (which crashes
+    ``loop.run_until_complete`` with "An asyncio.Future, a coroutine or
+    an awaitable is required"). ``call_args_list`` works identically.
+    """
     session_db = MagicMock()
+    session_db.create_session = AsyncMock(return_value="sid")
+    session_db.append_message = AsyncMock()
     agent = _make_agent(session_db)
 
     messages = [
