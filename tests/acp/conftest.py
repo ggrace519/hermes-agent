@@ -51,6 +51,42 @@ def _truncate_session_tables() -> None:
         pass
 
 
+def _reset_substrate_state() -> None:
+    """Tear down any module-level substrate state from a prior test.
+
+    Some acp tests (``test_entry``) invoke ``entry.main([])`` which calls
+    ``bootstrap_substrate_sync``. That sets ``hermes_bootstrap._substrate_booted
+    = True`` and binds ``substrate.events.hermes_hooks._substrate`` to the
+    booted instance.
+
+    After the per-test fixture closes the asyncpg pool, those module-level
+    references are stale — the substrate instance holds a dead pool ref and
+    the bound hooks dispatch into ``streams.get_by_name(...)`` which races
+    on a closed connection. The downstream symptom in the next test:
+    ``SessionDB.create_session`` opens a transaction, fires the
+    ``on_session_start_async`` hook, the hook raises (caught by the outer
+    try/except), but the transaction COMMITS the INSERT to a database the
+    next test isn't querying — so ``get_session`` returns None.
+
+    Resetting the bootstrap flags + unbinding hooks makes every acp test
+    start with a clean slate. The actual ``Substrate.boot()`` runs again
+    on demand in tests that need it; the cost is one extra
+    ``ensure_partitions`` + ``_autoregister_streams`` round-trip per test
+    that actually boots the substrate, which is negligible.
+    """
+    try:
+        import hermes_bootstrap
+        hermes_bootstrap._substrate_booted = False
+        hermes_bootstrap._substrate_handle = None
+    except Exception:
+        pass
+    try:
+        from substrate.events import hermes_hooks
+        hermes_hooks._unbind()
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _isolate_acp_session_db(hermes_db_initialized_sync):
     """Per-test cleanup: wipe sessions/messages before and after each test.
@@ -64,7 +100,14 @@ def _isolate_acp_session_db(hermes_db_initialized_sync):
     ``_pool is not None`` and skip re-init — so the test ends up querying
     a different database from the one Alembic just migrated, and
     everything 500s with ``relation "sessions" does not exist``.
+
+    Also resets substrate-module-level state in setup AND teardown so a
+    prior test that booted the substrate (notably ``test_entry``) can't
+    leak a stale ``hermes_bootstrap._substrate_handle`` or a bound
+    ``substrate.events.hermes_hooks._substrate`` into the next test.
     """
+    _reset_substrate_state()
     _truncate_session_tables()
     yield
+    _reset_substrate_state()
     _truncate_session_tables()
