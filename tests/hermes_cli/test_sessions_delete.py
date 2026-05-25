@@ -8,11 +8,13 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
     captured = {}
 
     class FakeDB:
-        def resolve_session_id(self, session_id):
+        # Phase 0: production wraps these in ``hermes_db.run_sync(...)`` so the
+        # test double must expose them as coroutines.
+        async def resolve_session_id(self, session_id):
             captured["resolved_from"] = session_id
             return "20260315_092437_c9a6ff"
 
-        def delete_session(self, session_id, **kwargs):
+        async def delete_session(self, session_id, **kwargs):
             captured["deleted"] = session_id
             return True
 
@@ -42,10 +44,10 @@ def test_sessions_delete_reports_not_found_when_prefix_is_unknown(monkeypatch, c
     import hermes_state
 
     class FakeDB:
-        def resolve_session_id(self, session_id):
+        async def resolve_session_id(self, session_id):
             return None
 
-        def delete_session(self, session_id, **kwargs):
+        async def delete_session(self, session_id, **kwargs):
             raise AssertionError("delete_session should not be called when resolution fails")
 
         def close(self):
@@ -70,10 +72,10 @@ def test_sessions_delete_handles_eoferror_on_confirm(monkeypatch, capsys):
     import hermes_state
 
     class FakeDB:
-        def resolve_session_id(self, session_id):
+        async def resolve_session_id(self, session_id):
             return "20260315_092437_c9a6ff"
 
-        def delete_session(self, session_id, **kwargs):
+        async def delete_session(self, session_id, **kwargs):
             raise AssertionError("delete_session should not be called when cancelled")
 
         def close(self):
@@ -98,7 +100,7 @@ def test_sessions_prune_handles_eoferror_on_confirm(monkeypatch, capsys):
     import hermes_state
 
     class FakeDB:
-        def prune_sessions(self, **kwargs):
+        async def prune_sessions(self, **kwargs):
             raise AssertionError("prune_sessions should not be called when cancelled")
 
         def close(self):
