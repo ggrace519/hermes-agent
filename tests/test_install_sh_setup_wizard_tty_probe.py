@@ -8,9 +8,12 @@ few lines later, aborting the entire image build. The fix replaces every
 existence-based check that guards a subsequent ``< /dev/tty`` redirect with
 an open-based probe so the skip kicks in correctly.
 
-This module covers all three affected functions: ``run_setup_wizard()``
-(the reproducer in #16746), ``install_system_packages()`` (the apt sudo
-prompt fallback), and ``maybe_start_gateway()`` (the gateway-install gate).
+In the substrate-edition rewrite the gateway install moved out of
+``install.sh`` (now driven by ``hermes setup``) and ``install_system_packages``
+no longer reads ``/dev/tty`` directly — it delegates to ``prompt_yes_no``,
+which gates on readability before redirecting. So the only function that
+still both opens ``/dev/tty`` itself *and* needs the gate is
+``run_setup_wizard()``.
 """
 
 from __future__ import annotations
@@ -23,9 +26,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
-# Every function in scripts/install.sh that previously gated on a bare
-# ``[ -e /dev/tty ]`` check before redirecting stdin from ``/dev/tty``.
-GATED_FUNCTIONS = ("run_setup_wizard", "install_system_packages", "maybe_start_gateway")
+# Functions in scripts/install.sh that read ``/dev/tty`` directly and so must
+# gate on an open-based probe (not a bare ``-e`` existence test). In the
+# upstream tree this list also covered ``install_system_packages`` and
+# ``maybe_start_gateway``; both were refactored out of the direct-read path
+# in the substrate-edition rewrite (see module docstring).
+GATED_FUNCTIONS = ("run_setup_wizard",)
 
 
 def _extract_function_body(name: str) -> str:
