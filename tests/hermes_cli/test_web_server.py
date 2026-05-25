@@ -2273,14 +2273,22 @@ class TestPtyWebSocket:
             # server adds us to ``_event_channels`` in a follow-up await,
             # so a publish immediately after connect can race ahead of the
             # subscriber registration and the message is dropped.
-            deadline = time.monotonic() + 5.0
+            #
+            # The deadline used to be 5s; cold-start CI runs sometimes
+            # missed it (the test would then proceed and hit the global
+            # 30s pytest-timeout because the publish would land before the
+            # subscriber registered and the dropped message would leave
+            # ``sub.receive_text()`` blocked forever). 15s is the cheap
+            # upper bound — the loop exits as soon as the channel appears,
+            # so the median path is still ~10ms.
+            deadline = time.monotonic() + 15.0
             while time.monotonic() < deadline:
                 if ws_mod._event_channels.get("broadcast-test"):
                     break
                 time.sleep(0.01)
             else:
                 raise AssertionError(
-                    "subscriber did not register on channel within 5s"
+                    "subscriber did not register on channel within 15s"
                 )
 
             with self.client.websocket_connect(pub_path) as pub:
