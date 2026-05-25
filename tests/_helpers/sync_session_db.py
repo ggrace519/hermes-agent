@@ -85,36 +85,37 @@ def set_session_meta_sync(
     session_id: str,
     *,
     started_at: Optional[datetime] = None,
+    ended_at: Optional[datetime] = None,
     title: Optional[str] = None,
 ) -> None:
-    """Pre-Phase-0 test convenience for backdating + retitling a
-    session. Replaces ``db._conn.execute("UPDATE sessions SET …")``.
+    """Pre-Phase-0 test convenience for backdating, ending, or retitling
+    a session. Replaces ``db._conn.execute("UPDATE sessions SET …")``.
 
-    Both kwargs are optional; only the columns you pass get touched.
-    Pass tz-aware ``datetime`` for ``started_at`` (PG ``TIMESTAMPTZ``)
-    — pre-Phase-0 tests passed epoch ints; the per-call conversion
-    is ``datetime.fromtimestamp(epoch, timezone.utc)``.
+    All kwargs are optional; only the columns you pass get touched.
+    Pass tz-aware ``datetime`` for ``started_at`` / ``ended_at`` (PG
+    ``TIMESTAMPTZ``) — pre-Phase-0 tests passed epoch ints; the
+    per-call conversion is ``datetime.fromtimestamp(epoch, timezone.utc)``.
     """
-    if started_at is None and title is None:
+    updates: list[tuple[str, object]] = []
+    if started_at is not None:
+        updates.append(("started_at", started_at))
+    if ended_at is not None:
+        updates.append(("ended_at", ended_at))
+    if title is not None:
+        updates.append(("title", title))
+    if not updates:
         return
+
+    set_sql = ", ".join(f"{col} = ${i + 1}" for i, (col, _) in enumerate(updates))
+    where_pos = len(updates) + 1
 
     async def _do():
         async with hermes_db.connection() as conn:
-            if started_at is not None and title is not None:
-                await conn.execute(
-                    "UPDATE sessions SET started_at = $1, title = $2 WHERE id = $3",
-                    started_at, title, session_id,
-                )
-            elif started_at is not None:
-                await conn.execute(
-                    "UPDATE sessions SET started_at = $1 WHERE id = $2",
-                    started_at, session_id,
-                )
-            else:
-                await conn.execute(
-                    "UPDATE sessions SET title = $1 WHERE id = $2",
-                    title, session_id,
-                )
+            await conn.execute(
+                f"UPDATE sessions SET {set_sql} WHERE id = ${where_pos}",
+                *(val for _, val in updates),
+                session_id,
+            )
 
     hermes_db.run_sync(_do())
 
