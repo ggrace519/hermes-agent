@@ -1,6 +1,6 @@
 """PostgreSQL port of kanban_db tests (Phase 0 Task 20).
 
-Tests use `hermes_db_initialized` from tests/conftest.py which:
+Tests use `hermes_db_initialized_sync` from tests/conftest.py which:
   - Creates a fresh per-test PG database via pytest-postgresql
   - Runs Alembic upgrade head (including the kanban schema migration)
   - Initialises the hermes_db pool
@@ -24,9 +24,9 @@ import pytest_asyncio
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _set_pg_dsn(hermes_db_initialized, monkeypatch):
+def _set_pg_dsn(hermes_db_initialized_sync, monkeypatch):
     """Make kanban_db use PG for the duration of each test."""
-    monkeypatch.setenv("HERMES_PG_DSN", hermes_db_initialized)
+    monkeypatch.setenv("HERMES_PG_DSN", hermes_db_initialized_sync)
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ def named_board(kb):
 # Board management
 # ---------------------------------------------------------------------------
 
-def test_init_db_creates_default_board(kb, hermes_db_initialized):
+def test_init_db_creates_default_board(kb, hermes_db_initialized_sync):
     """init_db in PG mode inserts the board slug into kanban_boards."""
     import hermes_db
     kb.init_db(board="default")
@@ -286,7 +286,7 @@ def test_add_comment_and_list_comments(kb, default_board):
 # Cascade delete when board deleted
 # ---------------------------------------------------------------------------
 
-def test_cascade_delete_on_board_deletion(kb, hermes_db_initialized):
+def test_cascade_delete_on_board_deletion(kb, hermes_db_initialized_sync):
     """Deleting a board cascades to kanban_tasks, task_events, etc."""
     import hermes_db
 
