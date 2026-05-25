@@ -1142,11 +1142,11 @@ install_node_deps() {
             case "$DISTRO" in
                 ubuntu|debian|raspbian|pop|linuxmint|elementary|zorin|kali|parrot)
                     if [ "$(id -u)" -eq 0 ] || (command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null); then
-                        run_browser_install_with_timeout 600 npx playwright install --with-deps chromium 2>/dev/null \
+                        run_browser_install_with_timeout 600 npx playwright install --with-deps chromium \
                             || log_warn "Playwright install failed — browser tools will not work"
                     else
                         log_warn "No sudo — installing Chromium only (admin must run later: sudo npx playwright install-deps chromium)"
-                        run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null \
+                        run_browser_install_with_timeout 600 npx playwright install chromium \
                             || log_warn "Playwright install failed"
                     fi
                     ;;
@@ -1155,16 +1155,16 @@ install_node_deps() {
                         local sudo_pfx=""; [ "$(id -u)" -ne 0 ] && sudo_pfx="sudo "
                         ${sudo_pfx}pacman -S --noconfirm --needed nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib >/dev/null 2>&1 || true
                     fi
-                    run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null \
+                    run_browser_install_with_timeout 600 npx playwright install chromium \
                         || log_warn "Playwright install failed"
                     ;;
                 fedora|rhel|centos|rocky|alma)
                     log_warn "RPM distro: install system deps manually if missing:"
                     log_info "  sudo dnf install nss atk at-spi2-core cups-libs libdrm libxkbcommon mesa-libgbm pango cairo alsa-lib"
-                    run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || true
+                    run_browser_install_with_timeout 600 npx playwright install chromium || true
                     ;;
                 *)
-                    run_browser_install_with_timeout 600 npx playwright install chromium 2>/dev/null || true
+                    run_browser_install_with_timeout 600 npx playwright install chromium || true
                     ;;
             esac
         fi
