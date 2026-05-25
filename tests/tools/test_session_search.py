@@ -9,10 +9,12 @@ All run zero LLM calls.
 """
 import json
 import time
+from datetime import datetime, timezone
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import _AsyncSessionDB
+from tests._helpers.sync_session_db import SyncSessionDB, set_session_meta_sync
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
@@ -22,17 +24,34 @@ from tools.session_search_tool import (
 
 
 @pytest.fixture
-def db(tmp_path):
-    return SessionDB(tmp_path / "state.db")
+def db(hermes_db_initialized_sync):
+    """Sync-wrapped PG-backed SessionDB.
+
+    Phase 0 moved SessionDB from SQLite to async PG. This fixture
+    keeps the pre-Phase-0 test bodies intact by wrapping
+    ``_AsyncSessionDB`` with a sync shim — every ``db.<method>(...)``
+    call dispatches through ``hermes_db.run_sync``. The
+    ``hermes_db_initialized_sync`` fixture (from tests/conftest.py)
+    binds the pool to the persistent sync loop and runs Alembic head.
+    """
+    return SyncSessionDB(_AsyncSessionDB())
 
 
 def _seed_modpack_sessions(db):
-    """Create three sessions about a modpack so FTS5 has hits to dedupe."""
-    now = int(time.time())
+    """Create three sessions about a modpack so trigram search has
+    hits to dedupe.
+
+    ``started_at`` is a TIMESTAMPTZ in PG (was INTEGER epoch in SQLite);
+    we backdate with ``datetime.now(UTC) - timedelta(seconds=N)``.
+    """
+    now = datetime.now(timezone.utc)
     # Older session — modpack origin
     db.create_session("s_oldest", source="cli")
-    db._conn.execute("UPDATE sessions SET started_at = ?, title = ? WHERE id = ?",
-                     (now - 30000, "Building the Modpack", "s_oldest"))
+    set_session_meta_sync(
+        "s_oldest",
+        started_at=datetime.fromtimestamp(now.timestamp() - 30000, timezone.utc),
+        title="Building the Modpack",
+    )
     db.append_message("s_oldest", role="user", content="Let's build a Minecraft modpack")
     db.append_message("s_oldest", role="assistant", content="Great. Let me scaffold the modpack repo.")
     db.append_message("s_oldest", role="user", content="Use NeoForge 1.21.1")
@@ -41,8 +60,11 @@ def _seed_modpack_sessions(db):
 
     # Middle session — modpack quest coverage
     db.create_session("s_middle", source="cli")
-    db._conn.execute("UPDATE sessions SET started_at = ?, title = ? WHERE id = ?",
-                     (now - 15000, "Modpack Quest Coverage", "s_middle"))
+    set_session_meta_sync(
+        "s_middle",
+        started_at=datetime.fromtimestamp(now.timestamp() - 15000, timezone.utc),
+        title="Modpack Quest Coverage",
+    )
     db.append_message("s_middle", role="user", content="Deep-dive every modpack reference quest guide")
     db.append_message("s_middle", role="assistant", content="Surveying ATM10 questbook for modpack inspiration.")
     db.append_message("s_middle", role="user", content="Update the modpack version too")
@@ -50,12 +72,15 @@ def _seed_modpack_sessions(db):
 
     # Newest session — modpack mob spawn fix
     db.create_session("s_newest", source="cli")
-    db._conn.execute("UPDATE sessions SET started_at = ?, title = ? WHERE id = ?",
-                     (now - 1000, "Modpack Mob Spawn Fix", "s_newest"))
+    set_session_meta_sync(
+        "s_newest",
+        started_at=datetime.fromtimestamp(now.timestamp() - 1000, timezone.utc),
+        title="Modpack Mob Spawn Fix",
+    )
     db.append_message("s_newest", role="user", content="Fix the modpack mob spawning")
     db.append_message("s_newest", role="assistant", content="Investigating elite mob gating in the modpack KubeJS.")
     db.append_message("s_newest", role="assistant", content="Shipped commit b850442. Modpack alternator nerfed too.")
-    db._conn.commit()
+    # No explicit commit needed — each run_sync(...) call commits its own txn.
 
 
 # =========================================================================
