@@ -1069,7 +1069,6 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
-    print(f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
@@ -1090,9 +1089,12 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
         print(f"kanban boards rm: {exc}", file=sys.stderr)
         return 1
     if res["action"] == "archived":
-        print(f"Board {res['slug']!r} archived → {res['new_path']}")
-        print("Recover by moving the directory back to "
-              "<root>/kanban/boards/<slug>/.")
+        print(f"Board {res['slug']!r} archived.")
+        print(
+            "Recover by running "
+            f"`hermes kanban boards unarchive {res['slug']}` "
+            "(sets archived_at = NULL)."
+        )
     else:
         print(f"Board {res['slug']!r} deleted.")
     return 0
