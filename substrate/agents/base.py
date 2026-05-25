@@ -130,10 +130,25 @@ class SubAgent(ABC):
         Exceptions in ``tick()`` are logged and the loop continues —
         Phase A sub-agents must never crash the substrate process.
         Phase B+ may introduce circuit-breaker behavior; not yet.
+
+        Sleeps via ``wait_for(self._stopped.wait(), timeout=...)`` so
+        ``stop()`` wakes the loop immediately instead of waiting out
+        the full tick interval. With a plain ``asyncio.sleep(interval)``
+        the partition-maintenance agent (24h cadence) and force-reject
+        (3–10s) would always exceed the 2-second shutdown grace and
+        log spurious ``subagent.stop.timeout`` warnings on clean exit.
         """
         self._log.debug(
             "subagent.run.start name=%s level=%s", self.name, self._level.value
         )
+
+        async def _wait(seconds: float) -> None:
+            """Sleep for *seconds*, but return early if ``stop()`` is called."""
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=seconds)
+            except asyncio.TimeoutError:
+                pass  # normal: the interval elapsed without a stop request
+
         try:
             while not self._stopped.is_set():
                 # Call ``self._interval_for(...)`` so subclasses can
@@ -142,7 +157,7 @@ class SubAgent(ABC):
                 # The base implementation looks up _INTERVAL_BY_LEVEL.
                 interval = self._interval_for(self._level)
                 if interval is None:  # OFF
-                    await asyncio.sleep(_OFF_POLL_INTERVAL)
+                    await _wait(_OFF_POLL_INTERVAL)
                     continue
                 try:
                     await self.tick()
@@ -150,7 +165,7 @@ class SubAgent(ABC):
                     # Log with exc_info so the traceback lands in the
                     # substrate's log; never re-raise to the loop.
                     self._log.exception("subagent.tick.error name=%s", self.name)
-                await asyncio.sleep(interval)
+                await _wait(interval)
         finally:
             self._log.debug("subagent.run.stop name=%s", self.name)
 

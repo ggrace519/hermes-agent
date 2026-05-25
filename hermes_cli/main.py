@@ -12446,13 +12446,17 @@ Examples:
     # =========================================================================
     curator_parser = subparsers.add_parser(
         "curator",
-        help="Background skill maintenance (curator) — status, run, pause, pin",
+        help="Skill-curator (background skill maintenance) — status, run, pause, pin",
         description=(
-            "The curator is an auxiliary-model background task that "
+            "The (skill) curator is an auxiliary-model background task that "
             "periodically reviews agent-created skills, prunes stale ones, "
             "consolidates overlaps, and archives obsolete skills. "
             "Bundled and hub-installed skills are never touched. "
-            "Archives are recoverable; auto-deletion never happens."
+            "Archives are recoverable; auto-deletion never happens. "
+            "\n\nNot to be confused with the substrate Curator sub-agent "
+            "(memory/perception slices) introduced by Phase B — that one "
+            "runs inside the substrate and has no separate CLI surface; "
+            "inspect it with `hermes substrate inspect`."
         ),
     )
     try:
