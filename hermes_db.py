@@ -13,6 +13,7 @@ Close at shutdown (`close()`). Pool size is tunable via env vars:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import threading
@@ -34,6 +35,27 @@ _pool_lock = threading.Lock()
 # Mirrors the pattern in ``model_tools._get_tool_loop``.
 _sync_loop: Optional[asyncio.AbstractEventLoop] = None
 _sync_loop_lock = threading.Lock()
+
+# Background single-thread executor used by ``run_sync`` when a different
+# asyncio event loop is already running in the caller's thread (typical
+# in pytest-asyncio tests that exercise sync wrappers around async DB
+# calls). Python forbids ``loop.run_until_complete`` while ANY loop is
+# running in the current thread, so we offload the call to this worker
+# thread where no loop is running. The thread is created lazily on first
+# need; ``max_workers=1`` keeps run_sync calls serialised on _sync_loop
+# (which is the only loop we ever run inside the worker).
+_sync_offload_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_sync_offload_lock = threading.Lock()
+
+
+def _get_sync_offload_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _sync_offload_executor
+    with _sync_offload_lock:
+        if _sync_offload_executor is None:
+            _sync_offload_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="hermes-db-sync"
+            )
+        return _sync_offload_executor
 
 
 def _get_sync_loop() -> asyncio.AbstractEventLoop:
@@ -126,31 +148,58 @@ async def transaction() -> AsyncIterator[asyncpg.Connection]:
 def run_sync(coro: Awaitable[T]) -> T:
     """Bridge a sync caller to an async DB call.
 
-    Mirrors the proven pattern in `model_tools._run_async`. Must NOT be called
-    from inside a running event loop — that indicates the caller is async and
-    should `await` directly.
-
-    Uses a persistent module-level event loop (``_get_sync_loop``) so the
+    Mirrors the proven pattern in `model_tools._run_async`. Uses a
+    persistent module-level event loop (``_get_sync_loop``) so the
     asyncpg pool stays bound to a live loop across calls. Per-call
-    ``asyncio.new_event_loop()`` would orphan the pool against a closed loop
-    after the first call and surface as ``RuntimeError: Event loop is closed``
-    on the next acquire.
+    ``asyncio.new_event_loop()`` would orphan the pool against a closed
+    loop after the first call and surface as ``RuntimeError: Event loop
+    is closed`` on the next acquire.
 
-    NOTE: this function does NOT lazy-bootstrap the pool — auto-init lives in
-    ``pool()`` for sync code paths that touch the DB outside an event loop,
-    and ``ensure_pool_sync()`` for code that knows it's about to acquire
-    connections from inside ``run_sync``. The reason is that ``run_sync`` may
-    legitimately be passed coroutines that never touch the pool (tests of
-    other primitives, smoke checks) and we don't want every call to attempt
-    a PG connect.
+    Three calling contexts:
+
+    1. **Pure sync caller** (CLI subcommand, gateway-runner sync entry,
+       smoke test): no asyncio loop is running in the current thread.
+       We drive ``_sync_loop.run_until_complete(coro)`` directly.
+    2. **Inside _sync_loop itself** (re-entrant call): ``_sync_loop`` is
+       already running. This is a true bug — the caller should ``await``
+       the coroutine — so we raise.
+    3. **Inside a *different* loop** (pytest-asyncio test body that calls
+       sync ``kb.*`` helpers, ACP server scheduled callbacks): another
+       loop is running in this thread but not ``_sync_loop``. Python's
+       asyncio still forbids running a second loop in the same thread,
+       so we offload the ``run_until_complete`` call to a dedicated
+       background thread where no loop is running. The pool stays on
+       ``_sync_loop`` (asyncpg cares about loop, not thread) so this is
+       safe.
+
+    NOTE: this function does NOT lazy-bootstrap the pool — auto-init
+    lives in ``pool()`` for sync code paths that touch the DB outside
+    an event loop, and ``ensure_pool_sync()`` for code that knows it's
+    about to acquire connections from inside ``run_sync``.
     """
     loop = _get_sync_loop()
     if loop.is_running():
+        # Case 2: re-entrant into our own sync loop.
         raise RuntimeError(
-            "hermes_db.run_sync called from inside running event loop; "
+            "hermes_db.run_sync called from inside its own sync loop; "
             "refactor caller to `await` the coroutine directly."
         )
-    return loop.run_until_complete(coro)
+
+    try:
+        current = asyncio.get_running_loop()
+    except RuntimeError:
+        current = None
+
+    if current is None:
+        # Case 1: pure sync context, run on this thread.
+        return loop.run_until_complete(coro)
+
+    # Case 3: a different loop is running in this thread (pytest-asyncio,
+    # ACP server callback, etc.). Offload to a worker thread so Python's
+    # one-loop-per-thread check doesn't reject us.
+    executor = _get_sync_offload_executor()
+    future = executor.submit(loop.run_until_complete, coro)
+    return future.result()
 
 
 def ensure_pool_sync() -> bool:
