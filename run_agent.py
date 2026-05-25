@@ -4257,6 +4257,20 @@ def main(
     print("\n👋 Agent execution completed!")
 
 
-if __name__ == "__main__":
+def _cli_main():
+    """Console-script entry point — dispatches argv through ``fire`` so that
+    ``hermes-agent --help`` / ``hermes-agent --query 'foo'`` work.
+
+    Setuptools' generated stub calls the console_scripts function with no
+    arguments; without this wrapper, ``hermes-agent --help`` would run
+    ``main()`` with kwargs at defaults, then crash on the first thing that
+    expects a configured LLM provider (instead of just printing help).
+    Calling ``main()`` programmatically from Python still works the same
+    way — only the CLI entry goes through ``fire``.
+    """
     import fire
     fire.Fire(main)
+
+
+if __name__ == "__main__":
+    _cli_main()
