@@ -374,11 +374,16 @@ def compress_context(
 
     if agent._session_db:
         try:
+            import hermes_db as _hermes_db
             # Propagate title to the new session with auto-numbering
-            old_title = agent._session_db.get_session_title(agent.session_id)
+            old_title = _hermes_db.run_sync(
+                agent._session_db.get_session_title(agent.session_id)
+            )
             # Trigger memory extraction on the old session before it rotates.
             agent.commit_memory_session(messages)
-            agent._session_db.end_session(agent.session_id, "compression")
+            _hermes_db.run_sync(
+                agent._session_db.end_session(agent.session_id, "compression")
+            )
             old_session_id = agent.session_id
             agent.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
             os.environ["HERMES_SESSION_ID"] = agent.session_id
@@ -388,22 +393,28 @@ def compress_context(
             except Exception:
                 pass
             agent._session_db_created = False
-            agent._session_db.create_session(
+            _hermes_db.run_sync(agent._session_db.create_session(
                 session_id=agent.session_id,
                 source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=agent.model,
                 model_config=agent._session_init_model_config,
                 parent_session_id=old_session_id,
-            )
+            ))
             agent._session_db_created = True
             # Auto-number the title for the continuation session
             if old_title:
                 try:
-                    new_title = agent._session_db.get_next_title_in_lineage(old_title)
-                    agent._session_db.set_session_title(agent.session_id, new_title)
+                    new_title = _hermes_db.run_sync(
+                        agent._session_db.get_next_title_in_lineage(old_title)
+                    )
+                    _hermes_db.run_sync(
+                        agent._session_db.set_session_title(agent.session_id, new_title)
+                    )
                 except (ValueError, Exception) as e:
                     logger.debug("Could not propagate title on compression: %s", e)
-            agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+            _hermes_db.run_sync(
+                agent._session_db.update_system_prompt(agent.session_id, new_system_prompt)
+            )
             # Reset flush cursor — new session starts with no messages written
             agent._last_flushed_db_idx = 0
         except Exception as e:

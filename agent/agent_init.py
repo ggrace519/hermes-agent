@@ -1116,7 +1116,10 @@ def init_agent(
                     # (e.g. honcho uses this to derive chat-scoped session keys)
                     if agent._session_db:
                         try:
-                            _st = agent._session_db.get_session_title(agent.session_id)
+                            import hermes_db as _hermes_db
+                            _st = _hermes_db.run_sync(
+                                agent._session_db.get_session_title(agent.session_id)
+                            )
                             if _st:
                                 _init_kwargs["session_title"] = _st
                         except Exception:

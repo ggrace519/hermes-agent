@@ -104,9 +104,11 @@ def auto_title_session(
     if not session_db or not session_id:
         return
 
+    import hermes_db as _hermes_db
+
     # Check if title already exists (user may have set one via /title before first response)
     try:
-        existing = session_db.get_session_title(session_id)
+        existing = _hermes_db.run_sync(session_db.get_session_title(session_id))
         if existing:
             return
     except Exception:
@@ -119,7 +121,7 @@ def auto_title_session(
         return
 
     try:
-        session_db.set_session_title(session_id, title)
+        _hermes_db.run_sync(session_db.set_session_title(session_id, title))
         logger.debug("Auto-generated session title: %s", title)
         if title_callback is not None:
             try:

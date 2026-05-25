@@ -158,7 +158,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_state = "missing"
     if conversation_history and agent._session_db:
         try:
-            session_row = agent._session_db.get_session(agent.session_id)
+            import hermes_db as _hermes_db
+            session_row = _hermes_db.run_sync(
+                agent._session_db.get_session(agent.session_id)
+            )
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
                 if raw_prompt is None:
@@ -219,7 +222,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            import hermes_db as _hermes_db
+            _hermes_db.run_sync(
+                agent._session_db.update_system_prompt(
+                    agent.session_id, agent._cached_system_prompt
+                )
+            )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -1671,7 +1679,8 @@ def run_conversation(
                             # affects 0 rows without error).
                             if not agent._session_db_created:
                                 agent._ensure_db_session()
-                            agent._session_db.update_token_counts(
+                            import hermes_db as _hermes_db
+                            _hermes_db.run_sync(agent._session_db.update_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
@@ -1688,7 +1697,7 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
-                            )
+                            ))
                         except Exception as e:
                             # Log token persistence failures so they're
                             # visible in agent.log — silent loss here is
