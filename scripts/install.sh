@@ -8,17 +8,18 @@
 # project. It REPLACES SQLite with PostgreSQL for all state — session
 # transcripts, kanban, substrate slices.
 #
-# Designed to install side-by-side with the upstream Hermes Agent
-# without touching its data. Defaults:
+# Defaults:
 #
-#   - INSTALL_DIR:  ~/.hermes-substrate/hermes-agent  (separate from upstream)
-#   - HERMES_HOME:  ~/.hermes-substrate               (separate from upstream)
-#   - CLI command:  hermes-substrate                  (no collision with `hermes`)
+#   - INSTALL_DIR:  ~/.hermes/hermes-agent
+#   - HERMES_HOME:  ~/.hermes
+#   - CLI command:  hermes
 #   - PostgreSQL:   docker compose service on port 5432, db `hermes`
 #
-# All four defaults can be overridden. If you do NOT have an upstream
-# Hermes install on the machine and want the natural `hermes` CLI name +
-# `~/.hermes/` home, pass:  --cli-name hermes --hermes-home ~/.hermes
+# If you are installing on a machine that already has an upstream
+# NousResearch/hermes-agent install and want to coexist without overwriting
+# it, override the defaults explicitly:
+#
+#   curl ... | bash -s -- --cli-name hermes-substrate --hermes-home ~/.hermes-substrate
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.sh | bash
@@ -60,9 +61,8 @@ BOLD='\033[1m'
 REPO_URL_SSH="git@github.com:ggrace519/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/ggrace519/hermes-agent.git"
 
-# Defaults are SIDE-BY-SIDE safe. See header for rationale.
-HERMES_HOME_DEFAULT="$HOME/.hermes-substrate"
-CLI_NAME_DEFAULT="hermes-substrate"
+HERMES_HOME_DEFAULT="$HOME/.hermes"
+CLI_NAME_DEFAULT="hermes"
 
 HERMES_HOME="${HERMES_HOME:-$HERMES_HOME_DEFAULT}"
 CLI_NAME="${HERMES_CLI_NAME:-$CLI_NAME_DEFAULT}"
@@ -135,32 +135,23 @@ Options:
                         set HERMES_PG_DSN + run 'alembic upgrade head' yourself
   --branch NAME       Git branch to install (default: main)
   --dir PATH          Installation directory
-                        default (non-root): ~/.hermes-substrate/hermes-agent
+                        default (non-root): ~/.hermes/hermes-agent
                         default (root, Linux): /usr/local/lib/hermes-agent
   --hermes-home PATH  Data directory
-                        default: ~/.hermes-substrate
+                        default: ~/.hermes
                         (Override env: HERMES_HOME)
-                        IMPORTANT: defaults to ~/.hermes-substrate (NOT ~/.hermes)
-                        so this install does not touch an upstream NousResearch
-                        Hermes install. Pass ~/.hermes to share with upstream.
   --cli-name NAME     Name for the CLI shim
-                        default: hermes-substrate
-                        Pass 'hermes' if you do NOT have an upstream install
-                        and want the natural name.
+                        default: hermes
+                        Pass a different name (e.g. hermes-substrate) to
+                        coexist with another Hermes install on the same machine.
                         (Override env: HERMES_CLI_NAME)
   --pg-dsn URL        PostgreSQL DSN to use
                         default: postgresql://hermes:hermes@localhost:5432/hermes
                         (matches the docker-compose service shipped with this repo)
   -h, --help          Show this help
 
-Side-by-side install with upstream NousResearch/hermes-agent:
-  The defaults are tuned to coexist. Your existing ~/.hermes/ data is never
-  touched. Your existing 'hermes' command keeps working. Use the new
-  'hermes-substrate' command (or 'source venv/bin/activate' then 'hermes')
-  to invoke this fork.
-
-Single install (no upstream present):
-  curl ... | bash -s -- --cli-name hermes --hermes-home ~/.hermes
+Side-by-side install (coexist with an existing upstream Hermes):
+  curl ... | bash -s -- --cli-name hermes-substrate --hermes-home ~/.hermes-substrate
 
 Custom PostgreSQL (e.g. your own cluster, Neon, Supabase):
   curl ... | bash -s -- --skip-postgres --pg-dsn 'postgresql://user:pw@host:5432/db'
@@ -293,30 +284,40 @@ get_hermes_command_path() {
     fi
 }
 
-# Warn loudly if the side-by-side defaults are being collapsed onto upstream's.
+# Warn loudly if we're about to overwrite an existing upstream Hermes install.
+# This is only triggered when ~/.hermes already exists and was not previously
+# created by this installer (no .substrate_install marker), or when an existing
+# `hermes` command on PATH would be shadowed by ours. Pass --hermes-home and
+# --cli-name to install side-by-side instead.
 warn_upstream_collision() {
     local upstream_home="$HOME/.hermes"
     local saw_collision=false
 
     if [ "$HERMES_HOME" = "$upstream_home" ] && [ -d "$upstream_home" ] && [ ! -f "$upstream_home/.substrate_install" ]; then
-        log_warn "HERMES_HOME=$upstream_home matches the default for the upstream Hermes Agent install."
-        log_warn "  Substrate-backed data (sessions, slices) will go into PostgreSQL, not SQLite,"
-        log_warn "  so this is non-destructive — but skills/config/SOUL.md will be SHARED."
+        log_warn "HERMES_HOME=$upstream_home already exists and looks like an upstream Hermes install."
+        log_warn "  Substrate-backed data (sessions, slices) lives in PostgreSQL, not SQLite,"
+        log_warn "  so this is non-destructive for transcripts — but skills/config/SOUL.md will be SHARED."
         saw_collision=true
     fi
 
     if [ "$CLI_NAME" = "hermes" ] && command -v hermes >/dev/null 2>&1; then
         local existing
         existing="$(command -v hermes)"
-        log_warn "CLI_NAME=hermes will install a launcher at $(get_command_link_display_dir)/hermes"
-        log_warn "  which shadows the existing 'hermes' command at: $existing"
-        saw_collision=true
+        local target_dir
+        target_dir="$(get_command_link_display_dir)"
+        # If we're about to replace the same launcher path, that's a re-run,
+        # not a collision — skip the warning.
+        if [ "$existing" != "$target_dir/hermes" ]; then
+            log_warn "CLI_NAME=hermes will install a launcher at $target_dir/hermes"
+            log_warn "  which shadows the existing 'hermes' command at: $existing"
+            saw_collision=true
+        fi
     fi
 
     if [ "$saw_collision" = true ]; then
         if [ "$IS_INTERACTIVE" = true ] || [ -r /dev/tty ]; then
             if ! prompt_yes_no "Continue anyway?" "no"; then
-                echo "Aborted. Re-run with default --hermes-home / --cli-name for side-by-side install."
+                echo "Aborted. Re-run with --hermes-home and/or --cli-name to install side-by-side."
                 exit 1
             fi
         else

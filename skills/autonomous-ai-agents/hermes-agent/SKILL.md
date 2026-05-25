@@ -342,12 +342,13 @@ $HERMES_HOME/skills/        Installed skills
 ~/.hermes/hermes-agent/     Source code (if git-installed)
 ```
 
-**Substrate Edition (this fork) path differences:** the substrate fork installs
-side-by-side with upstream Hermes by default — `HERMES_HOME` is
-`~/.hermes-substrate/`, the CLI shim is `hermes-substrate`, and session +
-kanban + substrate state all live in **PostgreSQL** (DSN `HERMES_PG_DSN`,
-default `postgresql://hermes:hermes@localhost:5432/hermes`) rather than
-`state.db`. The `state.db` SQLite file no longer exists in this fork.
+**Substrate Edition (this fork) differences:** session + kanban + substrate
+state all live in **PostgreSQL** (DSN `HERMES_PG_DSN`, default
+`postgresql://hermes:hermes@localhost:5432/hermes`) rather than `state.db`.
+The `state.db` SQLite file no longer exists in this fork. The installer's
+defaults still place `HERMES_HOME` at `~/.hermes/` and the launcher at
+`hermes`; pass `--cli-name hermes-substrate --hermes-home ~/.hermes-substrate`
+to coexist with an existing upstream install.
 
 Profiles use `~/.hermes/profiles/<name>/` with the same layout.
 
@@ -757,10 +758,10 @@ the provider is active for explicit deeper-search asks.
 Introspect:
 
 ```bash
-hermes-substrate substrate inspect            # streams + slice counts + pending queue
-hermes-substrate substrate inspect streams    # per-stream counts
-hermes-substrate substrate inspect curator    # decay/release activity
-hermes-substrate substrate inspect recall     # recall coverage + recent calls
+hermes substrate inspect            # streams + slice counts + pending queue
+hermes substrate inspect streams    # per-stream counts
+hermes substrate inspect curator    # decay/release activity
+hermes substrate inspect recall     # recall coverage + recent calls
 ```
 
 Deeper operator workflow lives in the **substrate** bundled skill —
