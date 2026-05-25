@@ -150,6 +150,12 @@ class _PgCursor:
     def keys(self) -> list[str]:
         return list(self._rows[0].keys()) if self._rows else []
 
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
 
 class _PgRow:
     """sqlite3.Row-like wrapper around a dict from asyncpg."""
@@ -160,13 +166,30 @@ class _PgRow:
         self._d = d
 
     def __getitem__(self, key):
+        # sqlite3.Row supports BOTH string-key and integer-positional access;
+        # mimic that so legacy `row[0]` (e.g. for SELECT COUNT(*)) still works.
+        if isinstance(key, int):
+            try:
+                return list(self._d.values())[key]
+            except IndexError:
+                raise IndexError(f"_PgRow index {key} out of range (len={len(self._d)})")
         return self._d[key]
 
     def keys(self):
         return list(self._d.keys())
 
+    def values(self):
+        return list(self._d.values())
+
     def __contains__(self, key):
         return key in self._d
+
+    def __iter__(self):
+        # sqlite3.Row iterates over values, not keys
+        return iter(self._d.values())
+
+    def __len__(self) -> int:
+        return len(self._d)
 
     def get(self, key, default=None):
         return self._d.get(key, default)
@@ -202,6 +225,7 @@ class _PgConnection:
         self._in_txn = False
         self._txn = None           # asyncpg Transaction object when active
         self.row_factory = None    # compat; ignored
+        self._last_lastrowid: Optional[int] = None  # sqlite last_insert_rowid() compat
 
     # ------------------------------------------------------------------ #
     # Sync execution bridge                                                #
@@ -217,7 +241,18 @@ class _PgConnection:
     # ------------------------------------------------------------------ #
 
     def execute(self, sql: str, params: tuple = ()) -> "_PgCursor":
-        return self._run(self._async_execute(sql, params))
+        # sqlite SELECT last_insert_rowid() compat — synthesize a cursor with
+        # the most recent INSERT's RETURNING id. asyncpg's lastrowid lives on
+        # the cursor returned by execute(); we stash it on the connection so
+        # subsequent SELECT last_insert_rowid() calls can find it.
+        sql_stripped = sql.strip().rstrip(";").strip()
+        if re.match(r"(?i)^SELECT\s+last_insert_rowid\s*\(\s*\)\s*$", sql_stripped):
+            rid = self._last_lastrowid
+            return _PgCursor([_PgRow({"last_insert_rowid": rid})], 1)
+        cursor = self._run(self._async_execute(sql, params))
+        if cursor.lastrowid is not None:
+            self._last_lastrowid = cursor.lastrowid
+        return cursor
 
     async def _async_execute(self, sql: str, params: tuple) -> "_PgCursor":
         sql_pg, pg_params = _translate_sql(sql, self._board_slug, params)
@@ -292,6 +327,18 @@ class _PgConnection:
     def close(self) -> None:
         # Connection lifecycle managed by _pg_connect; this is a no-op.
         pass
+
+    def commit(self) -> None:
+        # sqlite3.Connection.commit() compat. If we're inside an explicit
+        # transaction started via _begin(), finalize it; otherwise no-op
+        # (asyncpg auto-commits each statement outside a transaction).
+        if self._in_txn:
+            self._commit()
+
+    def rollback(self) -> None:
+        # sqlite3.Connection.rollback() compat.
+        if self._in_txn:
+            self._rollback()
 
     def __enter__(self):
         return self
