@@ -42,8 +42,14 @@ def _load_plugin_router():
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+def kanban_home(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """Isolated HERMES_HOME with an empty kanban DB.
+
+    Depends on ``hermes_db_initialized_sync`` so the PG pool is bound
+    to the persistent sync loop AND the kanban schema is migrated.
+    Phase 0 moved kanban_db from SQLite to PG; the table lives in the
+    per-test PG database now.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -710,8 +716,16 @@ def test_board_progress_rollup(client):
 # ---------------------------------------------------------------------------
 
 
-def test_board_auto_initializes_missing_db(tmp_path, monkeypatch):
-    """If kanban.db doesn't exist yet, GET /board must create it, not 500."""
+def test_board_auto_initializes_missing_db(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """If the kanban schema hasn't been touched yet, GET /board must
+    auto-initialize it rather than 500.
+
+    Phase 0 moved kanban storage from a sqlite ``kanban.db`` file to
+    PostgreSQL, so the legacy "did init_db create the file?" assertion
+    no longer applies. We instead verify the endpoint returns a
+    well-formed empty board and that ``init_db`` is now idempotent on
+    the PG side (calling it a second time must not raise).
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -719,14 +733,17 @@ def test_board_auto_initializes_missing_db(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    # Deliberately DO NOT call kb.init_db().
+    # Deliberately DO NOT call kb.init_db() here — the endpoint must.
 
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
     c = TestClient(app)
     r = c.get("/api/plugins/kanban/board")
     assert r.status_code == 200
-    assert (home / "kanban.db").exists(), "init_db wasn't invoked by /board"
+    body = r.json()
+    assert "columns" in body
+    # Idempotent re-init must not raise.
+    kb.init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +751,7 @@ def test_board_auto_initializes_missing_db(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
+def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """When _SESSION_TOKEN is set (normal dashboard context), a missing or
     wrong ?token= query param must be rejected with policy-violation."""
     home = tmp_path / ".hermes"
@@ -774,7 +791,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         assert ws is not None  # handshake succeeded
 
 
-def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp_path, monkeypatch):
+def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """The event stream must honor ``board=default`` even when the global
     current-board pointer targets a different board.
 
@@ -824,7 +841,7 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
     assert other_task not in task_ids
 
 
-def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
+def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch, hermes_db_initialized_sync):
     """``asyncio.CancelledError`` while sleeping in the poll loop is the
     normal uvicorn-shutdown path (``BaseException``, so the bare
     ``except Exception:`` does NOT catch it). Without the explicit
