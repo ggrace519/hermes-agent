@@ -136,6 +136,26 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "hi", "hello")
             db.set_session_title.assert_called_once_with("sess-1", "New Title")
 
+    def test_generates_and_sets_title_with_async_session_db(self):
+        class AsyncDB:
+            def __init__(self):
+                self.set_calls = []
+
+            async def get_session_title(self, _session_id):
+                return None
+
+            async def set_session_title(self, session_id, title):
+                self.set_calls.append((session_id, title))
+                return True
+
+        db = AsyncDB()
+
+        with patch("agent.title_generator.generate_title", return_value="New Title") as gen:
+            auto_title_session(db, "sess-1", "hi", "hello")
+
+        gen.assert_called_once()
+        assert db.set_calls == [("sess-1", "New Title")]
+
     def test_invokes_title_callback_after_setting_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None

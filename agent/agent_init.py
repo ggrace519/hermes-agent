@@ -42,6 +42,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.session_db_bridge import resolve_maybe_awaitable
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -1116,7 +1117,9 @@ def init_agent(
                     # (e.g. honcho uses this to derive chat-scoped session keys)
                     if agent._session_db:
                         try:
-                            _st = agent._session_db.get_session_title(agent.session_id)
+                            _st = resolve_maybe_awaitable(
+                                agent._session_db.get_session_title(agent.session_id)
+                            )
                             if _st:
                                 _init_kwargs["session_title"] = _st
                         except Exception:

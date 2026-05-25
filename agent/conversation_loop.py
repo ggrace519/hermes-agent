@@ -63,6 +63,7 @@ from agent.nous_rate_guard import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.session_db_bridge import resolve_maybe_awaitable
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn
@@ -158,7 +159,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     stored_state = "missing"
     if conversation_history and agent._session_db:
         try:
-            session_row = agent._session_db.get_session(agent.session_id)
+            session_row = resolve_maybe_awaitable(
+                agent._session_db.get_session(agent.session_id)
+            )
             if session_row is not None:
                 raw_prompt = session_row.get("system_prompt")
                 if raw_prompt is None:
@@ -219,7 +222,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # subsequent turn).
     if agent._session_db:
         try:
-            agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
+            resolve_maybe_awaitable(
+                agent._session_db.update_system_prompt(
+                    agent.session_id,
+                    agent._cached_system_prompt,
+                )
+            )
         except Exception as exc:
             logger.warning(
                 "Session DB update_system_prompt failed for session %s: "
@@ -1671,23 +1679,25 @@ def run_conversation(
                             # affects 0 rows without error).
                             if not agent._session_db_created:
                                 agent._ensure_db_session()
-                            agent._session_db.update_token_counts(
-                                agent.session_id,
-                                input_tokens=canonical_usage.input_tokens,
-                                output_tokens=canonical_usage.output_tokens,
-                                cache_read_tokens=canonical_usage.cache_read_tokens,
-                                cache_write_tokens=canonical_usage.cache_write_tokens,
-                                reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=float(cost_result.amount_usd)
-                                if cost_result.amount_usd is not None else None,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
-                                billing_provider=agent.provider,
-                                billing_base_url=agent.base_url,
-                                billing_mode="subscription_included"
-                                if cost_result.status == "included" else None,
-                                model=agent.model,
-                                api_call_count=1,
+                            resolve_maybe_awaitable(
+                                agent._session_db.update_token_counts(
+                                    agent.session_id,
+                                    input_tokens=canonical_usage.input_tokens,
+                                    output_tokens=canonical_usage.output_tokens,
+                                    cache_read_tokens=canonical_usage.cache_read_tokens,
+                                    cache_write_tokens=canonical_usage.cache_write_tokens,
+                                    reasoning_tokens=canonical_usage.reasoning_tokens,
+                                    estimated_cost_usd=float(cost_result.amount_usd)
+                                    if cost_result.amount_usd is not None else None,
+                                    cost_status=cost_result.status,
+                                    cost_source=cost_result.source,
+                                    billing_provider=agent.provider,
+                                    billing_base_url=agent.base_url,
+                                    billing_mode="subscription_included"
+                                    if cost_result.status == "included" else None,
+                                    model=agent.model,
+                                    api_call_count=1,
+                                )
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

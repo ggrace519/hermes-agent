@@ -41,6 +41,44 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 
 
 class TestStoredPromptReuse:
+    def test_present_row_from_async_session_db_is_reused_verbatim(self):
+        """Async-backed SessionDB get_session() is bridged in this sync helper."""
+
+        class AsyncSessionDB:
+            async def get_session(self, _session_id):
+                return {"system_prompt": "ASYNC_STORED_PROMPT"}
+
+            async def update_system_prompt(self, _session_id, _prompt):
+                raise AssertionError("restore path must not write")
+
+        agent = _make_agent(session_db=AsyncSessionDB())
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == "ASYNC_STORED_PROMPT"
+        agent._build_system_prompt.assert_not_called()
+
+    def test_fresh_build_persists_to_async_session_db(self):
+        """Async-backed SessionDB update_system_prompt() is bridged too."""
+
+        class AsyncSessionDB:
+            def __init__(self):
+                self.persisted = None
+
+            async def get_session(self, _session_id):
+                raise AssertionError("no history should skip get_session")
+
+            async def update_system_prompt(self, session_id, prompt):
+                self.persisted = (session_id, prompt)
+
+        db = AsyncSessionDB()
+        agent = _make_agent(session_db=db)
+
+        _restore_or_build_system_prompt(agent, None, [])
+
+        assert agent._cached_system_prompt == "BUILT_PROMPT"
+        assert db.persisted == (agent.session_id, "BUILT_PROMPT")
+
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"
