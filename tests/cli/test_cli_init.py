@@ -4,7 +4,7 @@ that only manifest at runtime (not in mocked unit tests)."""
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -269,7 +269,11 @@ class TestHistoryDisplay:
         cli = _make_cli()
         cli.session_id = "current"
         cli._session_db = MagicMock()
-        cli._session_db.list_sessions_rich.return_value = [
+        # Phase 0: list_sessions_rich is an async coroutine on _AsyncSessionDB.
+        # AsyncMock makes ``hermes_db.run_sync(db.list_sessions_rich(...))``
+        # in production code resolve to our payload rather than blow up with
+        # "An asyncio.Future, a coroutine or an awaitable is required".
+        cli._session_db.list_sessions_rich = AsyncMock(return_value=[
             {
                 "id": "current",
                 "title": "Current",
@@ -282,7 +286,7 @@ class TestHistoryDisplay:
                 "preview": "check running gateways for hermes agent",
                 "last_active": 0,
             },
-        ]
+        ])
 
         cli.show_history()
         output = capsys.readouterr().out
@@ -297,7 +301,7 @@ class TestHistoryDisplay:
         cli = _make_cli()
         cli.session_id = "current"
         cli._session_db = MagicMock()
-        cli._session_db.list_sessions_rich.return_value = [
+        cli._session_db.list_sessions_rich = AsyncMock(return_value=[
             {
                 "id": "current",
                 "title": "Current",
@@ -310,7 +314,7 @@ class TestHistoryDisplay:
                 "preview": "check running gateways for hermes agent",
                 "last_active": 0,
             },
-        ]
+        ])
 
         cli._handle_resume_command("/resume")
         output = capsys.readouterr().out
@@ -330,14 +334,14 @@ class TestHistoryDisplay:
         cli = _make_cli()
         cli.session_id = "current"
         cli._session_db = MagicMock()
-        cli._session_db.list_sessions_rich.return_value = [
+        cli._session_db.list_sessions_rich = AsyncMock(return_value=[
             {
                 "id": "20260401_201329_d85961",
                 "title": "Checking Running Hermes Agent",
                 "preview": "check running gateways for hermes agent",
                 "last_active": 0,
             },
-        ]
+        ])
 
         # Drive it through the public dispatcher to also lock in the
         # process_command wiring, not just the handler in isolation.
@@ -354,14 +358,14 @@ class TestHistoryDisplay:
         cli = _make_cli()
         cli.session_id = "current"
         cli._session_db = MagicMock()
-        cli._session_db.list_sessions_rich.return_value = [
+        cli._session_db.list_sessions_rich = AsyncMock(return_value=[
             {
                 "id": "20260401_201329_d85961",
                 "title": "Checking Running Hermes Agent",
                 "preview": "check running gateways for hermes agent",
                 "last_active": 0,
             },
-        ]
+        ])
 
         cli.process_command("/sessions list")
         output = capsys.readouterr().out
