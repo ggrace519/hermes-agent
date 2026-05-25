@@ -785,11 +785,18 @@ def board_dir(board: Optional[str] = None) -> Path:
 
 
 def board_exists(board: Optional[str] = None) -> bool:
-    """Return True if the board exists in the kanban_boards table.
+    """Return True if the board exists in the kanban_boards table and
+    is not archived.
 
     ``default`` is considered to always exist — its row is created
     on first :func:`connect` and there's no way for it to be missing
     in a configuration where the kanban feature is usable at all.
+
+    Archived boards (``archived_at IS NOT NULL``) report False so that
+    a stale ``HERMES_KANBAN_BOARD`` env var pointing at an archived
+    slug falls through to the next layer of ``get_current_board()``'s
+    resolution chain rather than silently routing writes onto an
+    invisible board.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     if slug == DEFAULT_BOARD:
@@ -798,7 +805,9 @@ def board_exists(board: Optional[str] = None) -> bool:
     async def _check():
         async with hermes_db.connection() as conn:
             row = await conn.fetchrow(
-                "SELECT 1 FROM kanban_boards WHERE slug = $1", slug
+                "SELECT 1 FROM kanban_boards "
+                "WHERE slug = $1 AND archived_at IS NULL",
+                slug,
             )
             return row is not None
     return hermes_db.run_sync(_check())
@@ -889,12 +898,11 @@ def _default_board_display_name(slug: str) -> str:
 
 
 def read_board_metadata(board: Optional[str] = None) -> dict:
-    """Return ``board.json`` contents (or synthesized defaults).
+    """Return the board's metadata row from ``kanban_boards``.
 
-    Never raises — a missing / malformed ``board.json`` falls back to a
-    synthesised entry so the dashboard always has something to render.
-    Includes the canonical ``slug`` and ``db_path`` so the caller
-    doesn't need to reconstruct them.
+    Synthesises a default entry when the board isn't in the table yet
+    so the dashboard always has something to render. The returned dict
+    always carries the canonical ``slug``.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta: dict[str, Any] = {
@@ -907,18 +915,34 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "created_at": None,
         "archived": False,
     }
+    import hermes_db
+    async def _read():
+        async with hermes_db.connection() as conn:
+            return await conn.fetchrow(
+                "SELECT slug, name, description, icon, color, default_workdir, "
+                "created_at, archived_at "
+                "FROM kanban_boards WHERE slug = $1",
+                slug,
+            )
     try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
-    meta["db_path"] = str(kanban_db_path(slug))
+        row = hermes_db.run_sync(_read())
+    except RuntimeError:
+        # Pool not initialised yet — fall back to synthesised defaults.
+        return meta
+    if row is None:
+        return meta
+    if row["name"]:
+        meta["name"] = row["name"]
+    meta["description"] = row["description"] or ""
+    meta["icon"] = row["icon"] or ""
+    meta["color"] = row["color"] or ""
+    meta["default_workdir"] = row["default_workdir"]
+    created = row["created_at"]
+    if created is not None:
+        # kanban_boards.created_at is TIMESTAMPTZ; legacy callers expect
+        # an int epoch.
+        meta["created_at"] = int(created.timestamp())
+    meta["archived"] = row["archived_at"] is not None
     return meta
 
 
@@ -932,38 +956,54 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
 ) -> dict:
-    """Create / update ``board.json`` for ``board``.
+    """Upsert this board's metadata in ``kanban_boards``.
 
-    Preserves any existing fields not mentioned in the call. Sets
-    ``created_at`` on first write. Returns the resulting metadata dict.
+    Preserves any existing fields not mentioned in the call. Returns the
+    resulting metadata dict.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta = read_board_metadata(slug)
-    # Preserve existing DB-derived fields — they get re-computed each
-    # read but shouldn't be written into board.json.
-    meta.pop("db_path", None)
-    if name is not None:
-        meta["name"] = str(name).strip() or _default_board_display_name(slug)
-    if description is not None:
-        meta["description"] = str(description)
-    if icon is not None:
-        meta["icon"] = str(icon)
-    if color is not None:
-        meta["color"] = str(color)
-    if archived is not None:
-        meta["archived"] = bool(archived)
-    if default_workdir is not None:
-        meta["default_workdir"] = str(default_workdir) if default_workdir else None
-    if not meta.get("created_at"):
-        meta["created_at"] = int(time.time())
-    path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+    import hermes_db
+    # Make sure the row exists (idempotent insert) before update.
+    async def _upsert():
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                "INSERT INTO kanban_boards (slug) VALUES ($1) "
+                "ON CONFLICT (slug) DO NOTHING",
+                slug,
+            )
+            # Build a single UPDATE that only touches the columns the
+            # caller specified — COALESCE keeps existing values for the
+            # rest.
+            assignments = []
+            params: list[Any] = [slug]
+            if name is not None:
+                normalized_name = str(name).strip() or _default_board_display_name(slug)
+                params.append(normalized_name)
+                assignments.append(f"name = ${len(params)}")
+            if description is not None:
+                params.append(str(description))
+                assignments.append(f"description = ${len(params)}")
+            if icon is not None:
+                params.append(str(icon))
+                assignments.append(f"icon = ${len(params)}")
+            if color is not None:
+                params.append(str(color))
+                assignments.append(f"color = ${len(params)}")
+            if default_workdir is not None:
+                params.append(str(default_workdir) if default_workdir else None)
+                assignments.append(f"default_workdir = ${len(params)}")
+            if archived is not None:
+                if archived:
+                    assignments.append("archived_at = COALESCE(archived_at, now())")
+                else:
+                    assignments.append("archived_at = NULL")
+            if assignments:
+                await conn.execute(
+                    f"UPDATE kanban_boards SET {', '.join(assignments)} WHERE slug = $1",
+                    *params,
+                )
+    hermes_db.run_sync(_upsert())
+    return read_board_metadata(slug)
 
 
 def create_board(
@@ -977,124 +1017,134 @@ def create_board(
 ) -> dict:
     """Create a new board. Idempotent.
 
-    Returns the resulting metadata. Raises :class:`ValueError` for a
-    malformed slug; returns the existing metadata (not an error) if the
-    board already exists — matching ``mkdir -p`` semantics.
+    Returns the resulting metadata row. Raises :class:`ValueError` for
+    a malformed slug; returns the existing metadata (not an error) if
+    the board already exists — matching ``mkdir -p`` semantics.
 
-    Inserts into kanban_boards table (idempotent via ON CONFLICT).
+    Inserts into kanban_boards table (idempotent via ON CONFLICT) and,
+    when any of the optional metadata kwargs are supplied, persists them
+    via :func:`write_board_metadata`. The default board's metadata is
+    NOT mutated by a no-arg call — only an explicit kwarg overrides what
+    was set on the original CREATE.
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    import hermes_db
-    async def _create():
-        async with hermes_db.connection() as conn:
-            await conn.execute(
-                "INSERT INTO kanban_boards (slug) VALUES ($1) ON CONFLICT (slug) DO NOTHING",
-                normed,
-            )
-    hermes_db.run_sync(_create())
-    return {
-        "slug": normed,
-        "name": _default_board_display_name(normed),
-        "description": description or "",
-        "icon": icon or "",
-        "color": color or "",
-        "default_workdir": default_workdir,
-        "created_at": int(time.time()),
-        "archived": False,
-    }
+    # Always upsert metadata so a fresh board gets at least a default
+    # display name + an empty description rather than NULLs.
+    return write_board_metadata(
+        normed,
+        name=name if name is not None else _default_board_display_name(normed),
+        description=description if description is not None else "",
+        icon=icon if icon is not None else "",
+        color=color if color is not None else "",
+        default_workdir=default_workdir,
+    )
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
-    """Enumerate all boards that exist on disk.
-
-    Always includes ``default`` (even when the ``boards/default/``
-    metadata dir doesn't exist, because its DB is at the legacy path).
-    Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
+    """Enumerate all boards registered in ``kanban_boards``.
 
     Returns a list of metadata dicts, sorted with ``default`` first and
-    the rest alphabetically.
+    the rest alphabetically by slug. The default board is always
+    surfaced, even when it doesn't yet have an explicit row (synthesised
+    by :func:`read_board_metadata`).
     """
+    import hermes_db
+    async def _list():
+        async with hermes_db.connection() as conn:
+            return await conn.fetch(
+                "SELECT slug, name, description, icon, color, default_workdir, "
+                "created_at, archived_at "
+                "FROM kanban_boards ORDER BY slug"
+            )
+    try:
+        rows = hermes_db.run_sync(_list())
+    except RuntimeError:
+        rows = []
+
     entries: list[dict] = []
     seen: set[str] = set()
 
-    # Default board is always first.
-    entries.append(read_board_metadata(DEFAULT_BOARD))
-    seen.add(DEFAULT_BOARD)
+    def _row_to_meta(row) -> dict:
+        return read_board_metadata(row["slug"])
 
-    root = boards_root()
-    if root.is_dir():
-        for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
-            if not child.is_dir():
-                continue
-            slug = child.name
-            # Keep slug normalisation soft for discovery — but skip dirs
-            # that don't parse as valid slugs so we don't surface junk.
-            try:
-                normed = _normalize_board_slug(slug)
-            except ValueError:
-                continue
-            if not normed or normed in seen:
-                continue
-            has_db = (child / "kanban.db").exists()
-            has_meta = (child / "board.json").exists()
-            if not (has_db or has_meta):
-                continue
-            meta = read_board_metadata(normed)
-            if meta.get("archived") and not include_archived:
-                continue
+    # Default board is always first.
+    default_row = next((r for r in rows if r["slug"] == DEFAULT_BOARD), None)
+    if default_row is not None:
+        meta = _row_to_meta(default_row)
+        if include_archived or not meta.get("archived"):
             entries.append(meta)
-            seen.add(normed)
+        seen.add(DEFAULT_BOARD)
+    else:
+        # No row yet — surface a synthesised default.
+        entries.append(read_board_metadata(DEFAULT_BOARD))
+        seen.add(DEFAULT_BOARD)
+
+    for row in rows:
+        slug = row["slug"]
+        if slug in seen:
+            continue
+        meta = _row_to_meta(row)
+        if not include_archived and meta.get("archived"):
+            continue
+        entries.append(meta)
+        seen.add(slug)
     return entries
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
-    ``archive=True`` (default) moves the board's directory to
-    ``<root>/kanban/boards/_archived/<slug>-<timestamp>/`` so the data
-    is recoverable. ``archive=False`` deletes the directory outright.
+    ``archive=True`` (default) sets ``archived_at = now()`` on the
+    board's row — data is preserved (tasks/events/runs are still
+    queryable via ``board_slug``) but the board drops out of
+    ``list_boards(include_archived=False)``.
+
+    ``archive=False`` deletes the row outright; the ON DELETE CASCADE
+    on ``kanban_tasks.board_slug`` removes all tasks (and their
+    dependent rows) belonging to that board.
 
     The ``default`` board cannot be removed — raises :class:`ValueError`.
-    Returns a summary dict describing what happened (``{"slug", "action",
-    "new_path"}``).
+    Returns a summary dict describing what happened (``{"slug",
+    "action"}``).
     """
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
     if normed == DEFAULT_BOARD:
         raise ValueError("the 'default' board cannot be removed")
-    d = board_dir(normed)
-    if not d.exists():
+
+    import hermes_db
+    async def _check():
+        async with hermes_db.connection() as conn:
+            return await conn.fetchval(
+                "SELECT 1 FROM kanban_boards WHERE slug = $1", normed
+            )
+    if not hermes_db.run_sync(_check()):
         raise ValueError(f"board {normed!r} does not exist")
 
     # If the user removed the currently-active board, revert to default.
     if get_current_board() == normed:
         clear_current_board()
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
     if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
+        async def _archive():
+            async with hermes_db.connection() as conn:
+                await conn.execute(
+                    "UPDATE kanban_boards SET archived_at = now() WHERE slug = $1",
+                    normed,
+                )
+        hermes_db.run_sync(_archive())
+        return {"slug": normed, "action": "archived"}
     else:
-        import shutil
-        shutil.rmtree(d)
-        return {"slug": normed, "action": "deleted", "new_path": ""}
+        async def _delete():
+            async with hermes_db.connection() as conn:
+                await conn.execute(
+                    "DELETE FROM kanban_boards WHERE slug = $1", normed
+                )
+        hermes_db.run_sync(_delete())
+        return {"slug": normed, "action": "deleted"}
 
 
 # ---------------------------------------------------------------------------

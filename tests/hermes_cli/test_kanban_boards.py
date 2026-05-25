@@ -252,16 +252,25 @@ class TestBoardCRUD:
         kb.create_board("toremove")
         res = kb.remove_board("toremove")
         assert res["action"] == "archived"
-        assert Path(res["new_path"]).exists()
-        assert "toremove" not in [b["slug"] for b in kb.list_boards()]
+        # Archived boards drop out of the non-archived list view but the
+        # row (and its data) is preserved — kanban_boards.archived_at is
+        # set to now(). The legacy sqlite implementation returned a
+        # "new_path" pointing at the moved filesystem directory; PG
+        # mode has no filesystem state, so the key is no longer present.
+        assert "toremove" not in [b["slug"] for b in kb.list_boards(include_archived=False)]
+        assert "toremove" in [b["slug"] for b in kb.list_boards(include_archived=True)]
+        archived = next(b for b in kb.list_boards() if b["slug"] == "toremove")
+        assert archived["archived"] is True
 
     def test_remove_hard_delete(self, fresh_home):
         kb.create_board("nuke")
-        d = kb.board_dir("nuke")
-        assert d.exists()
+        assert kb.board_exists("nuke")
         res = kb.remove_board("nuke", archive=False)
         assert res["action"] == "deleted"
-        assert not d.exists()
+        # Hard delete removes the kanban_boards row outright. ON DELETE
+        # CASCADE on kanban_tasks.board_slug drops dependent rows.
+        assert not kb.board_exists("nuke")
+        assert "nuke" not in [b["slug"] for b in kb.list_boards(include_archived=True)]
 
     def test_remove_default_forbidden(self, fresh_home):
         with pytest.raises(ValueError, match="default"):
@@ -277,36 +286,19 @@ class TestBoardCRUD:
         kb.remove_board("pinned")
         assert kb.get_current_board() == "default"
 
+    @pytest.mark.skip(
+        reason="Phase 0 (sqlite→PG): _INITIALIZED_PATHS was a per-file "
+        "schema-init cache for sqlite kanban.db files. In PG mode the "
+        "schema lives in Alembic-managed migrations on a single database; "
+        "there is no per-board filesystem file and no init cache to "
+        "invalidate. The regression this test guarded (post-remove "
+        "connect() failing because of stale init cache + recreated empty "
+        "sqlite file) cannot occur in PG mode — connect() just opens a "
+        "pool connection and selects WHERE board_slug = $1."
+    )
     @pytest.mark.parametrize("archive", [True, False])
     def test_remove_clears_init_cache_for_recreated_db(self, fresh_home, archive):
-        # Regression for #23833: poll loops that call connect(board=slug) right
-        # after remove_board() recreate an empty kanban.db at the same path
-        # (connect() does mkdir(exist_ok=True)). If _INITIALIZED_PATHS still
-        # contains the resolved path, the CREATE TABLE pass is skipped and
-        # downstream readers hit `no such table: task_events`.
-        kb.create_board("recycle")
-        # First connect populates _INITIALIZED_PATHS for this DB.
-        with kb.connect(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
-        db_path = kb.board_dir("recycle") / "kanban.db"
-        assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
-
-        kb.remove_board("recycle", archive=archive)
-        # remove_board must drop the cache entry so a re-create through
-        # connect() gets a fresh schema-init pass.
-        assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
-
-        # Simulate the event-stream poll: re-open the same slug. connect()
-        # recreates the directory + empty .db; the schema must be re-applied.
-        with kb.connect(board="recycle") as conn:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-        assert "task_events" in tables
-        assert "tasks" in tables
+        pass
 
     def test_rename_updates_metadata(self, fresh_home):
         kb.create_board("slug-immutable")
