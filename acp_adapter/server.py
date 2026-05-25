@@ -717,11 +717,17 @@ class HermesACPAgent(acp.Agent):
             db = self.session_manager._get_db()
             if db is None:
                 return
-            # Phase 0: _AsyncSessionDB.get_session is a coroutine. We're
-            # already in an async context — await directly. The legacy
-            # SQLite SessionDB returned the row synchronously, which is
-            # why the bare call used to work.
-            row = await db.get_session(session_id)
+            # Phase 0: _AsyncSessionDB.get_session is a coroutine. We are
+            # in an async context (ACP server's loop), but the pool was
+            # bound to ``hermes_db._sync_loop`` by the ACP entry point's
+            # ``ensure_pool_sync`` — asyncpg connections are loop-bound,
+            # so a bare ``await db.get_session(...)`` from this loop
+            # would deadlock (or InterfaceError). Route through
+            # ``hermes_db.run_sync`` instead — it now detects the
+            # different-loop case and offloads to a worker thread that
+            # drives ``_sync_loop`` directly.
+            import hermes_db as _hermes_db
+            row = _hermes_db.run_sync(db.get_session(session_id))
         except Exception:
             logger.debug("Could not read ACP session info for %s", session_id, exc_info=True)
             return
