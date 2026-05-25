@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.cli_name import cli_name
 from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -514,7 +515,7 @@ def cmd_install(
         )
 
     console.print("[dim]Restart the gateway for the plugin to take effect:[/dim]")
-    console.print("[dim]  hermes gateway restart[/dim]")
+    console.print(f"[dim]  {cli_name()} gateway restart[/dim]")
     console.print()
 
 
@@ -799,7 +800,7 @@ def cmd_list() -> None:
     entries = _discover_all_plugins()
     if not entries:
         console.print("[dim]No plugins installed.[/dim]")
-        console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
+        console.print(f"[dim]Install with:[/dim] {cli_name()} plugins install owner/repo")
         return
 
     enabled = _get_enabled_set()
@@ -824,8 +825,8 @@ def cmd_list() -> None:
     console.print()
     console.print(table)
     console.print()
-    console.print("[dim]Interactive toggle:[/dim] hermes plugins")
-    console.print("[dim]Enable/disable:[/dim] hermes plugins enable/disable <name>")
+    console.print(f"[dim]Interactive toggle:[/dim] {cli_name()} plugins")
+    console.print(f"[dim]Enable/disable:[/dim] {cli_name()} plugins enable/disable <name>")
     console.print("[dim]Plugins are opt-in by default — only 'enabled' plugins load.[/dim]")
 
 
@@ -1011,7 +1012,7 @@ def cmd_toggle() -> None:
 
     if not has_plugins and not has_categories:
         console.print("[dim]No plugins installed and no provider categories available.[/dim]")
-        console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
+        console.print(f"[dim]Install with:[/dim] {cli_name()} plugins install owner/repo")
         return
 
     # Non-TTY fallback

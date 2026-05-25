@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from hermes_cli.cli_name import cli_name
+
 
 def _fmt_ts(ts: Optional[str]) -> str:
     if not ts:
@@ -202,7 +204,7 @@ def _cmd_run(args) -> int:
                 f"reactivated={auto.get('reactivated', 0)}"
             )
     if not synchronous:
-        print("llm pass running in background — check `hermes curator status` later")
+        print(f"llm pass running in background — check `{cli_name()} curator status` later")
     if dry:
         if synchronous:
             print(

@@ -3111,12 +3111,17 @@ def main() -> int:
 
     # Next steps
     if args.execute:
+        try:
+            from hermes_cli.cli_name import cli_name
+            _cli = cli_name()
+        except Exception:
+            _cli = "hermes"
         print()
         print("  Next steps:")
         print("    1. Review ~/.hermes/config.yaml")
-        print("    2. Run: hermes mcp list")
+        print(f"    2. Run: {_cli} mcp list")
         if any(i["kind"] == "cron-jobs" and i["status"] == "archived" for i in items):
-            print("    3. Recreate cron jobs: hermes cron")
+            print(f"    3. Recreate cron jobs: {_cli} cron")
         if report.get("output_dir"):
             print(f"    → Full report: {report['output_dir']}/MIGRATION_NOTES.md")
     elif not args.execute:

@@ -146,6 +146,7 @@ _EXTRA_ENV_KEYS = frozenset({
 })
 import yaml
 
+from hermes_cli.cli_name import cli_name
 from hermes_cli.colors import Colors, color
 from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
@@ -4044,7 +4045,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         print(f"  ✓ Saved {name}")
                     print()
             else:
-                print("  Set later with: hermes config set <key> <value>")
+                print(f"  Set later with: {cli_name()} config set <key> <value>")
     
     # Check for missing config fields
     missing_config = get_missing_config_fields()
@@ -4111,7 +4112,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                 print()
             save_config(config)
         else:
-            print("  Set later with: hermes config set <key> <value>")
+            print(f"  Set later with: {cli_name()} config set <key> <value>")
 
     return results
 
@@ -5177,9 +5178,9 @@ def show_config():
 
     print()
     print(color("─" * 60, Colors.DIM))
-    print(color("  hermes config edit     # Edit config file", Colors.DIM))
-    print(color("  hermes config set <key> <value>", Colors.DIM))
-    print(color("  hermes setup           # Run setup wizard", Colors.DIM))
+    print(color(f"  {cli_name()} config edit     # Edit config file", Colors.DIM))
+    print(color(f"  {cli_name()} config set <key> <value>", Colors.DIM))
+    print(color(f"  {cli_name()} setup           # Run setup wizard", Colors.DIM))
     print()
 
 
@@ -5328,12 +5329,12 @@ def config_command(args):
         key = getattr(args, 'key', None)
         value = getattr(args, 'value', None)
         if not key or value is None:
-            print("Usage: hermes config set <key> <value>")
+            print(f"Usage: {cli_name()} config set <key> <value>")
             print()
             print("Examples:")
-            print("  hermes config set model anthropic/claude-sonnet-4")
-            print("  hermes config set terminal.backend docker")
-            print("  hermes config set OPENROUTER_API_KEY sk-or-...")
+            print(f"  {cli_name()} config set model anthropic/claude-sonnet-4")
+            print(f"  {cli_name()} config set terminal.backend docker")
+            print(f"  {cli_name()} config set OPENROUTER_API_KEY sk-or-...")
             sys.exit(1)
         set_config_value(key, value)
     
@@ -5433,7 +5434,7 @@ def config_command(args):
         if missing_config:
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
-            print("    Run 'hermes config migrate' to add them")
+            print(f"    Run '{cli_name()} config migrate' to add them")
         
         print()
     
@@ -5441,13 +5442,13 @@ def config_command(args):
         print(f"Unknown config command: {subcmd}")
         print()
         print("Available commands:")
-        print("  hermes config           Show current configuration")
-        print("  hermes config edit      Open config in editor")
-        print("  hermes config set <key> <value>   Set a config value")
-        print("  hermes config check     Check for missing/outdated config")
-        print("  hermes config migrate   Update config with new options")
-        print("  hermes config path      Show config file path")
-        print("  hermes config env-path  Show .env file path")
+        print(f"  {cli_name()} config           Show current configuration")
+        print(f"  {cli_name()} config edit      Open config in editor")
+        print(f"  {cli_name()} config set <key> <value>   Set a config value")
+        print(f"  {cli_name()} config check     Check for missing/outdated config")
+        print(f"  {cli_name()} config migrate   Update config with new options")
+        print(f"  {cli_name()} config path      Show config file path")
+        print(f"  {cli_name()} config env-path  Show .env file path")
         sys.exit(1)
 
 

@@ -548,7 +548,8 @@ def cmd_setup(args) -> None:
         print("  Memory provider set to 'honcho' in config.yaml")
     except Exception as e:
         print(f"  Could not auto-enable in config.yaml: {e}")
-        print("  Run: hermes config set memory.provider honcho")
+        from hermes_cli.cli_name import cli_name
+        print(f"  Run: {cli_name()} config set memory.provider honcho")
 
     # --- Test connection ---
     print("  Testing connection... ", end="", flush=True)
@@ -1313,8 +1314,9 @@ def honcho_command(args) -> None:
     sub = getattr(args, "honcho_command", None)
     if sub == "setup":
         # Redirect to memory setup — honcho setup goes through the unified path
+        from hermes_cli.cli_name import cli_name
         print("\n  Honcho is configured via the memory provider system.")
-        print("  Running 'hermes memory setup'...\n")
+        print(f"  Running '{cli_name()} memory setup'...\n")
         from hermes_cli.memory_setup import cmd_setup_provider
         cmd_setup_provider("honcho")
         return

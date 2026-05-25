@@ -1147,10 +1147,11 @@ def interactive_setup() -> None:
         save_env_value("TEAMS_ALLOW_ALL_USERS", "true")
         print_warning("⚠️  Open access — anyone who can message the bot can command it.")
 
+    from hermes_cli.cli_name import cli_name
     print()
     print_success("Teams configuration saved to ~/.hermes/.env")
     print_info("Install the app in Teams:  teams app install --id <teamsAppId>")
-    print_info("Restart the gateway:       hermes gateway restart")
+    print_info(f"Restart the gateway:       {cli_name()} gateway restart")
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

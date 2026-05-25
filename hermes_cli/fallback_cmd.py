@@ -21,6 +21,8 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.cli_name import cli_name
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,7 +124,7 @@ def cmd_fallback_list(args) -> None:  # noqa: ARG001
     if not chain:
         print("  No fallback providers configured.")
         print()
-        print("  Add one with:  hermes fallback add")
+        print(f"  Add one with:  {cli_name()} fallback add")
         print()
         return
 
@@ -166,7 +168,7 @@ def cmd_fallback_add(args) -> None:
 
     print()
     print("  Adding a fallback provider.  The picker below is the same one used by")
-    print("  `hermes model` — select the provider + model you want as a fallback.")
+    print(f"  `{cli_name()} model` — select the provider + model you want as a fallback.")
     print()
 
     try:
@@ -228,7 +230,7 @@ def cmd_fallback_add(args) -> None:
     print(f"  Added fallback: {_format_entry(new_entry)}")
     print(f"  Chain is now {len(chain)} {'entry' if len(chain) == 1 else 'entries'} long.")
     print()
-    print("  Run `hermes fallback list` to view, or `hermes fallback remove` to delete.")
+    print(f"  Run `{cli_name()} fallback list` to view, or `{cli_name()} fallback remove` to delete.")
 
 
 def _restore_model_cfg(model_before: Any) -> None:

@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.cli_name import cli_name
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
 
@@ -1027,7 +1028,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         return 0
     # Human table: marker (•) for current, slug, display name, counts.
     if not boards:
-        print("(no boards — create one with `hermes kanban boards create <slug>`)")
+        print(f"(no boards — create one with `{cli_name()} kanban boards create <slug>`)")
         return 0
     print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
     for b in boards:
@@ -1044,7 +1045,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print()
     print(f"Current board: {current}")
     if len(boards) > 1:
-        print("Switch boards with `hermes kanban boards switch <slug>`.")
+        print(f"Switch boards with `{cli_name()} kanban boards switch <slug>`.")
     return 0
 
 
@@ -1073,7 +1074,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
     else:
-        print(f"  Use `hermes kanban boards switch {meta['slug']}` to make it current.")
+        print(f"  Use `{cli_name()} kanban boards switch {meta['slug']}` to make it current.")
     return 0
 
 
@@ -1235,10 +1236,10 @@ def _cmd_init(args: argparse.Namespace) -> int:
             print(f"  {name}")
     else:
         print("No profiles found under ~/.hermes/profiles/.")
-        print("Create one with `hermes -p <name> setup` before assigning tasks.")
+        print(f"Create one with `{cli_name()} -p <name> setup` before assigning tasks.")
     print()
     print("Next step: start the gateway so ready tasks actually get picked up.")
-    print("  hermes gateway start")
+    print(f"  {cli_name()} gateway start")
     print()
     print(
         "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
@@ -1270,7 +1271,7 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return 0
     if not data:
-        print("(no assignees — create a profile with `hermes -p <name> setup`)")
+        print(f"(no assignees — create a profile with `{cli_name()} -p <name> setup`)")
         return 0
     # Header
     print(f"{'NAME':20s}  {'ON DISK':8s}  COUNTS")

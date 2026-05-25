@@ -961,6 +961,9 @@ unset PYTHONPATH
 unset PYTHONHOME
 export HERMES_HOME="\${HERMES_HOME:-$HERMES_HOME}"
 export HERMES_PG_DSN="\${HERMES_PG_DSN:-$pg_dsn}"
+# Echo the user-facing launcher name into resume/setup hints. The venv
+# console script is itself named "hermes" so argv[0] can't carry this.
+export HERMES_CLI_NAME="\${HERMES_CLI_NAME:-$CLI_NAME}"
 exec "$HERMES_BIN" "\$@"
 EOF
     chmod +x "$link_dir/$CLI_NAME"

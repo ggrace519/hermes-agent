@@ -3109,9 +3109,10 @@ def interactive_setup() -> None:
     if home:
         save_env_value("GOOGLE_CHAT_HOME_CHANNEL", home.strip())
 
+    from hermes_cli.cli_name import cli_name
     print()
     print_success("Google Chat configuration saved to ~/.hermes/.env")
-    print_info("Restart the gateway: hermes gateway restart")
+    print_info(f"Restart the gateway: {cli_name()} gateway restart")
 
 
 # Strict resource-name pattern.  ``spaces/<id>`` and ``users/<id>`` must
