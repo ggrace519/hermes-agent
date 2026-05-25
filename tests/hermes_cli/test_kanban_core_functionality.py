@@ -31,7 +31,15 @@ from hermes_cli.kanban import run_slash
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+def kanban_home(tmp_path, monkeypatch, hermes_db_initialized_sync):
+    """Isolated HERMES_HOME with the kanban schema migrated.
+
+    Depends on ``hermes_db_initialized_sync`` so the PG pool is bound
+    to the persistent sync loop AND the schema is migrated before
+    ``kb.init_db()`` runs. Phase 0 moved kanban_db from SQLite to PG;
+    without the fixture the table lives in a fresh per-test PG
+    database that hasn't been migrated yet.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

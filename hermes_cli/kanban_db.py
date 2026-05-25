@@ -463,22 +463,73 @@ def _inject_board_slug(sql: str, sql_upper: str, params: list, board_slug: str) 
 # PG connect() entry point                                             #
 # ------------------------------------------------------------------ #
 
-@contextlib.contextmanager
-def _pg_connect(board_slug: str) -> "_PgConnection":
-    """Open a PG connection scoped to board_slug.
+class _PgConnectionHandle:
+    """Public connect() return value — works as both context manager
+    AND a directly-usable connection.
 
-    All async operations run via hermes_db.run_sync so they share the same
-    event loop that owns the pool.  This satisfies asyncpg's requirement
-    that connections are only used from the loop they were created on.
+    The contextmanager form (``with connect() as conn:``) acquires the
+    pool connection on enter and releases on exit. The direct form
+    (``conn = connect(); ... conn.close()``) exists for pre-Phase-0
+    test code written against the SQLite ``sqlite3.Connection`` API
+    that didn't use ``with``. Both call paths release the raw asyncpg
+    connection back to the pool exactly once via ``close()``; double-
+    close is a no-op.
+
+    Delegates attribute access to the inner ``_PgConnection`` so
+    callers can use ``conn.execute(...)`` etc. directly without
+    entering the context manager.
     """
-    import hermes_db
 
-    raw_conn = hermes_db.run_sync(hermes_db.pool().acquire())
-    try:
-        pg_conn = _PgConnection(raw_conn, board_slug)
-        yield pg_conn
-    finally:
-        hermes_db.run_sync(hermes_db.pool().release(raw_conn))
+    def __init__(self, board_slug: str) -> None:
+        import hermes_db
+
+        self._hermes_db = hermes_db
+        self._raw_conn = hermes_db.run_sync(hermes_db.pool().acquire())
+        self._inner = _PgConnection(self._raw_conn, board_slug)
+        self._closed = False
+
+    def __enter__(self) -> "_PgConnection":
+        return self._inner
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Release the underlying asyncpg connection back to the pool.
+        Idempotent — safe to call from both the ``__exit__`` path and
+        from explicit pre-Phase-0 ``conn.close()`` test code."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._hermes_db.run_sync(
+                self._hermes_db.pool().release(self._raw_conn)
+            )
+        except Exception:
+            # Pool may already be closed (e.g. test teardown order); the
+            # raw connection will be reclaimed by GC. Don't crash the
+            # caller's finally block.
+            pass
+
+    def __getattr__(self, name: str):
+        # Delegate ``conn.execute(...)`` / ``conn.executemany(...)`` /
+        # ``conn.fetchone()`` etc. to the inner _PgConnection. Triggered
+        # only when name not found on _PgConnectionHandle directly, so
+        # ``close`` and ``__enter__`` aren't intercepted.
+        return getattr(self._inner, name)
+
+
+def _pg_connect(board_slug: str) -> "_PgConnectionHandle":
+    """Open a PG connection scoped to ``board_slug``.
+
+    Returns a ``_PgConnectionHandle`` that supports both
+    ``with connect() as conn:`` AND ``conn = connect(); ... conn.close()``
+    usage patterns. All async operations run via hermes_db.run_sync so
+    they share the same event loop that owns the pool — asyncpg's
+    requirement that connections only be used from their owning loop.
+    """
+    return _PgConnectionHandle(board_slug)
 
 
 # ---------------------------------------------------------------------------
