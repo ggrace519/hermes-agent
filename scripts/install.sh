@@ -835,7 +835,7 @@ run_migrations() {
     log_info "Running Alembic migrations against:"
     log_info "  $dsn"
     cd "$INSTALL_DIR"
-    if HERMES_PG_DSN="$dsn" ./venv/bin/alembic upgrade head; then
+    if HERMES_PG_DSN="$dsn" ./venv/bin/alembic -c migrations/alembic.ini upgrade head; then
         log_success "Substrate schema migrated to head"
     else
         log_error "Alembic upgrade failed"
