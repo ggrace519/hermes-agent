@@ -67,13 +67,55 @@ def _get_sync_loop() -> asyncio.AbstractEventLoop:
 
 
 async def _setup_jsonb_codec(conn):
-    """Register JSONB codec so asyncpg returns Python objects for jsonb columns."""
+    """Register JSONB codec so asyncpg returns Python objects for jsonb columns.
+
+    Also registers a text-format codec for the pgvector ``vector`` type so
+    asyncpg round-trips ``vector(N)`` columns as ``list[float]`` (Phase C —
+    used by ``substrate_slices.embedding``). The vector extension may not
+    be enabled yet on every database (pre-Phase-C deployments); we probe
+    for it and skip registration silently if absent. This keeps the pool
+    init path safe to run against older Alembic heads.
+    """
     await conn.set_type_codec(
         "jsonb",
         encoder=json.dumps,
         decoder=json.loads,
         schema="pg_catalog",
     )
+    # Vector codec: optional. Skip when the extension isn't installed
+    # (older deployments). Encoder formats as "[x,y,z,...]" — pgvector's
+    # text input format. Decoder strips the brackets and splits on
+    # commas. ~10 lines; no Python `pgvector` package required.
+    try:
+        await conn.set_type_codec(
+            "vector",
+            encoder=_encode_vector,
+            decoder=_decode_vector,
+            schema="public",
+            format="text",
+        )
+    except asyncpg.exceptions.UndefinedObjectError:
+        # Vector type isn't registered on this DB; skip silently. The
+        # substrate recall pipeline will fail loudly when it tries to
+        # write embeddings, which is the right place for the error.
+        pass
+
+
+def _encode_vector(vec) -> str:
+    """Encode a Python sequence of floats as pgvector's text input
+    format, e.g. ``[0.1,0.2,0.3]``. Uses ``repr(float(x))`` so floats
+    round-trip without rounding (Python's repr is exact for floats)."""
+    return "[" + ",".join(repr(float(x)) for x in vec) + "]"
+
+
+def _decode_vector(s: str) -> list:
+    """Decode pgvector's text output ``[x,y,z,...]`` into a list of
+    Python floats. asyncpg passes the raw string; we strip brackets and
+    split."""
+    inner = s.strip().strip("[]")
+    if not inner:
+        return []
+    return [float(x) for x in inner.split(",")]
 
 
 async def init(
