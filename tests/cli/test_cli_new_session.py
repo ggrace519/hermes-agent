@@ -6,9 +6,10 @@ import importlib
 import os
 import sys
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from hermes_state import SessionDB
+from tests._helpers.sync_session_db import SyncSessionDB
 from tools.todo_tool import TodoStore
 
 
@@ -119,10 +120,22 @@ def _make_cli(env_overrides=None, config_overrides=None, **kwargs):
             return _cli_mod.HermesCLI(**kwargs)
 
 
-def _prepare_cli_with_active_session(tmp_path):
+def _prepare_cli_with_active_session(tmp_path, *, hermes_db_initialized_sync=None):
+    """Return (cli, sync_db) — production-shaped async DB on the CLI,
+    plus a sync wrapper for test-body assertions.
+
+    Phase 0 moved sessions from SQLite to PG: ``SessionDB`` is now an
+    alias for ``_AsyncSessionDB``, so every method returns a coroutine.
+    Production code in ``cli.py`` drives them through
+    ``hermes_db.run_sync``; test bodies use the ``SyncSessionDB`` shim
+    so they can write the same ``db.get_session(id)["end_reason"]``
+    pattern they used to.
+    """
     cli = _make_cli()
-    cli._session_db = SessionDB(db_path=tmp_path / "state.db")
-    cli._session_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
+    async_db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db = async_db
+    sync_db = SyncSessionDB(async_db)
+    sync_db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
 
     cli.agent = _FakeAgent(cli.session_id, cli.session_start)
     cli.conversation_history = [{"role": "user", "content": "hello"}]
@@ -135,11 +148,11 @@ def _prepare_cli_with_active_session(tmp_path):
     # the new-session mechanics, not the confirm prompt itself (covered in
     # tests/cli/test_destructive_slash_confirm.py).
     cli._confirm_destructive_slash = lambda *_a, **_kw: "once"
-    return cli
+    return cli, sync_db
 
 
-def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path):
-    cli = _prepare_cli_with_active_session(tmp_path)
+def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path, hermes_db_initialized_sync):
+    cli, sync_db = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
     old_session_start = cli.session_start
 
@@ -147,14 +160,14 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
 
     assert cli.session_id != old_session_id
 
-    old_session = cli._session_db.get_session(old_session_id)
+    old_session = sync_db.get_session(old_session_id)
     assert old_session is not None
     assert old_session["end_reason"] == "new_session"
 
-    new_session = cli._session_db.get_session(cli.session_id)
+    new_session = sync_db.get_session(cli.session_id)
     assert new_session is not None
 
-    cli._session_db.append_message(cli.session_id, role="user", content="next turn")
+    sync_db.append_message(cli.session_id, role="user", content="next turn")
 
     assert cli.agent.session_id == cli.session_id
     assert cli.agent._last_flushed_db_idx == 0
@@ -164,19 +177,19 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
-def test_reset_command_is_alias_for_new_session(tmp_path):
-    cli = _prepare_cli_with_active_session(tmp_path)
+def test_reset_command_is_alias_for_new_session(tmp_path, hermes_db_initialized_sync):
+    cli, sync_db = _prepare_cli_with_active_session(tmp_path)
     old_session_id = cli.session_id
 
     cli.process_command("/reset")
 
     assert cli.session_id != old_session_id
-    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
-    assert cli._session_db.get_session(cli.session_id) is not None
+    assert sync_db.get_session(old_session_id)["end_reason"] == "new_session"
+    assert sync_db.get_session(cli.session_id) is not None
 
 
-def test_clear_command_starts_new_session_before_redrawing(tmp_path):
-    cli = _prepare_cli_with_active_session(tmp_path)
+def test_clear_command_starts_new_session_before_redrawing(tmp_path, hermes_db_initialized_sync):
+    cli, sync_db = _prepare_cli_with_active_session(tmp_path)
     cli.console = MagicMock()
     cli.show_banner = MagicMock()
 
@@ -184,16 +197,16 @@ def test_clear_command_starts_new_session_before_redrawing(tmp_path):
     cli.process_command("/clear")
 
     assert cli.session_id != old_session_id
-    assert cli._session_db.get_session(old_session_id)["end_reason"] == "new_session"
-    assert cli._session_db.get_session(cli.session_id) is not None
+    assert sync_db.get_session(old_session_id)["end_reason"] == "new_session"
+    assert sync_db.get_session(cli.session_id) is not None
     cli.console.clear.assert_called_once()
     cli.show_banner.assert_called_once()
     assert cli.conversation_history == []
 
 
-def test_new_session_resets_token_counters(tmp_path):
+def test_new_session_resets_token_counters(tmp_path, hermes_db_initialized_sync):
     """Regression test for #2099: /new must zero all token counters."""
-    cli = _prepare_cli_with_active_session(tmp_path)
+    cli, _sync_db = _prepare_cli_with_active_session(tmp_path)
 
     # Verify counters are non-zero before reset
     agent = cli.agent
@@ -226,17 +239,42 @@ def test_new_session_resets_token_counters(tmp_path):
     assert comp._context_probed is False
 
 
+def _make_async_session_db_mock(**overrides):
+    """Build a SessionDB mock whose async methods are AsyncMock so
+    ``hermes_db.run_sync(db.method(...))`` doesn't raise
+    ``TypeError: An asyncio.Future, a coroutine or an awaitable is required``.
+    """
+    mock_db = MagicMock()
+    for method in (
+        "get_session",
+        "get_messages_as_conversation",
+        "resolve_resume_session_id",
+        "reopen_session",
+        "set_session_title",
+        "create_session",
+        "end_session",
+        "append_message",
+        "get_meta",
+        "set_meta",
+    ):
+        setattr(mock_db, method, AsyncMock())
+    for k, v in overrides.items():
+        setattr(mock_db, k, v)
+    return mock_db
+
+
 def test_new_session_with_title(capsys):
     """new_session(title=...) creates a session and sets the title."""
     cli = _make_cli()
-    cli._session_db = MagicMock()
+    cli._session_db = _make_async_session_db_mock()
     cli.agent = _FakeAgent("old_session_id", datetime.now())
     cli.conversation_history = []
 
     cli.new_session(title="My Test Session")
 
-    # Assert set_session_title was called with the new session ID and sanitized title
-    cli._session_db.set_session_title.assert_called_once()
+    # Assert set_session_title was awaited with the new session ID and
+    # sanitized title — Phase 0 moved set_session_title to an async coroutine.
+    cli._session_db.set_session_title.assert_awaited_once()
     call_args = cli._session_db.set_session_title.call_args
     assert call_args[0][0] == cli.session_id
     assert call_args[0][1] == "My Test Session"
@@ -252,9 +290,12 @@ def test_new_session_with_duplicate_title_surfaces_error(capsys):
     must not claim the rejected title as the session name.
     """
     cli = _make_cli()
-    cli._session_db = MagicMock()
-    cli._session_db.set_session_title.side_effect = ValueError(
-        "Title 'Dup' is already in use by session abc-123"
+    cli._session_db = _make_async_session_db_mock(
+        set_session_title=AsyncMock(
+            side_effect=ValueError(
+                "Title 'Dup' is already in use by session abc-123"
+            )
+        )
     )
     cli.agent = _FakeAgent("old_session_id", datetime.now())
     cli.conversation_history = []
@@ -271,7 +312,7 @@ def test_new_session_with_duplicate_title_surfaces_error(capsys):
     finally:
         method_globals["_cprint"] = original
 
-    cli._session_db.set_session_title.assert_called_once()
+    cli._session_db.set_session_title.assert_awaited_once()
     joined = "\n".join(warnings)
     assert "already in use" in joined
     assert "session started untitled" in joined

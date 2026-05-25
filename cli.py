@@ -1089,15 +1089,16 @@ def _run_state_db_auto_maintenance(session_db) -> None:
     try:
         from hermes_cli.config import load_config as _load_full_config
         from hermes_constants import get_hermes_home as _get_hermes_home
+        import hermes_db as _hermes_db
         _hermes_home_maint = _get_hermes_home()
 
         # One-time prune of empty TUI ghost sessions.
         try:
-            if not session_db.get_meta("ghost_session_prune_v1"):
-                pruned = session_db.prune_empty_ghost_sessions(
+            if not _hermes_db.run_sync(session_db.get_meta("ghost_session_prune_v1")):
+                pruned = _hermes_db.run_sync(session_db.prune_empty_ghost_sessions(
                     sessions_dir=_hermes_home_maint / "sessions"
-                )
-                session_db.set_meta("ghost_session_prune_v1", "1")
+                ))
+                _hermes_db.run_sync(session_db.set_meta("ghost_session_prune_v1", "1"))
                 if pruned:
                     logger.info("Pruned %d empty TUI ghost sessions", pruned)
         except Exception as _prune_exc:
@@ -1105,9 +1106,9 @@ def _run_state_db_auto_maintenance(session_db) -> None:
 
         # One-time finalize of orphaned compression continuations (#20001).
         try:
-            if not session_db.get_meta("orphaned_compression_finalize_v1"):
-                finalized = session_db.finalize_orphaned_compression_sessions()
-                session_db.set_meta("orphaned_compression_finalize_v1", "1")
+            if not _hermes_db.run_sync(session_db.get_meta("orphaned_compression_finalize_v1")):
+                finalized = _hermes_db.run_sync(session_db.finalize_orphaned_compression_sessions())
+                _hermes_db.run_sync(session_db.set_meta("orphaned_compression_finalize_v1", "1"))
                 if finalized:
                     logger.info(
                         "Finalized %d orphaned compression sessions", finalized
@@ -1118,12 +1119,12 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         cfg = (_load_full_config().get("sessions") or {})
         if not cfg.get("auto_prune", False):
             return
-        session_db.maybe_auto_prune_and_vacuum(
+        _hermes_db.run_sync(session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
             vacuum=bool(cfg.get("vacuum_after_prune", True)),
             sessions_dir=_hermes_home_maint / "sessions",
-        )
+        ))
     except Exception as exc:
         logger.debug("state.db auto-maintenance skipped: %s", exc)
 
