@@ -24,8 +24,18 @@ def _mock_agent():
 
 
 @pytest.fixture()
-def manager():
-    """SessionManager with a mock agent factory (avoids needing API keys)."""
+def manager(hermes_db_initialized_sync):
+    """SessionManager with a mock agent factory (avoids needing API keys).
+
+    Depends on ``hermes_db_initialized_sync`` so the per-test PG database
+    is created (Alembic upgrade head) and the asyncpg pool is bound to
+    the persistent sync loop BEFORE any test body or production code in
+    ``SessionManager._get_db`` calls ``hermes_db.ensure_pool_sync()``.
+    Without this dependency the manager's lazy ``_get_db`` may bind the
+    pool to a stale or wrong DSN — leaving the test connected to a
+    database where Alembic never ran and producing
+    ``UndefinedTableError: relation "sessions" does not exist``.
+    """
     return SessionManager(agent_factory=_mock_agent)
 
 
