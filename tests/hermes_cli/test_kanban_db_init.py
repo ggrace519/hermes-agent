@@ -3,9 +3,18 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 
 
+@pytest.mark.skip(
+    reason="Phase 0 (sqlite→PG): _INITIALIZED_PATHS was a per-file schema-init "
+    "cache for sqlite kanban.db files. In PG mode the schema lives in "
+    "Alembic-managed migrations on a single database — no per-board init "
+    "concurrency to test. The assertion ``conn.execute('PRAGMA table_info(tasks)')`` "
+    "is also sqlite-specific; the PG _PgConnection raises on unknown PRAGMA."
+)
 def test_connect_initialization_is_thread_safe(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
