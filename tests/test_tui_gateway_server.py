@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import sys
@@ -7,7 +8,43 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tui_gateway import server
+
+
+@pytest.fixture(autouse=True)
+def _pass_through_run_sync_for_sync_mocks(monkeypatch):
+    """Make ``hermes_db.run_sync`` accept the sync mock returns this file uses.
+
+    Phase 0 turned every ``SessionDB`` method into an async coroutine, and
+    ``tui_gateway.server`` correspondingly wraps every DB call with
+    ``_hermes_db.run_sync(db.<method>(...))``. The 20+ ``FakeDB`` classes
+    in this file are sync — their methods return plain dicts / lists, not
+    coroutines — so the production wrapper crashes with ``TypeError: An
+    asyncio.Future, a coroutine or an awaitable is required`` before the
+    test body's assertions can run.
+
+    Rewriting every FakeDB to be async (or constructing a per-test PG
+    ``_AsyncSessionDB``) would be a deeper port than the property under
+    test warrants — these tests exercise ``handle_request`` routing and
+    session-title queuing logic, not the SessionDB itself. Instead,
+    monkeypatch ``run_sync`` so it pass-through-returns the value when
+    the input isn't actually awaitable. Real coroutines still go through
+    the real ``run_sync`` (so any test that *does* return a coroutine,
+    e.g. an ``async def`` mock or a production code path under test,
+    keeps its existing semantics).
+    """
+    import hermes_db
+
+    real_run_sync = hermes_db.run_sync
+
+    def _passthrough(value):
+        if inspect.iscoroutine(value) or inspect.isawaitable(value):
+            return real_run_sync(value)
+        return value
+
+    monkeypatch.setattr(hermes_db, "run_sync", _passthrough)
 
 
 class _ChunkyStdout:
