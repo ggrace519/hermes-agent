@@ -149,7 +149,14 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 # older revision (unless ``HERMES_AUTO_MIGRATE=1``). When a future revision
 # (Phase B+) lands, add it here AND keep the substrate code able to boot
 # against the prior head until the new schema is required.
-_EXPECTED_REVISIONS = frozenset({"20260523_0003"})
+#
+# - ``20260523_0003`` — Phase A substrate skeleton (the schema this code
+#   actually depends on).
+# - ``20260524_0004`` — kanban board metadata columns (PR #16). Strictly
+#   additive — no substrate-owned tables touched — so the substrate is
+#   safe to boot against it. Listed so the head check stops rejecting
+#   freshly-migrated databases.
+_EXPECTED_REVISIONS = frozenset({"20260523_0003", "20260524_0004"})
 
 
 # Shutdown timeout — Phase A spec §8.2.

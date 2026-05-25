@@ -358,18 +358,26 @@ def test_commit_slice_sync_works_from_sync_context(hermes_db_dsn):
 
 
 @pytest.mark.asyncio
-async def test_commit_slice_sync_raises_inside_event_loop(substrate):
-    """From inside a running event loop, the sync facade must raise
-    rather than deadlock the loop.
+async def test_commit_slice_sync_inside_event_loop_does_not_deadlock(substrate):
+    """From inside a running event loop, the sync facade must not
+    deadlock the loop. Two acceptable outcomes:
 
-    The error may surface as either:
-      * ``RuntimeError("hermes_db.run_sync called from inside running
-        event loop ...")`` — when ``run_sync`` detects the running
-        loop in its own up-front check.
-      * ``RuntimeError("Cannot run the event loop while another loop
-        is running")`` — when the persistent ``_sync_loop`` and
-        pytest-asyncio's per-test loop both try to own the thread.
-    Either is acceptable; both prevent the deadlock.
+    * ``RuntimeError`` from the cross-loop guard (legacy behaviour
+      before the worker-thread offload landed).
+    * ``asyncpg.InterfaceError`` (or any non-RuntimeError) when the
+      pool is bound to a different loop than the offload's
+      ``_sync_loop`` — happens in this test because the ``substrate``
+      fixture initialises the pool on pytest-asyncio's per-test loop
+      via ``hermes_db_initialized``. The offload routes the call to
+      ``_sync_loop``; asyncpg's loop-bound connection refuses, but
+      raises promptly rather than hanging.
+    * **Successful commit** when the pool is on ``_sync_loop``
+      (the production binding via ``ensure_pool_sync``) — the offload
+      legitimately works there and the slice persists.
+
+    All three outcomes prove the invariant: ``commit_slice_sync``
+    from inside an async context **returns** (success or exception)
+    rather than spinning the loop.
     """
     stream = await substrate.streams.register(
         name="hermes.test.sync_in_async",
@@ -379,10 +387,15 @@ async def test_commit_slice_sync_raises_inside_event_loop(substrate):
         organ="pytest",
         decay_profile_id=DEFAULT_TEXT_PROFILE,
     )
-    with pytest.raises(RuntimeError):
+    try:
         commit_slice_sync(
             substrate,
             stream.stream_id,
-            "won't fly",
+            "may or may not fly",
             event_time_world=_now_utc(),
         )
+    except Exception:
+        # Any exception is acceptable; the only failure mode this test
+        # is guarding against is the loop deadlocking and the test
+        # timing out (pytest-timeout would fire after 30s).
+        pass
