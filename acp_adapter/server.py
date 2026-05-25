@@ -714,7 +714,14 @@ class HermesACPAgent(acp.Agent):
         if not self._conn:
             return
         try:
-            row = self.session_manager._get_db().get_session(session_id)
+            db = self.session_manager._get_db()
+            if db is None:
+                return
+            # Phase 0: _AsyncSessionDB.get_session is a coroutine. We're
+            # already in an async context — await directly. The legacy
+            # SQLite SessionDB returned the row synchronously, which is
+            # why the bare call used to work.
+            row = await db.get_session(session_id)
         except Exception:
             logger.debug("Could not read ACP session info for %s", session_id, exc_info=True)
             return
