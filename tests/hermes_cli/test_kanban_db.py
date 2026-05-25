@@ -1819,11 +1819,26 @@ class TestSharedBoardPaths:
         assert kb.kanban_home() == default_home
 
     def test_dispatcher_and_worker_share_a_real_database(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, hermes_db_initialized_sync
     ):
         # Belt-and-suspenders: round-trip a task across the two
-        # HERMES_HOME perspectives via a real SQLite file. Without the
-        # fix the worker would open a different file and see no rows.
+        # HERMES_HOME perspectives. Under sqlite this proved the two
+        # processes opened the same on-disk file; under PG the two
+        # ``kb.connect()`` calls dispatch through the same shared
+        # ``hermes_db`` pool, so the property under test becomes "the
+        # dispatcher's row is visible to the worker after a HERMES_HOME
+        # swap" — still the regression that originally motivated the
+        # test.
+        #
+        # ``hermes_db_initialized_sync`` is required so the per-test PG
+        # database has the kanban schema migrated AND the asyncpg pool
+        # is bound to *that* database before ``kb.init_db()`` runs. With-
+        # out it, the test inherits whichever DSN was last on the env
+        # and either (a) crashes with ``relation "kanban_boards" does
+        # not exist`` against the unmigrated shared compose DB, or
+        # (b) writes its row into the wrong DB and poisons the next
+        # test that calls ``ensure_pool_sync`` (which short-circuits
+        # on ``_pool is not None``).
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
         profile_home = default_home / "profiles" / "nehemiahkanban"
