@@ -12,16 +12,32 @@ transactions so a partial failure leaves the others intact. Audit
 emissions run **after** the relevant transaction commits — a slow audit
 emit doesn't extend the lock window on ``substrate_slices``.
 
+**Phase C extension** (spec §5.7): the Curator also emits embeddings
+for unembedded passed slices once per cycle. This is the backfill path
+that keeps ``substrate_slices.embedding`` coverage climbing toward
+100% — recall against missing-embedding slices falls back to keyword
+Jaccard, so embedding-emit is an eventually-consistent optimisation,
+not a correctness gate. Failures (API down, mis-encoded payload) are
+logged and the slice retried up to ``RECALL_EMBEDDING_BACKFILL_MAX_RETRIES``
+times before being persistently marked failed.
+
 See [Phase B spec](https://github.com/ggrace519/llm-cognitive-thought/blob/main/docs/superpowers/specs/2026-05-25-phase-b-curator.md)
-§4 (Curator's loop), §6 (release), §7 (self-state emission).
+§4 (Curator's loop), §6 (release), §7 (self-state emission), and
+[Phase C spec](https://github.com/ggrace519/llm-cognitive-thought/blob/main/docs/superpowers/specs/2026-05-25-phase-c-recall.md)
+§5.7 (embedding-emit pipeline).
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from substrate.agents.base import Level, SubAgent
+# Module-level import so tests can monkeypatch
+# substrate.agents.curator.embed for the embedding-emit failure cases.
+from substrate.recall.embeddings import embed
 
 if TYPE_CHECKING:  # pragma: no cover
     from substrate.facade import Substrate
@@ -57,6 +73,16 @@ class Curator(SubAgent):
         # LOW; the assertive assignment here is forward-defensive against
         # future base-class default changes.
         self._level = Level.LOW
+        # Phase C: per-slice retry counter for the embedding-emit loop.
+        # In-process dict keyed by slice_id; bounded only by the
+        # max-retries cap (failed slices get persisted into metadata
+        # and then dropped from list_unembedded, so the dict naturally
+        # caps).
+        self._embed_failure_counts: dict[UUID, int] = {}
+        # Track wall-clock of the last embedding backfill cycle so we
+        # respect RECALL_EMBEDDING_BACKFILL_INTERVAL_S regardless of
+        # how fast the Curator's main tick cadence is.
+        self._last_embed_backfill_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Intensity floor — Phase B spec §8.3.
@@ -109,6 +135,10 @@ class Curator(SubAgent):
         await self._emit_release_audit(released)
         alarmed = await self._alarm_pathological()
         await self._emit_alarm_audit(alarmed)
+        # Phase C: embedding backfill — guarded by its own interval so
+        # the Curator's main tick can run faster without hammering the
+        # embedding API.
+        await self._maybe_emit_embeddings()
 
     # ------------------------------------------------------------------
     # Decay — Phase B spec §4 + archived plan Task 5.2.
@@ -270,6 +300,118 @@ class Curator(SubAgent):
                 )
         return alarmed
 
+    # ------------------------------------------------------------------
+    # Phase C: embedding emit (spec §5.7).
+    # ------------------------------------------------------------------
+
+    async def _maybe_emit_embeddings(self) -> None:
+        """Run the embedding-backfill batch if enough wall-clock time
+        has passed since the last cycle. ``RECALL_EMBEDDING_BACKFILL_INTERVAL_S``
+        is the gate; the Curator's main tick cadence may be faster."""
+        from substrate import config as _cfg
+
+        now = time.monotonic()
+        if (now - self._last_embed_backfill_at) < _cfg.RECALL_EMBEDDING_BACKFILL_INTERVAL_S:
+            return
+        self._last_embed_backfill_at = now
+        await self._emit_embeddings_for_unembedded()
+
+    async def _emit_embeddings_for_unembedded(self) -> None:
+        """One backfill pass: read up to ``RECALL_EMBEDDING_BACKFILL_BATCH_SIZE``
+        unembedded passed slices, batch-call the embedding client,
+        persist each result via ``SliceRepo.set_embedding``.
+
+        Per-slice failures (None vector returned, or set_embedding
+        raised) increment the in-process retry counter; once a slice
+        hits ``RECALL_EMBEDDING_BACKFILL_MAX_RETRIES`` consecutive
+        failures it's marked ``embedding_failed=true`` in metadata and
+        the next ``list_unembedded`` excludes it.
+        """
+        from substrate import config as _cfg
+
+        import hermes_db
+
+        async with hermes_db.connection() as conn:
+            rows = await self._substrate.slices.list_unembedded(
+                conn, limit=_cfg.RECALL_EMBEDDING_BATCH_SIZE
+            )
+        if not rows:
+            return
+
+        texts = [_extract_text_for_embedding(r["payload"]) for r in rows]
+        try:
+            vectors = await embed(
+                texts,
+                model=_cfg.RECALL_EMBEDDING_MODEL,
+                timeout_ms=_cfg.RECALL_EMBEDDING_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            self._log.warning("curator embed batch raised: %s", exc)
+            # Whole-batch failure: bump each slice's retry counter.
+            for r in rows:
+                self._record_embed_failure(r["slice_id"])
+            await self._persist_failures_if_maxed(rows)
+            return
+
+        async with hermes_db.connection() as conn:
+            async with conn.transaction():
+                for row, vec in zip(rows, vectors):
+                    if vec is None:
+                        self._record_embed_failure(row["slice_id"])
+                        continue
+                    try:
+                        await self._substrate.slices.set_embedding(
+                            conn, row["slice_id"], vec
+                        )
+                        self._reset_embed_failure(row["slice_id"])
+                    except Exception as exc:
+                        self._log.warning(
+                            "curator set_embedding for %s failed: %s",
+                            row["slice_id"],
+                            exc,
+                        )
+                        self._record_embed_failure(row["slice_id"])
+            # Persist failures outside the embedding transaction so a
+            # bad slice can't block the rest of the batch from landing.
+            await self._persist_failures_if_maxed(rows)
+
+    def _record_embed_failure(self, slice_id: UUID) -> None:
+        self._embed_failure_counts[slice_id] = (
+            self._embed_failure_counts.get(slice_id, 0) + 1
+        )
+
+    def _reset_embed_failure(self, slice_id: UUID) -> None:
+        self._embed_failure_counts.pop(slice_id, None)
+
+    async def _persist_failures_if_maxed(self, rows: list[dict]) -> None:
+        """For each slice whose failure count has reached the cap,
+        persist metadata.embedding_failed=true and drop the in-process
+        counter."""
+        from substrate import config as _cfg
+
+        import hermes_db
+
+        to_persist: list[UUID] = []
+        cap = _cfg.RECALL_EMBEDDING_BACKFILL_MAX_RETRIES
+        for r in rows:
+            sid = r["slice_id"]
+            count = self._embed_failure_counts.get(sid, 0)
+            if count >= cap:
+                to_persist.append(sid)
+        if not to_persist:
+            return
+        async with hermes_db.transaction() as conn:
+            for sid in to_persist:
+                try:
+                    await self._substrate.slices.mark_embedding_failed(conn, sid)
+                except Exception as exc:
+                    self._log.warning(
+                        "mark_embedding_failed for %s raised: %s", sid, exc
+                    )
+                # Drop the counter regardless — the DB marker is now
+                # authoritative for whether this slice gets retried.
+                self._embed_failure_counts.pop(sid, None)
+
     async def _emit_alarm_audit(self, alarmed: list[dict]) -> None:
         """Emit one ``curator.pathological_forgetting_alarm`` slice on
         ``substrate.self_state`` per alarmed slice."""
@@ -304,6 +446,38 @@ class Curator(SubAgent):
                 event_time_world=now,
                 metadata={"agent": "curator"},
             )
+
+
+def _extract_text_for_embedding(payload) -> str:
+    """Best-effort text extraction for the embedding API.
+
+    * ``str`` (already-unwrapped text-modality payload) passes through.
+    * ``{"text": "..."}`` (text-modality JSONB envelope from the L0
+      writer) unwraps to bare string.
+    * Other dicts (structured events) are JSON-serialised with
+      deterministic key ordering so retries on the same payload
+      embed identical text.
+    * Anything else is str()'d as a fallback.
+
+    Empty / whitespace-only output is allowed — the embedding API
+    handles short strings; the result will be a degenerate but unit
+    vector. The recall pipeline degrades gracefully (cosine of a
+    degenerate vector against any query is just whatever the model
+    produces; the ranker handles it).
+    """
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        text_field = payload.get("text")
+        if isinstance(text_field, str):
+            return text_field
+        import json
+
+        try:
+            return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            return str(payload)
+    return str(payload)
 
 
 __all__ = ["Curator"]

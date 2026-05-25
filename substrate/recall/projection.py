@@ -20,6 +20,7 @@ import string
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional, Union
+from uuid import UUID
 
 if TYPE_CHECKING:  # pragma: no cover
     from substrate.storage.types import Address
@@ -35,6 +36,11 @@ if TYPE_CHECKING:  # pragma: no cover
 class RecallCandidate:
     """One slice candidate returned by ``SliceRepo.recall_window``.
 
+    ``slice_id`` is the UUID primary key — uniquely identifies the
+    slice (Address triples can collide when multiple slices share the
+    same stream + event time, e.g. duplicate user messages emitted in
+    the same tick).
+
     ``payload`` is already decoded — text-modality slices arrive with
     ``{"text": ...}`` unwrapped to the bare string; structured-event
     payloads stay as dicts. ``embedding`` is the 1536-d vector when
@@ -42,6 +48,7 @@ class RecallCandidate:
     handles per-candidate fallback to keyword Jaccard.
     """
 
+    slice_id: UUID
     address: "Address"
     stream_name: str
     payload: Union[str, dict]

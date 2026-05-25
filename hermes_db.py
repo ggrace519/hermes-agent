@@ -94,10 +94,13 @@ async def _setup_jsonb_codec(conn):
             schema="public",
             format="text",
         )
-    except asyncpg.exceptions.UndefinedObjectError:
+    except (asyncpg.exceptions.UndefinedObjectError, ValueError):
         # Vector type isn't registered on this DB; skip silently. The
         # substrate recall pipeline will fail loudly when it tries to
         # write embeddings, which is the right place for the error.
+        # asyncpg raises ValueError("unknown type: public.vector") when
+        # introspection finds no matching entry in pg_type — older
+        # deployments that haven't run the Phase C migration yet.
         pass
 
 

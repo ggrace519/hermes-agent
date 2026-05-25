@@ -551,6 +551,7 @@ class SliceRepo:
                 payload = payload["text"]
             candidates.append(
                 RecallCandidate(
+                    slice_id=r["slice_id"],
                     address=Address(
                         stream_id=r["stream_id"],
                         time_start_world=r["time_start_world"],

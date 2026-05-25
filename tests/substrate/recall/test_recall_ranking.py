@@ -34,6 +34,7 @@ def _candidate(
 ) -> RecallCandidate:
     now = t_now or datetime.now(timezone.utc)
     return RecallCandidate(
+        slice_id=uuid4(),
         address=_addr(),
         stream_name="test.stream",
         payload=payload,

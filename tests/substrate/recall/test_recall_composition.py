@@ -19,6 +19,7 @@ from substrate.storage.types import Address
 def _candidate(payload, *, stream: str = "test.stream") -> RecallCandidate:
     now = datetime.now(timezone.utc)
     return RecallCandidate(
+        slice_id=uuid4(),
         address=Address(uuid4(), now, now),
         stream_name=stream,
         payload=payload,

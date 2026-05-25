@@ -199,6 +199,11 @@ class Substrate:
         self._subagents: dict[str, "object"] = {}
         self._conductor: Optional["object"] = None
 
+        # Phase C: recall log writer. Lazy-attached at boot; tests that
+        # build via ``from_pool`` get ``None`` (the recall API's
+        # ``_safe_enqueue_log`` swallows that case).
+        self.recall_log: Optional["object"] = None
+
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
@@ -286,6 +291,19 @@ class Substrate:
 
             substrate._conductor = StubConductor(substrate)
 
+        # 5b. Phase C: start the recall log writer. Lives alongside the
+        # sub-agents but isn't a SubAgent itself (no tick body — pure
+        # drain loop). Started even when start_subagents=False because
+        # tests that exercise recall() against ``from_pool`` substrates
+        # still want the log writer attached so enqueue() works.
+        from substrate.recall.log import RecallLogWriter
+        from substrate import config as _cfg
+
+        substrate.recall_log = RecallLogWriter(
+            substrate, max_queue_depth=_cfg.RECALL_LOG_QUEUE_DEPTH
+        )
+        substrate.recall_log.start()
+
         # 6. Bind hook module to this substrate instance.
         from substrate.events import hermes_hooks
 
@@ -329,6 +347,16 @@ class Substrate:
             )
             self._subagents.clear()
         self._conductor = None
+
+        # Phase C: stop the recall log writer. In-flight queue contents
+        # are dropped (per the spec — substrate shutdown is bounded).
+        if self.recall_log is not None:
+            try:
+                await self.recall_log.stop()
+            except Exception as exc:
+                self.log.warning("recall_log.stop failed: %s", exc)
+            self.recall_log = None
+
         self.log.info("substrate.shutdown.ok")
 
     # ------------------------------------------------------------------
