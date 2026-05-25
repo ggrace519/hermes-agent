@@ -52,8 +52,19 @@ def _truncate_session_tables() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_acp_session_db():
-    """Per-test cleanup: wipe sessions/messages before and after each test."""
+def _isolate_acp_session_db(hermes_db_initialized_sync):
+    """Per-test cleanup: wipe sessions/messages before and after each test.
+
+    Depends on ``hermes_db_initialized_sync`` so the per-test PG database
+    is created (Alembic upgrade head) and the asyncpg pool is bound to
+    THAT database BEFORE the truncate call runs. Without this dependency
+    the autouse fixture initialises the pool with whatever
+    ``HERMES_PG_DSN`` the container started with (the shared compose
+    database), and subsequent calls to ``ensure_pool_sync`` see
+    ``_pool is not None`` and skip re-init — so the test ends up querying
+    a different database from the one Alembic just migrated, and
+    everything 500s with ``relation "sessions" does not exist``.
+    """
     _truncate_session_tables()
     yield
     _truncate_session_tables()
