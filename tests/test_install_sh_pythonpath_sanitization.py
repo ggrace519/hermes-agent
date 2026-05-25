@@ -24,8 +24,9 @@ def test_hermes_launcher_wrapper_clears_python_env_before_exec() -> None:
     text = INSTALL_SH.read_text()
 
     # Wrapper should clear env and forward args untouched to the venv entrypoint.
-    # The CLI name is now configurable (default `hermes-substrate`) so the
-    # heredoc opener writes to `$link_dir/$CLI_NAME`, not a hard-coded `hermes`.
+    # The CLI name is configurable (default `hermes`, overridable via
+    # --cli-name) so the heredoc opener writes to `$link_dir/$CLI_NAME`,
+    # not a hard-coded `hermes`.
     assert 'cat > "$link_dir/$CLI_NAME" <<EOF' in text
     assert 'unset PYTHONPATH' in text
     assert 'unset PYTHONHOME' in text

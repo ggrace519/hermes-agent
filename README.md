@@ -32,12 +32,14 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 > **Substrate Edition fork (`ggrace519/hermes-agent`):** this fork ships an
 > additional PostgreSQL-backed cognitive substrate (Phases A–C) on top of
-> upstream Hermes, and replaces SQLite with PostgreSQL for all state. The
-> installer is tuned to coexist with an existing upstream install — defaults
-> are `HERMES_HOME=~/.hermes-substrate`, CLI shim `hermes-substrate`, and a
-> `docker compose` PostgreSQL service on port 5432 with database `hermes`.
-> Override `--cli-name hermes --hermes-home ~/.hermes` if you do **not** have
-> an upstream install. The substrate-edition installer one-liner is:
+> upstream Hermes, and replaces SQLite with PostgreSQL for all state. Defaults
+> match the upstream installer (`HERMES_HOME=~/.hermes`, CLI shim `hermes`)
+> and add a `docker compose` PostgreSQL service on port 5432 with database
+> `hermes`. If you already have an upstream Hermes install on the same machine
+> and want to coexist with it, pass
+> `--cli-name hermes-substrate --hermes-home ~/.hermes-substrate`.
+>
+> The substrate-edition installer one-liner is:
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.sh | bash
@@ -133,7 +135,9 @@ ingest time) and decided by Sentinel.
   drops pending slices past their decay-profile TTL), partition-maintenance
   (24 h tick, keeps a rolling window of 3 monthly partitions ahead of
   `now()`).
-- A `hermes-substrate substrate inspect` CLI for poking at substrate state.
+- A `hermes substrate inspect` CLI for poking at substrate state. (When
+  installed side-by-side as `hermes-substrate`, substitute the launcher name
+  accordingly.)
 
 ### Phase B — Curator
 
@@ -142,7 +146,7 @@ ingest time) and decided by Sentinel.
   `min_salience_to_retain` threshold they release per the tombstone policy
   (`thin` / `full` / `none`). Each decision emits a self-state slice on
   `substrate.self_state` so Phase E's Reflector can develop calibration.
-- New inspect subtree: `hermes-substrate substrate inspect curator [summary | histogram |
+- New inspect subtree: `hermes substrate inspect curator [summary | histogram |
   recent | pressure]`.
 
 ### Phase C — recall API + pgvector embeddings
@@ -158,19 +162,19 @@ ingest time) and decided by Sentinel.
   a composite score (pgvector similarity + keyword Jaccard + salience +
   recency, ranked under a 1500-token budget by default). The model also gets
   a `substrate_recall_more` tool for explicit deeper-search asks.
-- New inspect subtree: `hermes-substrate substrate inspect recall [summary | recent |
+- New inspect subtree: `hermes substrate inspect recall [summary | recent |
   sample --session-id <id> | config]`.
 
 ### Inspecting substrate state
 
 ```bash
-hermes-substrate substrate inspect            # default summary (streams, slice counts, pending)
-hermes-substrate substrate inspect streams    # per-stream slice counts
-hermes-substrate substrate inspect slices --stream hermes.world.user_message.cli --limit 20
-hermes-substrate substrate inspect pending    # current pending-queue depth + oldest age
-hermes-substrate substrate inspect profiles   # the 4 seeded decay profiles
-hermes-substrate substrate inspect curator    # Curator decay/release activity
-hermes-substrate substrate inspect recall     # recall coverage + recent calls
+hermes substrate inspect            # default summary (streams, slice counts, pending)
+hermes substrate inspect streams    # per-stream slice counts
+hermes substrate inspect slices --stream hermes.world.user_message.cli --limit 20
+hermes substrate inspect pending    # current pending-queue depth + oldest age
+hermes substrate inspect profiles   # the 4 seeded decay profiles
+hermes substrate inspect curator    # Curator decay/release activity
+hermes substrate inspect recall     # recall coverage + recent calls
 ```
 
 If your DB is on an older Alembic revision when Hermes starts, the substrate
@@ -178,7 +182,7 @@ boot raises a `RuntimeError` with the upgrade command to run; set
 `HERMES_AUTO_MIGRATE=1` to upgrade automatically on first boot.
 
 Procedural operator docs ship as a bundled skill — load with `/substrate` or
-`hermes-substrate -s substrate`. Design rationale + future-phase specs live
+`hermes -s substrate`. Design rationale + future-phase specs live
 in the [llm-cognitive-thought](https://github.com/ggrace519/llm-cognitive-thought)
 spec repo.
 
