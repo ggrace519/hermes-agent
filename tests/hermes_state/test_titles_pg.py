@@ -78,10 +78,28 @@ async def test_set_and_get_title(db):
 
 
 @pytest.mark.asyncio
-async def test_set_title_whitespace_only_returns_false(db):
-    # sanitize_title returns None → set_session_title returns False
+async def test_set_title_whitespace_only_clears_existing(db):
+    """Whitespace-only / empty title clears whatever title is set.
+
+    PR #23 changed ``set_session_title`` so empty input means "clear"
+    rather than "no-op" — the dashboard's /retitle "" flow and
+    ``tests/acp/test_session.py::test_list_sessions_prefers_title_then_preview``
+    both rely on this. Returns True iff the row was actually touched
+    (i.e. the session exists).
+    """
+    await db.set_session_title("t1", "Initial")
+    assert await db.get_session_title("t1") == "Initial"
+    # Whitespace clears the title to NULL — and reports the UPDATE ran.
     result = await db.set_session_title("t1", "   ")
-    assert result is False
+    assert result is True
+    assert await db.get_session_title("t1") is None
+    # Empty input against a session with NO title leaves it NULL and
+    # still reports True (the UPDATE matched a row).
+    result = await db.set_session_title("t1", "")
+    assert result is True
+    assert await db.get_session_title("t1") is None
+    # Unknown session id → no row matched → False.
+    assert await db.set_session_title("nonexistent", "") is False
 
 
 @pytest.mark.asyncio
