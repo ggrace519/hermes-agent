@@ -145,22 +145,43 @@ def init_db_sync() -> None:
     call ``await hermes_db.init(dsn)`` directly inside their asyncio.run().
 
     Raises RuntimeError if HERMES_PG_DSN is not set in the environment.
+
+    Drives the init on ``hermes_db._get_sync_loop()`` rather than a
+    transient ``asyncio.run`` loop. asyncpg pools are loop-bound; an
+    ``asyncio.run(hermes_db.init(dsn))`` call would create a fresh loop,
+    bind the pool to it, then close that loop on return — leaving every
+    subsequent ``run_sync`` call holding a pool against a dead loop.
+    Routing through ``_get_sync_loop`` (the same persistent loop
+    ``ensure_pool_sync`` uses) keeps the pool alive for the lifetime of
+    the process.
     """
     global _db_initialized
-    if _db_initialized:
-        return
-    import asyncio
     import atexit
     import os
     import hermes_db
+
+    # Re-check ``_pool`` directly each call. Some test fixtures close
+    # the pool between tests (e.g. ``hermes_db_initialized_sync`` in
+    # ``tests/conftest.py``); the module-level ``_db_initialized`` flag
+    # would otherwise short-circuit and leave the next test running
+    # against a closed pool.
+    if _db_initialized and hermes_db._pool is not None:
+        return
 
     dsn = os.environ.get("HERMES_PG_DSN")
     if not dsn:
         raise RuntimeError(
             "HERMES_PG_DSN must be set; export from .env or configure in environment"
         )
-    asyncio.run(hermes_db.init(dsn))
-    atexit.register(lambda: asyncio.run(hermes_db.close()) if hermes_db._pool else None)
+    if hermes_db._pool is None:
+        loop = hermes_db._get_sync_loop()
+        loop.run_until_complete(hermes_db.init(dsn))
+    atexit.register(
+        lambda: (
+            hermes_db._get_sync_loop().run_until_complete(hermes_db.close())
+            if hermes_db._pool is not None else None
+        )
+    )
     _db_initialized = True
 
 
