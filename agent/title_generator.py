@@ -9,6 +9,7 @@ import threading
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from agent.session_db_bridge import resolve_maybe_awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 # become visible instead of piling up as NULL session titles.
 FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
+
 
 _TITLE_PROMPT = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
@@ -106,7 +108,7 @@ def auto_title_session(
 
     # Check if title already exists (user may have set one via /title before first response)
     try:
-        existing = session_db.get_session_title(session_id)
+        existing = resolve_maybe_awaitable(session_db.get_session_title(session_id))
         if existing:
             return
     except Exception:
@@ -119,7 +121,7 @@ def auto_title_session(
         return
 
     try:
-        session_db.set_session_title(session_id, title)
+        resolve_maybe_awaitable(session_db.set_session_title(session_id, title))
         logger.debug("Auto-generated session title: %s", title)
         if title_callback is not None:
             try:

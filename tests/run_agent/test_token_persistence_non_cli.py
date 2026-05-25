@@ -65,6 +65,27 @@ def test_run_conversation_persists_tokens_for_cron_sessions():
     assert session_db.update_token_counts.call_args.args[0] == "cron-session"
 
 
+def test_run_conversation_bridges_async_token_persistence():
+    class AsyncSessionDB:
+        def __init__(self):
+            self.calls = []
+
+        async def update_token_counts(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    session_db = AsyncSessionDB()
+    agent = _make_agent(session_db, platform="telegram")
+
+    result = agent.run_conversation("hello")
+
+    assert result["final_response"] == "done"
+    assert len(session_db.calls) == 1
+    args, kwargs = session_db.calls[0]
+    assert args[0] == "telegram-session"
+    assert kwargs["input_tokens"] == 11
+    assert kwargs["output_tokens"] == 7
+
+
 def test_session_search_lazily_opens_db_when_entrypoint_did_not_pass_one(monkeypatch):
     sentinel_db = object()
     captured = {}
