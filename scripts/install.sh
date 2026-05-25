@@ -789,6 +789,71 @@ install_deps() {
 }
 
 # ── PostgreSQL via docker compose ──────────────────────────────────────────
+
+# Detect a non-substrate PostgreSQL listening on the chosen port. If a native
+# pg server (apt-installed `postgresql` is common on Ubuntu) is bound to
+# 5432 *and* it doesn't accept our `hermes/hermes` creds, our docker
+# container will silently fail to bind (or bind on a different interface)
+# and every connection from the host will hit the native one and bounce
+# with InvalidPasswordError. Probe first; if the port is taken by something
+# other than our container, bump to the next free port and pin everything
+# downstream to that port.
+choose_pg_port() {
+    if [ "$SKIP_POSTGRES" = true ] || [ -n "${PG_DSN_OVERRIDE:-}" ]; then
+        return 0
+    fi
+
+    local port="$PG_PORT_DEFAULT"
+
+    # Helper: does *something* answer a TCP connect on this port?
+    _port_in_use() {
+        local p="$1"
+        # Prefer ss (always installed on Linux), then lsof, then bash /dev/tcp.
+        if command -v ss >/dev/null 2>&1; then
+            ss -tlnH "( sport = :$p )" 2>/dev/null | grep -q ':'
+        elif command -v lsof >/dev/null 2>&1; then
+            lsof -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1
+        else
+            (timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null) && return 0 || return 1
+        fi
+    }
+
+    # Helper: is the listener on this port actually OUR docker container?
+    # If yes, no port change needed — `docker compose up -d` will keep it.
+    _port_is_our_container() {
+        local p="$1"
+        docker port hermes-agent-postgres-1 2>/dev/null \
+            | grep -qE "5432/tcp -> 0\\.0\\.0\\.0:$p|5432/tcp -> \\[::]:$p"
+    }
+
+    if _port_in_use "$port"; then
+        if _port_is_our_container "$port"; then
+            log_info "PostgreSQL: port $port already used by our container — reusing"
+        else
+            log_warn "PostgreSQL: port $port is taken by something else (likely a native"
+            log_warn "  Postgres install — apt-installed postgresql, system service, etc.)"
+            # Pick the next free port between 5433 and 5450.
+            local p
+            for p in $(seq 5433 5450); do
+                if ! _port_in_use "$p"; then
+                    port="$p"
+                    log_info "PostgreSQL: bumping to port $port to avoid collision"
+                    break
+                fi
+            done
+            if [ "$port" = "$PG_PORT_DEFAULT" ]; then
+                log_error "No free port in 5433-5450; aborting."
+                log_info "Free a port or pass --pg-dsn pointing at an existing cluster."
+                exit 1
+            fi
+        fi
+    fi
+
+    PG_PORT_DEFAULT="$port"
+    # Re-publish the env-var so docker compose's port mapping picks it up.
+    export POSTGRES_PORT="$port"
+}
+
 setup_postgres() {
     if [ "$SKIP_POSTGRES" = true ]; then
         log_info "Skipping PostgreSQL setup (--skip-postgres)"
@@ -798,7 +863,9 @@ setup_postgres() {
         return 0
     fi
 
-    log_info "Starting PostgreSQL via docker compose..."
+    choose_pg_port
+
+    log_info "Starting PostgreSQL via docker compose (host port $PG_PORT_DEFAULT → container 5432)..."
     cd "$INSTALL_DIR"
 
     # docker-compose.yml ships with `postgres` (port 5432) + `postgres-test`
