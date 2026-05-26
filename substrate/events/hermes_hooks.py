@@ -555,6 +555,50 @@ async def on_session_end_async(
         metadata={"session_id": session_id, "reason": reason},
     )
 
+    # Steady-state observability — one INFO line per session that
+    # summarises perception coverage. Operators scanning agent.log can
+    # confirm at a glance that the substrate is hearing the
+    # conversation without trawling per-message DEBUG traces. Best
+    # effort: query failures fall back to a minimal summary so the
+    # session_end emit above isn't blocked.
+    try:
+        import hermes_db
+        async with hermes_db.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT st.name, count(sl.slice_id) AS n
+                  FROM substrate_streams st
+                  LEFT JOIN substrate_slices sl
+                    ON sl.stream_id = st.stream_id
+                   AND sl.metadata->>'session_id' = $1
+                 WHERE st.name IN (
+                       'hermes.world.user_message.cli',
+                       'hermes.world.user_message.telegram',
+                       'hermes.world.user_message.discord',
+                       'hermes.world.user_message.slack',
+                       'hermes.world.user_message.whatsapp',
+                       'hermes.world.user_message.signal',
+                       'hermes.world.user_message.acp',
+                       'hermes.self_action.assistant_response',
+                       'hermes.self_action.tool_call',
+                       'hermes.self_state.tool_result'
+                 )
+                 GROUP BY st.name
+                 HAVING count(sl.slice_id) > 0
+                """,
+                session_id,
+            )
+        counts = ", ".join(f"{r['name'].split('.')[-1]}={r['n']}" for r in rows) or "none"
+        _substrate.log.info(
+            "substrate.session.summary session=%s reason=%s slices: %s",
+            session_id, reason, counts,
+        )
+    except Exception:
+        _substrate.log.warning(
+            "substrate.session.summary query failed for session=%s",
+            session_id, exc_info=True,
+        )
+
 
 def on_session_end(
     session_id: str,
