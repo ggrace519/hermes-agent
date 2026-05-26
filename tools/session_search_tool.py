@@ -489,12 +489,25 @@ def session_search(
 
 
 def check_session_search_requirements() -> bool:
-    """Requires the SQLite state database."""
+    """Requires the session store to be reachable.
+
+    Substrate edition runs the session store on Postgres (via
+    ``hermes_db``), so availability means either the pool is already
+    initialised or ``HERMES_PG_DSN`` is set so the pool can be
+    bootstrapped on first use. The legacy SQLite ``DEFAULT_DB_PATH``
+    check was a holdover from the upstream filesystem-backed store and
+    always returned False on this fork (the import raised
+    ``ImportError`` silently).
+    """
     try:
-        from hermes_state import DEFAULT_DB_PATH
-        return DEFAULT_DB_PATH.parent.exists()
+        import os
+
+        import hermes_db
     except ImportError:
         return False
+    if hermes_db._pool is not None:
+        return True
+    return bool(os.environ.get("HERMES_PG_DSN"))
 
 
 SESSION_SEARCH_SCHEMA = {
