@@ -121,6 +121,59 @@ def _decode_vector(s: str) -> list:
     return [float(x) for x in inner.split(",")]
 
 
+def _ssl_kwarg_for_dsn(dsn: str) -> dict:
+    """Decide the ``ssl=`` kwarg for ``asyncpg.create_pool(...)``.
+
+    Two distinct goals:
+
+    1. **Production correctness.** Remote Postgres (Neon, Supabase, RDS,
+       any DSN that doesn't resolve to a loopback / docker-compose host)
+       should use asyncpg's default SSL negotiation. Operators who set
+       ``sslmode=`` explicitly in the DSN have their preference honoured
+       by asyncpg's own parsing — we don't override.
+
+    2. **CI / local test stability.** When the DSN points at a known
+       local plain-text Postgres (the docker-compose ``postgres`` service
+       at ``localhost`` / ``127.0.0.1`` / ``postgres``) and the user did
+       NOT specify ``sslmode=`` themselves, force ``ssl=False`` to skip
+       asyncpg's SSL upgrade negotiation. That negotiation runs
+       ``_create_ssl_connection`` even for ``sslmode=prefer``-then-
+       downgrade, and the SSL context setup intermittently segfaults
+       inside CPython's ssl module on GitHub Actions runners — taking
+       the whole pytest worker down with no Python traceback. The local
+       compose PG has no SSL anyway; this is the negotiation we want to
+       skip.
+
+    Returns ``{"ssl": False}`` when we want the skip, ``{}`` otherwise
+    so we don't override asyncpg's default-or-DSN-derived behaviour.
+    """
+    dsn_lower = dsn.lower()
+    # User-pinned sslmode in the DSN → respect it, no override.
+    if "sslmode=" in dsn_lower:
+        return {}
+    # Extract the host segment between "@" and the trailing ":port/db".
+    # urllib.parse handles all the edge cases (auth-with-@, ipv6, empty
+    # password, etc.) so we don't have to reinvent them.
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(dsn_lower).hostname or "").strip()
+    except Exception:
+        return {}
+    if not host:
+        return {}
+    # Loopback aliases — always local.
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return {"ssl": False}
+    # Docker-compose service hostnames are single-label (no dots):
+    # ``postgres``, ``postgres-test``, ``db``, etc. Public DNS names
+    # always have at least one dot. This heuristic catches our two
+    # compose services (production and test) plus any operator-defined
+    # ones without overreaching to real hosts.
+    if "." not in host:
+        return {"ssl": False}
+    return {}
+
+
 async def init(
     dsn: str,
     *,
@@ -141,6 +194,7 @@ async def init(
         max_size=Ms,
         command_timeout=command_timeout,
         init=_setup_jsonb_codec,
+        **_ssl_kwarg_for_dsn(dsn),
     )
     with _pool_lock:
         if _pool is None:
@@ -244,19 +298,18 @@ def run_sync(coro: Awaitable[T]) -> T:
         _run_sync_local.in_run_sync = True
         try:
             with _sync_loop_mutex:
-                # Auto-bootstrap the pool from the env DSN inside the
-                # mutex so concurrent run_sync callers don't both race
-                # to drive ``run_until_complete(init(...))``. ``pool()``'s
-                # own lazy bootstrap only fires from a pure sync context
-                # (no running loop); by the time inner code calls
-                # ``pool()`` we're inside ``run_until_complete`` and the
-                # lazy path is locked out. Priming here covers every CLI
-                # subcommand that bridges async DB code via run_sync,
-                # without each subcommand having to call
-                # ``ensure_pool_sync`` explicitly. No-op when the pool
-                # is already initialised or no DSN is set.
-                if _pool is None and os.environ.get("HERMES_PG_DSN"):
-                    loop.run_until_complete(init(os.environ["HERMES_PG_DSN"]))
+                # NB: this function intentionally does NOT lazy-bootstrap
+                # the pool. The eager-bootstrap path used to fire whenever
+                # ``HERMES_PG_DSN`` was set, even when the coro was a Mock
+                # / AsyncMock that didn't actually need a real connection.
+                # Under pytest, that drove ``asyncpg.create_pool(...)`` on
+                # every CLI unit test, which intermittently segfaulted on
+                # GitHub Actions runners during the asyncpg protocol-class
+                # init. Bootstrap is now the caller's responsibility: real
+                # entry points (CLI ``main``, daemons, scripts) call
+                # ``ensure_pool_sync()`` once up-front; tests use the
+                # ``hermes_db_initialized*`` fixtures; mocked tests need
+                # nothing.
                 return loop.run_until_complete(coro)
         finally:
             _run_sync_local.in_run_sync = False
@@ -275,9 +328,6 @@ def run_sync(coro: Awaitable[T]) -> T:
         _run_sync_local.in_run_sync = True
         try:
             with _sync_loop_mutex:
-                # Same lazy-pool bootstrap as Case 1 — see comment above.
-                if _pool is None and os.environ.get("HERMES_PG_DSN"):
-                    loop.run_until_complete(init(os.environ["HERMES_PG_DSN"]))
                 return loop.run_until_complete(coro)
         finally:
             _run_sync_local.in_run_sync = False
