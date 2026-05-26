@@ -1062,8 +1062,9 @@ def init_agent(
     #
     # Phase C: a SubstrateMemoryProvider is registered alongside any
     # external plugin when the substrate has booted. The provider's
-    # prefetch is gated by HERMES_SUBSTRATE_RECALL (default 0) so user-
-    # facing behavior is unchanged unless the operator opts in.
+    # prefetch is gated by HERMES_SUBSTRATE_RECALL (default 1 in this
+    # fork — substrate is the primary memory backend). Set the env var
+    # to 0 to fall back to the upstream built-in provider exclusively.
     agent._memory_manager = None
     if not skip_memory:
         try:

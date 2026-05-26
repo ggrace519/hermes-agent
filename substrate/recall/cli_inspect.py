@@ -71,7 +71,7 @@ async def print_summary(conn: "asyncpg.Connection") -> None:
 
     import os
 
-    enabled = os.environ.get("HERMES_SUBSTRATE_RECALL", "0")
+    enabled = os.environ.get("HERMES_SUBSTRATE_RECALL", "1")
     print("Provider status:")
     print(f"  HERMES_SUBSTRATE_RECALL = {enabled}")
 

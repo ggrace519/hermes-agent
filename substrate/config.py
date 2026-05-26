@@ -129,11 +129,12 @@ RECALL_EMBEDDING_BACKFILL_MAX_RETRIES = _envint(
 )
 
 # Master toggle for the SubstrateMemoryProvider's prefetch (spec §6.1).
-# Default 0 in Phase C — provider registers but returns empty so
-# user-facing behavior is byte-identical. Flipping to 1 routes the
-# foreground's <memory-context> through the substrate.
+# Default ON: this fork installs the substrate as the primary memory
+# backend; recall driving the per-turn <memory-context> is the point.
+# Set HERMES_SUBSTRATE_RECALL=0 to fall back to the upstream built-in
+# provider exclusively (useful for A/B comparison or debugging).
 HERMES_SUBSTRATE_RECALL_ENABLED = _envbool(
-    "HERMES_SUBSTRATE_RECALL", default=False
+    "HERMES_SUBSTRATE_RECALL", default=True
 )
 
 
