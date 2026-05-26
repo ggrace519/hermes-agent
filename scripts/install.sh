@@ -826,12 +826,9 @@ choose_pg_port() {
         return 0
     fi
 
-    local port="$PG_PORT_DEFAULT"
-
     # Helper: does *something* answer a TCP connect on this port?
     _port_in_use() {
         local p="$1"
-        # Prefer ss (always installed on Linux), then lsof, then bash /dev/tcp.
         if command -v ss >/dev/null 2>&1; then
             ss -tlnH "( sport = :$p )" 2>/dev/null | grep -q ':'
         elif command -v lsof >/dev/null 2>&1; then
@@ -841,39 +838,72 @@ choose_pg_port() {
         fi
     }
 
-    # Helper: is the listener on this port actually OUR docker container?
-    # If yes, no port change needed — `docker compose up -d` will keep it.
-    _port_is_our_container() {
-        local p="$1"
-        docker port hermes-agent-postgres-1 2>/dev/null \
-            | grep -qE "5432/tcp -> 0\\.0\\.0\\.0:$p|5432/tcp -> \\[::]:$p"
-    }
+    # Upgrade-aware path: if a prior Hermes Postgres container exists
+    # (running OR stopped, current OR legacy name), reclaim its port
+    # and remove the old container so the new compose-up can bind
+    # cleanly. Without this, the substrate→hermes rename last week
+    # left old containers on port 5432 unreferenceable by the new
+    # compose project, the next install bumped to 5433, and every
+    # subsequent re-install drifted further up the port range.
+    #
+    # Container name candidates, in priority order. First match wins:
+    #   1. ``hermes-agent-postgres-1`` — current compose project name
+    #   2. ``hermes-substrate-postgres-1`` — legacy (pre-2026-05-26)
+    local existing_container=""
+    for name in hermes-agent-postgres-1 hermes-substrate-postgres-1; do
+        if docker inspect "$name" >/dev/null 2>&1; then
+            existing_container="$name"
+            break
+        fi
+    done
 
+    if [ -n "$existing_container" ]; then
+        # Extract the host port the existing container was bound to.
+        # ``docker port`` only works when the container is running;
+        # ``docker inspect`` works in any state. Format of the inspect
+        # output: ``5432/tcp:0.0.0.0:5432`` (port mapping line).
+        local existing_port
+        existing_port=$(docker inspect \
+            --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "5432/tcp"}}{{range $conf}}{{.HostPort}}{{end}}{{end}}{{end}}' \
+            "$existing_container" 2>/dev/null | head -1)
+
+        if [ -n "$existing_port" ]; then
+            log_info "PostgreSQL upgrade: found existing container '$existing_container' on port $existing_port"
+            log_info "  Stopping + removing it so the new compose-up reuses the same port."
+            docker rm -f "$existing_container" >/dev/null 2>&1 || true
+            PG_PORT_DEFAULT="$existing_port"
+            export POSTGRES_PORT="$existing_port"
+            return 0
+        fi
+
+        # Container exists but has no published 5432 mapping (weird
+        # config). Remove it; fall through to normal port selection.
+        log_warn "PostgreSQL: found existing '$existing_container' with no 5432 mapping; removing"
+        docker rm -f "$existing_container" >/dev/null 2>&1 || true
+    fi
+
+    # No existing container — fall back to the original collision-detection
+    # path. Probe the default port; bump if something else is holding it.
+    local port="$PG_PORT_DEFAULT"
     if _port_in_use "$port"; then
-        if _port_is_our_container "$port"; then
-            log_info "PostgreSQL: port $port already used by our container — reusing"
-        else
-            log_warn "PostgreSQL: port $port is taken by something else (likely a native"
-            log_warn "  Postgres install — apt-installed postgresql, system service, etc.)"
-            # Pick the next free port between 5433 and 5450.
-            local p
-            for p in $(seq 5433 5450); do
-                if ! _port_in_use "$p"; then
-                    port="$p"
-                    log_info "PostgreSQL: bumping to port $port to avoid collision"
-                    break
-                fi
-            done
-            if [ "$port" = "$PG_PORT_DEFAULT" ]; then
-                log_error "No free port in 5433-5450; aborting."
-                log_info "Free a port or pass --pg-dsn pointing at an existing cluster."
-                exit 1
+        log_warn "PostgreSQL: port $port is taken by something else (likely a native"
+        log_warn "  Postgres install — apt-installed postgresql, system service, etc.)"
+        local p
+        for p in $(seq 5433 5450); do
+            if ! _port_in_use "$p"; then
+                port="$p"
+                log_info "PostgreSQL: bumping to port $port to avoid collision"
+                break
             fi
+        done
+        if [ "$port" = "$PG_PORT_DEFAULT" ]; then
+            log_error "No free port in 5433-5450; aborting."
+            log_info "Free a port or pass --pg-dsn pointing at an existing cluster."
+            exit 1
         fi
     fi
 
     PG_PORT_DEFAULT="$port"
-    # Re-publish the env-var so docker compose's port mapping picks it up.
     export POSTGRES_PORT="$port"
 }
 
