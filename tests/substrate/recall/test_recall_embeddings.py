@@ -88,14 +88,73 @@ async def test_embed_different_inputs_produce_different_vectors():
 
 
 @pytest.mark.asyncio
-async def test_embed_real_path_no_key_returns_none_per_item(monkeypatch):
-    """When mock is disabled and no API key is present, ``embed`` returns
-    a list of None (signal for keyword fallback)."""
+async def test_embed_real_path_no_provider_returns_none_per_item(monkeypatch):
+    """When mock is disabled AND no provider is configured (no
+    OPENAI_API_KEY, no OPENROUTER_API_KEY, no custom config), ``embed``
+    returns a list of None (signal for keyword fallback)."""
     monkeypatch.delenv(embeddings.MOCK_ENV_VAR, raising=False)
     monkeypatch.delenv(embeddings.API_KEY_ENV_VAR, raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Bypass any config file that might pin a provider during the test run.
+    monkeypatch.setattr(embeddings, "_resolve_embedding_provider", lambda: None)
     embeddings.reset_client_cache()
     out = await embeddings.embed(["x", "y"])
     assert out == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_openai_env_only(monkeypatch):
+    """OPENAI_API_KEY alone → openai routing (no base_url)."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv(embeddings.API_KEY_ENV_VAR, "sk-test-123")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {},
+    )
+    r = embeddings._resolve_embedding_provider()
+    assert r is not None
+    assert r["api_key"] == "sk-test-123"
+    assert r["base_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_openrouter_env_fallback(monkeypatch):
+    """OPENROUTER_API_KEY but no OPENAI key → openrouter routing."""
+    monkeypatch.delenv(embeddings.API_KEY_ENV_VAR, raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-456")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {},
+    )
+    r = embeddings._resolve_embedding_provider()
+    assert r is not None
+    assert r["api_key"] == "or-test-456"
+    assert r["base_url"] == "https://openrouter.ai/api/v1"
+    # And the default model auto-flips to the openai/ prefix.
+    assert embeddings._resolve_default_model() == "openai/text-embedding-3-small"
+
+
+@pytest.mark.asyncio
+async def test_resolve_provider_custom_config(monkeypatch):
+    """Explicit custom config (e.g. Ollama) → custom routing."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "auxiliary": {
+                "embedding": {
+                    "provider": "custom",
+                    "base_url": "http://localhost:11434/v1",
+                    "api_key": "ollama",
+                    "model": "nomic-embed-text",
+                }
+            }
+        },
+    )
+    r = embeddings._resolve_embedding_provider()
+    assert r is not None
+    assert r["api_key"] == "ollama"
+    assert r["base_url"] == "http://localhost:11434/v1"
+    assert embeddings._resolve_default_model() == "nomic-embed-text"
 
 
 @pytest.mark.asyncio
