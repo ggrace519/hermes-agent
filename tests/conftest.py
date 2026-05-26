@@ -943,8 +943,34 @@ async def hermes_db_initialized(hermes_db_dsn):
     ``InterfaceError: cannot perform operation: another operation is
     in progress``. Sync tests should use :func:`hermes_db_initialized_sync`
     below.
+
+    Defensive loop-binding check: a prior test (or a ``run_sync`` call
+    that lazy-bootstrapped the pool on ``hermes_db._sync_loop``) may
+    have left ``hermes_db._pool`` bound to a loop other than this
+    test's pytest-asyncio loop. ``init()`` is idempotent — it would
+    silently return without rebinding — so the async test body would
+    inherit the stale pool and explode on teardown with a cross-loop
+    error from ``PoolConnectionHolder.close()``. Detect that mismatch
+    here and close the stale pool on its own binding loop first.
     """
+    import asyncio
     import hermes_db
+    if hermes_db._pool is not None:
+        current = asyncio.get_running_loop()
+        pool_loop = getattr(hermes_db._pool, "_loop", None)
+        if pool_loop is not current:
+            # Pool is bound to a different loop (typically the
+            # persistent _sync_loop from a sibling sync test). Close
+            # via run_sync, which detects the cross-loop situation and
+            # offloads the close onto the binding loop's worker thread.
+            try:
+                hermes_db.run_sync(hermes_db.close())
+            except Exception:
+                # Binding loop is dead (e.g., a prior pytest-asyncio
+                # per-test loop). Orphan the pool — Postgres will reap
+                # the idle connections, Python GC will clean up the
+                # holders. Leaks briefly but tests are independent.
+                hermes_db._pool = None
     await hermes_db.init(hermes_db_dsn)
     yield hermes_db_dsn
     await hermes_db.close()
