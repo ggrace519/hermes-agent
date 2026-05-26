@@ -17777,12 +17777,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         except Exception as _e:
             logger.warning("PG pool init failed, continuing: %s", _e)
 
-    # Phase A: bootstrap the substrate so perception hooks emit slices.
+    # Phase A: bootstrap the substrate in WRITER mode so perception
+    # hooks emit slices + recall queries work, but sub-agent tick loops
+    # are NOT spawned here. The sub-agents live in a separate process
+    # (``hermes substrate worker run``, managed by the
+    # ``hermes-substrate-worker.service`` systemd unit) so they get
+    # their own asyncpg pool + event loop and don't collide with the
+    # gateway's ``hermes_db.run_sync`` worker-thread bridge.
+    # See ``substrate/cli/worker.py`` for the rationale (2026-05-26
+    # cross-loop pool incident).
     # Failures are non-fatal — substrate problems must never crash the
     # gateway (spec §0). The helper itself logs the traceback.
     try:
         from hermes_bootstrap import bootstrap_substrate as _bootstrap_substrate
-        await _bootstrap_substrate(log=logger)
+        await _bootstrap_substrate(log=logger, mode="writer")
     except Exception as _se:  # noqa: BLE001 — defensive
         logger.warning("substrate bootstrap failed, continuing: %s", _se)
 

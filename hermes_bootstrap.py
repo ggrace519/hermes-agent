@@ -202,12 +202,22 @@ _substrate_booted = False
 _substrate_handle: "object | None" = None
 
 
-async def bootstrap_substrate(log=None):
-    """Boot the substrate and bind perception hooks. Idempotent.
+async def bootstrap_substrate(log=None, *, mode: str = "writer"):
+    """Boot the substrate. Idempotent.
+
+    ``mode`` selects the process role:
+
+    * ``"writer"`` (default) — perception emitters + recall reads. The
+      gateway, chat CLI, ACP adapter, and cron runner all want this.
+      Streams auto-register, hooks bind, recall log writer starts;
+      sub-agent tick loops do NOT start.
+    * ``"worker"`` — sub-agent tick loops only. Use exclusively from
+      the dedicated ``hermes substrate worker run`` subprocess.
 
     Returns the Substrate instance (or ``None`` if boot failed). Failures
     are logged as warnings and the function returns ``None`` so the
-    caller (Hermes startup) can proceed without substrate emission.
+    caller can proceed without substrate (writer-mode callers degrade
+    to no-emit; worker-mode callers should exit with non-zero).
 
     Tests that need a deterministic substrate construct it directly via
     ``Substrate.from_pool``; this helper is for production startup.
@@ -221,7 +231,15 @@ async def bootstrap_substrate(log=None):
     try:
         from substrate import Substrate
 
-        substrate = await Substrate.boot(log=log)
+        if mode == "writer":
+            substrate = await Substrate.boot_writer(log=log)
+        elif mode == "worker":
+            substrate = await Substrate.boot_worker(log=log)
+        else:
+            raise ValueError(
+                f"bootstrap_substrate: unknown mode {mode!r}; "
+                "expected 'writer' or 'worker'"
+            )
         _substrate_handle = substrate
         _substrate_booted = True
         return substrate
@@ -230,13 +248,13 @@ async def bootstrap_substrate(log=None):
         return None
 
 
-def bootstrap_substrate_sync(log=None):
+def bootstrap_substrate_sync(log=None, *, mode: str = "writer"):
     """Sync facade for ``bootstrap_substrate``.
 
     Bridges via :func:`hermes_db.run_sync`. Must NOT be called from inside
     a running event loop — async entry points should ``await
-    bootstrap_substrate(log)`` directly.
+    bootstrap_substrate(log, mode=...)`` directly.
     """
     import hermes_db
 
-    return hermes_db.run_sync(bootstrap_substrate(log=log))
+    return hermes_db.run_sync(bootstrap_substrate(log=log, mode=mode))

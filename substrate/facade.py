@@ -251,6 +251,8 @@ class Substrate:
         log: "Optional[_logging.Logger]" = None,
         config: Optional[SubstrateConfig] = None,
         start_subagents: bool = True,
+        bind_hooks: bool = True,
+        start_recall_log: bool = True,
     ) -> "Substrate":
         """Full Phase A boot sequence.
 
@@ -261,11 +263,18 @@ class Substrate:
            run ``alembic upgrade head``; otherwise raise.
         3. Ensure month partitions exist (current + next 2).
         4. Auto-register the 15 streams from spec §9 (idempotent).
-        5. Spawn sub-agent tasks: StubSentinel, ForceRejectWorker,
-           PartitionMaintenanceWorker. Also instantiate StubConductor
-           (which holds state but doesn't tick).
-        6. Bind ``substrate.events.hermes_hooks`` to this instance so
-           Hermes call sites can emit perception via the hook surface.
+        5. (``start_subagents``) Spawn sub-agent tasks: StubSentinel,
+           ForceRejectWorker, PartitionMaintenanceWorker. Also instantiate
+           StubConductor (which holds state but doesn't tick).
+        5b. (``start_recall_log``) Start the Phase C recall-log writer.
+        6. (``bind_hooks``) Bind ``substrate.events.hermes_hooks`` to this
+           instance so Hermes call sites can emit perception via the hook
+           surface.
+
+        The three boolean kwargs let the caller pick a role. Most callers
+        should use :meth:`boot_writer` or :meth:`boot_worker` which pick
+        the correct combination for their process role; this primitive
+        is exposed for tests and one-shot scripts that need a custom mix.
 
         Returns the booted Substrate. Failures are surfaced — the
         caller (Hermes startup) decides whether to abort the process
@@ -300,30 +309,106 @@ class Substrate:
 
             substrate._conductor = StubConductor(substrate)
 
-        # 5b. Phase C: start the recall log writer. Lives alongside the
-        # sub-agents but isn't a SubAgent itself (no tick body — pure
-        # drain loop). Started even when start_subagents=False because
-        # tests that exercise recall() against ``from_pool`` substrates
-        # still want the log writer attached so enqueue() works.
-        from substrate.recall.log import RecallLogWriter
-        from substrate import config as _cfg
+        # 5b. Phase C: start the recall log writer. Optional via
+        # ``start_recall_log`` — the worker subprocess (which only
+        # ticks sub-agents and never serves recall queries) doesn't
+        # need it. Tests that exercise recall() against ``from_pool``
+        # substrates DO want it on, hence the default True.
+        if start_recall_log:
+            from substrate.recall.log import RecallLogWriter
+            from substrate import config as _cfg
 
-        substrate.recall_log = RecallLogWriter(
-            substrate, max_queue_depth=_cfg.RECALL_LOG_QUEUE_DEPTH
-        )
-        substrate.recall_log.start()
+            substrate.recall_log = RecallLogWriter(
+                substrate, max_queue_depth=_cfg.RECALL_LOG_QUEUE_DEPTH
+            )
+            substrate.recall_log.start()
 
-        # 6. Bind hook module to this substrate instance.
-        from substrate.events import hermes_hooks
+        # 6. Bind hook module to this substrate instance. Optional via
+        # ``bind_hooks`` — the worker subprocess (no perception hooks
+        # fire there) skips this so the global hook-target reference
+        # stays bound to whichever writer process owns it.
+        if bind_hooks:
+            from substrate.events import hermes_hooks
 
-        hermes_hooks._bind(substrate)
+            hermes_hooks._bind(substrate)
 
         substrate.log.info(
-            "substrate.boot.ok streams_registered=%d subagents=%d",
+            "substrate.boot.ok streams_registered=%d subagents=%d hooks=%s recall_log=%s",
             len(_autoregister_specs()) + 1,  # +1 for the seeded self_state
             len(substrate._subagents),
+            "on" if bind_hooks else "off",
+            "on" if start_recall_log else "off",
         )
         return substrate
+
+    @classmethod
+    async def boot_writer(
+        cls,
+        *,
+        log: "Optional[_logging.Logger]" = None,
+        config: Optional[SubstrateConfig] = None,
+    ) -> "Substrate":
+        """Boot in **writer** mode (perception emitters + recall reads).
+
+        Use this from any process that emits perception slices via the
+        hook surface OR queries the recall API: the gateway, the chat
+        CLI, the ACP adapter, the cron runner. Streams are auto-
+        registered, perception hooks get bound, and the recall log
+        writer starts. **Sub-agent tick loops are NOT started** — those
+        run in a dedicated ``hermes substrate worker run`` subprocess
+        so they own their own event loop and asyncpg pool.
+
+        Why the split: when sub-agents tick in a process that also
+        runs ``hermes_db.run_sync`` (worker-thread bridge for sync DB
+        callers like gateway session handlers), the substrate's
+        main-loop pool and run_sync's ``_sync_loop`` pool collide. PG
+        sees the same connection driven from two event loops, asyncpg
+        rejects with ``cannot switch to state N; another operation
+        is in progress``, the Curator/Sentinel ticks fail in a 5-second
+        loop. The 2026-05-26 production incident: 4 hours of gateway
+        uptime with zero embeddings landed because every Curator tick
+        crashed on this race. Moving the sub-agents to their own
+        process gives each loop a clean single-owner pool.
+        """
+        return await cls.boot(
+            log=log,
+            config=config,
+            start_subagents=False,
+            bind_hooks=True,
+            start_recall_log=True,
+        )
+
+    @classmethod
+    async def boot_worker(
+        cls,
+        *,
+        log: "Optional[_logging.Logger]" = None,
+        config: Optional[SubstrateConfig] = None,
+    ) -> "Substrate":
+        """Boot in **worker** mode (sub-agent tick loops only).
+
+        Use this exclusively from the ``hermes substrate worker run``
+        subprocess. Streams auto-register (idempotent — safe even if
+        the writer process already registered them), sub-agent tick
+        loops start (Sentinel, Curator, ForceRejectWorker,
+        PartitionMaintenanceWorker; Conductor instantiated), but:
+
+        * **Perception hooks are NOT bound** — the worker subprocess
+          doesn't receive Hermes-side ``on_user_message`` / etc. calls.
+          The hook target stays bound to whatever writer process owns
+          it (typically the gateway).
+        * **Recall log writer NOT started** — the worker doesn't serve
+          recall queries; only writer processes do.
+
+        See :meth:`boot_writer` for the rationale behind the split.
+        """
+        return await cls.boot(
+            log=log,
+            config=config,
+            start_subagents=True,
+            bind_hooks=False,
+            start_recall_log=False,
+        )
 
     # ------------------------------------------------------------------
     # Shutdown

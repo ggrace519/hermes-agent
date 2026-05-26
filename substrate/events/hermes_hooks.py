@@ -78,6 +78,16 @@ def _unbind() -> None:
     _substrate = None
 
 
+def _substrate_for_tests() -> "Optional[Substrate]":
+    """Test-only read accessor for the bound substrate. Production code
+    must NOT touch this — use the hook surface (``on_user_message_async``
+    etc.) which goes through ``_guard`` and handles the unbound case.
+    Tests need this to assert ``boot_writer`` binds and ``boot_worker``
+    leaves the binding alone.
+    """
+    return _substrate
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers: the ``_guard`` decorator + payload summariser.
 # ---------------------------------------------------------------------------

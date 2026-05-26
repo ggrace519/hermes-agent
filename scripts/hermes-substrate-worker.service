@@ -1,0 +1,83 @@
+[Unit]
+# Hermes substrate sub-agent worker subprocess.
+#
+# Runs Sentinel + Curator + ForceRejectWorker + PartitionMaintenanceWorker
+# in a dedicated process with its own asyncpg pool and event loop.
+# Without this unit running, sub-agent tick loops never fire: slices
+# accumulate as ``pending`` forever, salience decay never runs, embedding
+# backfill never happens. See ``substrate/cli/worker.py`` for the
+# rationale (2026-05-26 cross-loop pool incident).
+#
+# Installed by ``scripts/install.sh`` as a per-user (``--user``) unit.
+# After the install command places this file at
+# ``~/.config/systemd/user/hermes-substrate-worker.service``, enable +
+# start it with:
+#
+#   systemctl --user enable --now hermes-substrate-worker
+#
+# Path placeholders below assume the standard install layout:
+#   HERMES_HOME = ~/.hermes
+#   INSTALL_DIR = ~/.hermes/hermes-agent
+#   .env at     = ~/.hermes/.env
+#
+# Operators with a custom install dir need to edit the ExecStart /
+# WorkingDirectory / EnvironmentFile paths to match. The install
+# script overwrites this file on each ``install.sh`` run, so custom
+# edits should be staged in a drop-in at
+# ``~/.config/systemd/user/hermes-substrate-worker.service.d/override.conf``.
+
+Description=Hermes Substrate Sub-Agent Worker (Sentinel, Curator, etc.)
+Documentation=https://github.com/ggrace519/hermes-agent#substrate
+After=network-online.target
+Wants=network-online.target
+
+# Start the worker after the gateway in normal boot, but neither requires
+# the other — if the gateway is stopped for maintenance the worker keeps
+# decaying salience and backfilling embeddings against whatever slices
+# the writer processes (CLI sessions, cron) emit.
+After=hermes-gateway.service
+
+[Service]
+Type=simple
+
+# WorkingDirectory must be the install root so relative imports + the
+# bundled ``alembic.ini`` resolve correctly.
+WorkingDirectory=%h/.hermes/hermes-agent
+
+# Load .env (HERMES_PG_DSN, HERMES_EMBEDDING_DIM, etc.) before exec.
+EnvironmentFile=%h/.hermes/.env
+
+# Single foreground process; systemd captures stdout/stderr to journal.
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main substrate worker run
+
+# Graceful shutdown sequence:
+#   1. SIGTERM → ``substrate worker run`` trips its stop_event
+#   2. ``Substrate.shutdown()`` runs (cancels sub-agent tasks, flushes
+#      pending audit emissions, closes pool)
+#   3. Process exits 0
+# 15s is the spec §8.2 sub-agent shutdown timeout + buffer for pool
+# close. If shutdown hangs past this, systemd SIGKILLs.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+# Auto-restart on crash so the sub-agent tick loop keeps the substrate
+# healthy. RestartSec gives PG time to recover from transient blips
+# (e.g. docker compose restart of the postgres container).
+Restart=on-failure
+RestartSec=10
+
+# Resource guards. Sub-agents are bounded by RECALL_EMBEDDING_BATCH_SIZE
+# and the per-tick query LIMITs, but a runaway loop shouldn't take down
+# the box.
+MemoryMax=512M
+CPUWeight=50
+
+# Hardening (per-user unit so most NoNewPrivileges-style flags don't
+# add isolation, but PrivateTmp does and is cheap).
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.hermes
+
+[Install]
+# Start on user login (when systemd --user becomes active).
+WantedBy=default.target

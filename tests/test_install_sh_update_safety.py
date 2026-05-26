@@ -134,3 +134,90 @@ def test_force_rewrite_flag_documented_in_help() -> None:
         "--force-rewrite-config must appear in the help block so users "
         "can discover the escape hatch via --help."
     )
+
+
+# ---------------------------------------------------------------------------
+# Substrate worker systemd unit — install.sh must install + enable it so
+# new installs and upgrades both end up with a running worker without
+# the operator having to know it exists. The worker is what runs the
+# Sentinel/Curator tick loops; without it the substrate is inert. See
+# scripts/install.sh::setup_substrate_worker_service and the writer/
+# worker boot-split commit.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_substrate_worker_service_function_exists() -> None:
+    """install.sh ships a function that installs the substrate-worker
+    systemd unit. Without it, fresh installs come up with sub-agents
+    that aren't ticking."""
+    text = _read_install_sh()
+    assert "setup_substrate_worker_service()" in text, (
+        "install.sh must define setup_substrate_worker_service; without "
+        "it the substrate worker subprocess is not installed and "
+        "Sentinel/Curator don't tick after install."
+    )
+
+
+def test_setup_substrate_worker_service_called_from_main() -> None:
+    """The function must be wired into main() — defining it without
+    calling it would be a silent regression."""
+    body = _extract_function_body("main")
+    assert "setup_substrate_worker_service" in body, (
+        "setup_substrate_worker_service defined but not called from "
+        "main(). The unit will never be installed."
+    )
+
+
+def test_substrate_worker_unit_uses_install_paths() -> None:
+    """The rendered unit must reference the install's actual paths
+    (INSTALL_DIR for ExecStart, HERMES_HOME for EnvironmentFile) so
+    operators with custom --hermes-home / --cli-name don't get a broken
+    unit pointing at someone else's home directory."""
+    body = _extract_function_body("setup_substrate_worker_service")
+    # ExecStart resolves to the actual venv python in this install.
+    assert "$INSTALL_DIR/venv/bin/python" in body or \
+           "$python_path" in body, (
+        "Unit's ExecStart must use $INSTALL_DIR-derived python path; "
+        "hardcoding ~/.hermes/hermes-agent breaks custom-dir installs."
+    )
+    # EnvironmentFile points at $HERMES_HOME/.env, not %h/.hermes/.env.
+    assert "EnvironmentFile=$env_file" in body or \
+           "EnvironmentFile=$HERMES_HOME" in body, (
+        "Unit's EnvironmentFile must use $HERMES_HOME-derived path so "
+        "operators with custom --hermes-home get a working unit."
+    )
+
+
+def test_substrate_worker_update_path_restarts_if_active() -> None:
+    """On update, if the worker unit was already active, restart it
+    (to pick up new code + unit changes). Don't enable a unit the
+    operator chose to disable, and don't start one they chose to stop."""
+    body = _extract_function_body("setup_substrate_worker_service")
+    assert "was_active" in body, (
+        "setup_substrate_worker_service must capture prior is-active "
+        "state before mutating the unit; otherwise the update path "
+        "can't distinguish 'restart this' from 'leave alone'."
+    )
+    assert "was_enabled" in body, (
+        "setup_substrate_worker_service must capture prior is-enabled "
+        "state so operator-disabled units stay disabled across updates."
+    )
+    assert "systemctl $scope restart" in body or \
+           "systemctl $scope enable --now" in body, (
+        "setup_substrate_worker_service must restart-if-active and "
+        "enable-now-on-fresh; neither path can be missing."
+    )
+
+
+def test_substrate_worker_skips_cleanly_without_systemd() -> None:
+    """Termux / non-Linux / no-systemctl environments must not error
+    out — install.sh should print manual steps and continue."""
+    body = _extract_function_body("setup_substrate_worker_service")
+    assert 'DISTRO" = "termux"' in body, (
+        "Termux skip-path missing; Termux has no systemd."
+    )
+    assert "command -v systemctl" in body, (
+        "systemctl presence check missing; some Linux containers "
+        "(distroless, scratch) ship without systemctl and the install "
+        "must still succeed there."
+    )

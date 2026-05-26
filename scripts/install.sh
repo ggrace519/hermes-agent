@@ -1375,6 +1375,165 @@ PY
     fi
 }
 
+# ── Substrate worker subprocess (Sentinel/Curator/etc.) ───────────────────
+# The substrate sub-agents run in a dedicated process with their own
+# event loop + asyncpg pool — see ``substrate/cli/worker.py`` for the
+# rationale (2026-05-26 cross-loop pool incident). Without this unit
+# running, slices stay ``pending`` forever and embeddings never
+# backfill.
+#
+# Strategy:
+#   * systemd --user available → write unit + daemon-reload + enable
+#     (on fresh install) or restart (on update if active).
+#   * sudo / system-mode FHS install → write to /etc/systemd/system,
+#     enable + start system-wide.
+#   * Termux / macOS launchd / no systemd → print clear manual steps
+#     and continue. The worker is not strictly required for the
+#     gateway to come up; recall just degrades to keyword Jaccard.
+setup_substrate_worker_service() {
+    if [ "$DISTRO" = "termux" ]; then
+        log_info "Substrate worker: Termux has no systemd — run manually:"
+        log_info "  $CLI_NAME substrate worker run &"
+        return 0
+    fi
+
+    if [ "$OS" != "linux" ]; then
+        log_info "Substrate worker: non-Linux ($OS) has no systemd here."
+        log_info "  Run manually or daemonise via your platform's mechanism:"
+        log_info "    $CLI_NAME substrate worker run"
+        return 0
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "Substrate worker: systemctl not on PATH — run manually:"
+        log_info "  $CLI_NAME substrate worker run &"
+        return 0
+    fi
+
+    # Choose scope: system mode (FHS layout, root install) vs user mode.
+    local scope=""
+    local unit_dir=""
+    local unit_name="hermes-substrate-worker.service"
+    if [ "$ROOT_FHS_LAYOUT" = true ]; then
+        scope="--system"
+        unit_dir="/etc/systemd/system"
+    else
+        scope="--user"
+        unit_dir="$HOME/.config/systemd/user"
+        # systemd --user requires a logind session. Skip cleanly if not
+        # available (CI containers, fresh non-interactive installs).
+        if ! systemctl --user list-units >/dev/null 2>&1; then
+            log_warn "Substrate worker: no systemd --user session detected."
+            log_info "  After logging in interactively, enable the worker:"
+            log_info "    systemctl --user daemon-reload"
+            log_info "    systemctl --user enable --now $unit_name"
+            log_info "  Without it, substrate sub-agents (Sentinel/Curator/embedding"
+            log_info "  backfill) will NOT tick."
+            return 0
+        fi
+    fi
+
+    # Detect prior state BEFORE we touch anything so the update-vs-fresh
+    # decision is honest.
+    local was_active=false
+    local was_enabled=false
+    if systemctl $scope is-active "$unit_name" >/dev/null 2>&1; then
+        was_active=true
+    fi
+    if systemctl $scope is-enabled "$unit_name" >/dev/null 2>&1; then
+        was_enabled=true
+    fi
+
+    mkdir -p "$unit_dir"
+    local unit_path="$unit_dir/$unit_name"
+
+    # Render the unit. We don't copy ``scripts/hermes-substrate-worker.service``
+    # verbatim because that file uses ``%h`` (systemd home substitution)
+    # which only works for ``--user`` units AND assumes the standard
+    # install layout — operators with custom ``--hermes-home`` /
+    # ``--cli-name`` / system-mode installs need their actual paths
+    # baked in. Template the values here so the unit is correct for
+    # the install we just performed.
+    local python_path="$INSTALL_DIR/venv/bin/python"
+    local env_file="$HERMES_HOME/.env"
+
+    # Pick ExecStart wrapper — system-mode FHS runs as the operator's
+    # primary user if set; user-mode runs as the invoking user implicitly.
+    local user_directive=""
+    if [ "$ROOT_FHS_LAYOUT" = true ]; then
+        local _run_as=""
+        if [ -n "${SUDO_USER:-}" ]; then _run_as="$SUDO_USER"; fi
+        if [ -n "$_run_as" ]; then
+            user_directive=$'\nUser='"$_run_as"
+        fi
+    fi
+
+    cat > "$unit_path" <<UNIT
+[Unit]
+# Hermes substrate sub-agent worker. Installed by install.sh; do NOT
+# hand-edit (your changes will be overwritten on the next install
+# run). For local overrides use a drop-in at
+# ${unit_path}.d/override.conf
+#
+# Runs Sentinel + Curator + ForceRejectWorker + PartitionMaintenanceWorker
+# in a process separate from the gateway so each owns its own asyncpg
+# pool + event loop (no cross-loop contention — see
+# substrate/cli/worker.py for the 2026-05-26 incident).
+
+Description=Hermes Substrate Sub-Agent Worker (Sentinel, Curator, etc.)
+Documentation=https://github.com/ggrace519/hermes-agent#substrate
+After=network-online.target
+Wants=network-online.target
+After=hermes-gateway.service
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+EnvironmentFile=$env_file$user_directive
+ExecStart=$python_path -m hermes_cli.main substrate worker run
+TimeoutStopSec=15
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=10
+MemoryMax=512M
+CPUWeight=50
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$HERMES_HOME
+
+[Install]
+WantedBy=$([ "$ROOT_FHS_LAYOUT" = true ] && echo "multi-user.target" || echo "default.target")
+UNIT
+
+    log_success "Substrate worker unit installed at $unit_path"
+
+    # Reload + enable/restart per scenario.
+    systemctl $scope daemon-reload
+
+    if [ "$IS_UPDATE" = true ] && [ "$was_active" = true ]; then
+        # Update path: pick up new unit + new code by restarting.
+        log_info "Substrate worker: restarting (was active)"
+        systemctl $scope restart "$unit_name" || \
+            log_warn "systemctl $scope restart $unit_name failed — investigate"
+    elif [ "$was_enabled" = true ] && [ "$was_active" = false ]; then
+        # Enabled but stopped (operator paused it deliberately). Don't
+        # second-guess; just reload and leave alone.
+        log_info "Substrate worker: enabled but stopped — leaving as-is."
+        log_info "  Start when ready: systemctl $scope start $unit_name"
+    else
+        # Fresh install (or update where the unit was never enabled):
+        # enable + start now.
+        log_info "Substrate worker: enabling + starting"
+        if systemctl $scope enable --now "$unit_name" 2>&1 | sed 's/^/    /'; then
+            log_success "Substrate worker active"
+        else
+            log_warn "systemctl $scope enable --now $unit_name failed."
+            log_info "  Inspect: systemctl $scope status $unit_name"
+            log_info "  Logs:    journalctl $scope -u $unit_name --since '5 minutes ago'"
+        fi
+    fi
+}
+
 # ── Setup wizard ───────────────────────────────────────────────────────────
 run_setup_wizard() {
     if [ "$RUN_SETUP" = false ]; then
@@ -1422,6 +1581,16 @@ print_success() {
         echo -e "   $DOCKER_COMPOSE ps postgres   # check status"
         echo -e "   $DOCKER_COMPOSE logs postgres # inspect logs"
         echo -e "   $DOCKER_COMPOSE stop postgres # shut down (will not auto-restart)"
+        echo ""
+
+        # Substrate worker scope (system vs user) picked by
+        # setup_substrate_worker_service() above.
+        local _wscope="--user"
+        if [ "$ROOT_FHS_LAYOUT" = true ]; then _wscope="--system"; fi
+        echo -e "${CYAN}${BOLD}🧠 Substrate worker (Sentinel + Curator):${NC}"
+        echo -e "   systemctl $_wscope status hermes-substrate-worker"
+        echo -e "   journalctl $_wscope -u hermes-substrate-worker -f"
+        echo -e "   systemctl $_wscope restart hermes-substrate-worker"
         echo ""
     fi
 
@@ -1484,6 +1653,7 @@ main() {
     setup_path
     copy_config_templates
     substrate_smoke
+    setup_substrate_worker_service
     run_setup_wizard
 
     print_success
