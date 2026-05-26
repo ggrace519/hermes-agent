@@ -3,9 +3,9 @@
 
 Phase A surface is a single debug command::
 
-    hermes substrate inspect
-    hermes substrate inspect streams
-    hermes substrate inspect slices --stream NAME --limit 20
-    hermes substrate inspect pending
-    hermes substrate inspect profiles
+    hermes substrate
+    hermes substrate streams
+    hermes substrate slices --stream NAME --limit 20
+    hermes substrate pending
+    hermes substrate profiles
 """

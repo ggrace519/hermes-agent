@@ -160,8 +160,17 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 #   Strictly additive — only the recall pipeline reads/writes this table.
 # - ``20260525_0006`` — Phase C substrate_slices.embedding column + ivfflat
 #   index. Adds a NULLable column; pre-Phase-C code paths ignore it.
+# - ``20260526_0009`` — Phase C configurable embedding dim. Reshapes the
+#   ``embedding`` column to ``vector(HERMES_EMBEDDING_DIM)``; default 1536
+#   makes this a no-op for installs that don't set the env var.
 _EXPECTED_REVISIONS = frozenset(
-    {"20260523_0003", "20260524_0004", "20260525_0005", "20260525_0006"}
+    {
+        "20260523_0003",
+        "20260524_0004",
+        "20260525_0005",
+        "20260525_0006",
+        "20260526_0009",
+    }
 )
 
 

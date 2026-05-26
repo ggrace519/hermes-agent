@@ -11299,7 +11299,7 @@ def main():
         logger.debug("LSP CLI registration failed: %s", _lsp_err)
 
     # =========================================================================
-    # substrate command (Phase A inspect surface)
+    # substrate command (read-only inspection) + embed command (admin)
     # =========================================================================
     try:
         from substrate.cli.inspect import register_subparser as _substrate_register
@@ -11308,6 +11308,11 @@ def main():
         # Substrate CLI is debug-only — never let registration failure
         # break the rest of the CLI.
         logger.debug("Substrate CLI registration failed: %s", _substrate_err)
+    try:
+        from substrate.cli.embed import register_subparser as _embed_register
+        _embed_register(subparsers)
+    except Exception as _embed_err:  # noqa: BLE001
+        logger.debug("Embed CLI registration failed: %s", _embed_err)
 
     # =========================================================================
     # setup command
@@ -12469,7 +12474,7 @@ Examples:
             "\n\nNot to be confused with the substrate Curator sub-agent "
             "(memory/perception slices) introduced by Phase B — that one "
             "runs inside the substrate and has no separate CLI surface; "
-            "inspect it with `hermes substrate inspect`."
+            "inspect it with `hermes substrate`."
         ),
     )
     try:
