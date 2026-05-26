@@ -235,13 +235,16 @@ async def recall(
 
     # 1b. Embed the query (best-effort; None on failure → keyword path
     # forced for all candidates). Bounded by its own timeout from the
-    # embeddings module.
+    # embeddings module. ``RECALL_EMBEDDING_MODEL`` is the override knob
+    # (None by default) — when unset, ``embed_query`` reads
+    # ``auxiliary.embedding.model`` from config. Forcing a model name
+    # here would override the operator's provider choice and 404 on
+    # non-OpenAI endpoints. See substrate/config.py.
+    eq_kwargs = {"timeout_ms": _cfg.RECALL_EMBEDDING_TIMEOUT_MS}
+    if _cfg.RECALL_EMBEDDING_MODEL is not None:
+        eq_kwargs["model"] = _cfg.RECALL_EMBEDDING_MODEL
     try:
-        query_embedding = await embed_query(
-            query,
-            model=_cfg.RECALL_EMBEDDING_MODEL,
-            timeout_ms=_cfg.RECALL_EMBEDDING_TIMEOUT_MS,
-        )
+        query_embedding = await embed_query(query, **eq_kwargs)
     except Exception as exc:
         _log.debug("query embedding failed: %s", exc)
         query_embedding = None

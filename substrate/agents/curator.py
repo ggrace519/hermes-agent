@@ -379,12 +379,17 @@ class Curator(SubAgent):
             return
 
         texts = [_extract_text_for_embedding(r["payload"]) for r in rows]
+        # ``RECALL_EMBEDDING_MODEL`` is an OVERRIDE knob (see
+        # ``substrate/config.py``). When unset (the default) we pass
+        # ``model=None`` so ``embed()`` reads ``auxiliary.embedding.model``
+        # from the operator's config.yaml — without that the Curator
+        # would silently force the OpenAI model name on Ollama / Voyage /
+        # any non-OpenAI provider, and every embed call would 404.
+        embed_kwargs = {"timeout_ms": _cfg.RECALL_EMBEDDING_TIMEOUT_MS}
+        if _cfg.RECALL_EMBEDDING_MODEL is not None:
+            embed_kwargs["model"] = _cfg.RECALL_EMBEDDING_MODEL
         try:
-            vectors = await embed(
-                texts,
-                model=_cfg.RECALL_EMBEDDING_MODEL,
-                timeout_ms=_cfg.RECALL_EMBEDDING_TIMEOUT_MS,
-            )
+            vectors = await embed(texts, **embed_kwargs)
         except Exception as exc:
             self._log.warning("curator embed batch raised: %s", exc)
             # Whole-batch failure: bump each slice's retry counter.
