@@ -158,6 +158,52 @@ async def test_resolve_provider_custom_config(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_schema_dim_fallback_when_pg_unreachable(monkeypatch):
+    """When PG introspection fails, _get_schema_dim falls back to the
+    module-level EMBEDDING_DIM constant instead of raising. Recall keeps
+    working with the (possibly stale) constant value.
+
+    Implementation: patch the whole introspection helper to raise so
+    we exercise the except-branch without juggling async context
+    managers in the mock. The real PG-roundtrip path is exercised in
+    integration tests that have a live pool.
+    """
+    embeddings.reset_schema_dim_cache()
+    # Force the inner ``import hermes_db`` to fail by removing the
+    # entry from sys.modules and shadowing the path. Easier: monkeypatch
+    # the hermes_db module to a stub whose ``connection`` access raises.
+    import hermes_db
+    class _Boom:
+        def __getattr__(self, name):
+            raise RuntimeError("simulated PG down")
+    monkeypatch.setattr("substrate.recall.embeddings.hermes_db", _Boom(), raising=False)
+    # The function uses a late ``import hermes_db`` inside its body.
+    # Easier than fighting that import path: just rig hermes_db.connection
+    # to be a no-op context manager that yields a conn whose fetchrow raises.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _broken_connection():
+        class _C:
+            async def fetchrow(self, *_, **__):
+                raise RuntimeError("simulated PG down")
+        yield _C()
+
+    monkeypatch.setattr(hermes_db, "connection", _broken_connection, raising=True)
+    dim = await embeddings._get_schema_dim()
+    assert dim == embeddings.EMBEDDING_DIM
+
+
+def test_schema_dim_cache_resets():
+    """reset_schema_dim_cache() drops the cached value so the next
+    _get_schema_dim() call re-reads PG. No async; just verifies the
+    test seam itself works."""
+    embeddings._schema_dim_cache = 999
+    embeddings.reset_schema_dim_cache()
+    assert embeddings._schema_dim_cache is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(
     not os.environ.get(embeddings.API_KEY_ENV_VAR),
     reason=f"{embeddings.API_KEY_ENV_VAR} not set",

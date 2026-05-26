@@ -41,9 +41,14 @@ from typing import Optional
 from substrate import config as _substrate_config  # noqa: F401  (forward use)
 
 
-# Dimension is pinned at the schema level (Alembic revision 0006 uses
-# vector(1536)). Mismatch with the model's output dim raises loudly at
-# the first embed call so silent drift can't corrupt rankings.
+# Dimension was originally pinned at 1536 (Phase C / Alembic 0006).
+# Phase C-cleanup migration 0009 makes it configurable via the
+# ``HERMES_EMBEDDING_DIM`` env var, with 1536 retained as the default
+# for back-compat. The actual column dimension is read from PG at
+# first use via ``_get_schema_dim`` — env var only matters at
+# migration time. ``EMBEDDING_DIM`` is preserved here as a fallback
+# (for code paths and tests that read it before any embed() call) and
+# for the mock path which generates fixed-size deterministic vectors.
 EMBEDDING_DIM = 1536
 MOCK_ENV_VAR = "HERMES_RECALL_EMBEDDING_MOCK"
 API_KEY_ENV_VAR = "OPENAI_API_KEY"
@@ -52,6 +57,48 @@ _log = logging.getLogger("substrate.recall.embeddings")
 
 _client = None  # OpenAI-compatible client cache — created lazily.
 _unconfigured_warned = False  # one-shot operator warning
+_schema_dim_cache: Optional[int] = None  # cached PG column dim, see _get_schema_dim
+
+
+async def _get_schema_dim() -> int:
+    """Read the live ``substrate_slices.embedding`` column dimension.
+
+    Cached after first read — the dim doesn't change without a
+    migration + restart. Falls back to the module-level
+    ``EMBEDDING_DIM`` constant if PG is unreachable or the column
+    introspection fails (defensive — the dim guard in embed() then
+    uses the constant).
+    """
+    global _schema_dim_cache
+    if _schema_dim_cache is not None:
+        return _schema_dim_cache
+    try:
+        import hermes_db
+        async with hermes_db.connection() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT format_type(atttypid, atttypmod) AS coltype
+                  FROM pg_attribute
+                 WHERE attrelid = 'substrate_slices'::regclass
+                   AND attname  = 'embedding'
+                   AND NOT attisdropped
+                """
+            )
+        if row and row["coltype"] and row["coltype"].startswith("vector("):
+            _schema_dim_cache = int(row["coltype"][len("vector("):-1])
+            return _schema_dim_cache
+    except Exception:
+        # PG unreachable, asyncpg not initialised, column missing —
+        # fall through to the module constant.
+        pass
+    _schema_dim_cache = EMBEDDING_DIM
+    return _schema_dim_cache
+
+
+def reset_schema_dim_cache() -> None:
+    """Test seam — re-read schema dim on next embed()."""
+    global _schema_dim_cache
+    _schema_dim_cache = None
 
 
 def _is_mock_enabled() -> bool:
@@ -259,14 +306,21 @@ async def embed(
         # Any embedding-side error: caller falls back to keyword.
         return [None] * len(texts)
 
+    # Dim guard: model output must match the PG column's vector(N) shape
+    # exactly. Read the schema's actual dim (configurable via
+    # HERMES_EMBEDDING_DIM at migration time) instead of the module
+    # constant so users who reshape their schema for a 768-d local model
+    # don't get false-positive mismatch errors.
+    schema_dim = await _get_schema_dim()
     out: list[Optional[list[float]]] = []
     for d in resp.data:
         vec = list(d.embedding)
-        if len(vec) != EMBEDDING_DIM:
-            # Dim guard — silent drift would corrupt rankings.
+        if len(vec) != schema_dim:
             raise RuntimeError(
-                f"embedding dim mismatch: got {len(vec)}, expected {EMBEDDING_DIM} "
-                f"(model={model!r}; check RECALL_EMBEDDING_MODEL config)"
+                f"embedding dim mismatch: got {len(vec)}, schema expects "
+                f"{schema_dim} (model={model!r}). Either pick a model whose "
+                f"output dim matches the schema, OR set HERMES_EMBEDDING_DIM="
+                f"{len(vec)} in env + re-run migrations to reshape the column."
             )
         out.append(vec)
     # Pad with None if the API returned fewer items than requested
