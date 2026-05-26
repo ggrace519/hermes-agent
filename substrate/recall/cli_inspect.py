@@ -1,4 +1,4 @@
-"""``hermes substrate inspect recall`` printers — Phase C Task 12.
+"""``hermes substrate recall`` printers — Phase C Task 12.
 
 Implementation lives next to the recall API for cohesion; the parent
 ``substrate/cli/inspect.py`` registers the subparser and delegates the

@@ -758,10 +758,10 @@ the provider is active for explicit deeper-search asks.
 Introspect:
 
 ```bash
-hermes substrate inspect            # streams + slice counts + pending queue
-hermes substrate inspect streams    # per-stream counts
-hermes substrate inspect curator    # decay/release activity
-hermes substrate inspect recall     # recall coverage + recent calls
+hermes substrate            # streams + slice counts + pending queue
+hermes substrate streams    # per-stream counts
+hermes substrate curator    # decay/release activity
+hermes substrate recall     # recall coverage + recent calls
 ```
 
 Deeper operator workflow lives in the **substrate** bundled skill —

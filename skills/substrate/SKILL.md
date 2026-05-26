@@ -86,43 +86,43 @@ session lifecycle, and cron dispatch. Substrate self-state lands on
 
 ## Inspect Commands
 
-The `hermes substrate inspect` tree is read-only and connects to the
+The `hermes substrate` tree is read-only and connects to the
 configured PG via the existing pool — safe to run against a live Hermes
 process from another shell.
 
 ```bash
 # default summary — streams, slice totals by state, pending queue, sub-agent list
-hermes substrate inspect
+hermes substrate
 
 # all streams + per-stream slice counts
-hermes substrate inspect streams
+hermes substrate streams
 
 # the most-recent N slices on a single stream
-hermes substrate inspect slices --stream hermes.world.user_message.cli --limit 20
+hermes substrate slices --stream hermes.world.user_message.cli --limit 20
 
 # pending queue depth + oldest pending age
-hermes substrate inspect pending
+hermes substrate pending
 
 # the 4 seeded decay profiles + their half-lives, TTLs, tombstone policies
-hermes substrate inspect profiles
+hermes substrate profiles
 ```
 
 ### Curator (Phase B)
 
 ```bash
-hermes substrate inspect curator              # release / pending consolidation / recent emissions
-hermes substrate inspect curator histogram    # per-profile 10-bucket salience histogram
-hermes substrate inspect curator recent --limit 20   # last N curator.* self-state emissions
-hermes substrate inspect curator pressure     # per-stream density + 5m update rate
+hermes substrate curator              # release / pending consolidation / recent emissions
+hermes substrate curator histogram    # per-profile 10-bucket salience histogram
+hermes substrate curator recent --limit 20   # last N curator.* self-state emissions
+hermes substrate curator pressure     # per-stream density + 5m update rate
 ```
 
 ### Recall (Phase C)
 
 ```bash
-hermes substrate inspect recall               # last-hour call stats + embedding coverage
-hermes substrate inspect recall recent --limit 20
-hermes substrate inspect recall sample --session-id <hermes-session-id>
-hermes substrate inspect recall config        # current RECALL_* knobs
+hermes substrate recall               # last-hour call stats + embedding coverage
+hermes substrate recall recent --limit 20
+hermes substrate recall sample --session-id <hermes-session-id>
+hermes substrate recall config        # current RECALL_* knobs
 ```
 
 ## Tables
@@ -176,13 +176,13 @@ possibly empty with `empty_reason` set (`timeout`, `no_candidates`,
 
 ```bash
 # Are calls happening + landing in the log?
-hermes substrate inspect recall
+hermes substrate recall
 
 # Look at a specific session's most-recent recall
-hermes substrate inspect recall sample --session-id <id>
+hermes substrate recall sample --session-id <id>
 
 # What's the embedding coverage? (Curator backfills async — climbs toward 100%)
-hermes substrate inspect recall    # "coverage" line in the summary
+hermes substrate recall    # "coverage" line in the summary
 ```
 
 Recall against slices without embeddings falls back to keyword Jaccard, so
@@ -197,10 +197,10 @@ coverage is an optimization target, not a correctness gate.
 hermes sessions list | head
 
 # All user-message slices for the CLI source, ordered most-recent first
-hermes substrate inspect slices --stream hermes.world.user_message.cli --limit 50
+hermes substrate slices --stream hermes.world.user_message.cli --limit 50
 
 # Assistant responses
-hermes substrate inspect slices --stream hermes.self_action.assistant_response --limit 50
+hermes substrate slices --stream hermes.self_action.assistant_response --limit 50
 ```
 
 For session-scoped filtering you currently need raw SQL — the `payload` JSON
@@ -217,7 +217,7 @@ SELECT event_time_world, payload->>'text' AS text
 
 ### "Why didn't recall return X?"
 
-1. `hermes substrate inspect recall sample --session-id <id>` — look at
+1. `hermes substrate recall sample --session-id <id>` — look at
    the most recent recall row for that session. Check `empty_reason`,
    `returned_count`, and the candidate count.
 2. If `empty_reason='no_candidates'`: the time window
@@ -235,10 +235,10 @@ SELECT event_time_world, payload->>'text' AS text
 
 ```bash
 # Summary line includes embedding coverage %
-hermes substrate inspect recall
+hermes substrate recall
 
 # Recent curator emissions — look for curator.embed_batch successes/failures
-hermes substrate inspect curator recent --limit 50
+hermes substrate curator recent --limit 50
 ```
 
 If coverage is stuck below 100% and growing slowly, check:
@@ -354,19 +354,19 @@ A healthy substrate, freshly booted, should pass these checks:
 
 ```bash
 # 1. Streams present (15 — 7 user-message sources + 7 self-action/state + 1 substrate.self_state)
-hermes substrate inspect streams | wc -l    # ~17 lines (header + 15)
+hermes substrate streams | wc -l    # ~17 lines (header + 15)
 
 # 2. Decay profiles seeded (4)
-hermes substrate inspect profiles | wc -l    # ~6 lines (header + 4)
+hermes substrate profiles | wc -l    # ~6 lines (header + 4)
 
 # 3. Pending queue not growing without bound (depth should stay low under steady use)
-hermes substrate inspect pending
+hermes substrate pending
 
 # 4. After a few turns of conversation, slices > 0
-hermes substrate inspect    # "Slices: N total" should be non-zero
+hermes substrate    # "Slices: N total" should be non-zero
 
 # 5. After Curator has run at least once, recent curator emissions exist
-hermes substrate inspect curator recent
+hermes substrate curator recent
 ```
 
 If any of these fail on a fresh install: re-run `alembic upgrade head`, then
@@ -383,7 +383,7 @@ restart Hermes.
 - **The substrate is write-mostly in steady state.** A long-running Hermes
   emits hundreds of slices per active session. If you see PG storage growing
   fast, the Curator is the throttle — verify it's ticking
-  (`hermes substrate inspect curator recent`) and the
+  (`hermes substrate curator recent`) and the
   `consolidation_window` on your decay profiles is reasonable.
 - **`HERMES_SUBSTRATE_RECALL=1` is irreversible mid-process.** The
   `SubstrateMemoryProvider` checks the env var at construction time. To

@@ -898,7 +898,7 @@ alongside the conversation loop. Phases A–C are shipped:
   invocations must set `PYTEST_XDIST_WORKER=run_<unique-id>` and point at
   the test container. See `tests/conftest.py:_TEST_PG_PORT`.
 
-CLI surface: `hermes substrate inspect [streams | slices | pending |
+CLI surface: `hermes substrate [streams | slices | pending |
 profiles | curator | recall]` (substitute the launcher name for a
 side-by-side install). Operator-facing playbook is the bundled
 `substrate` skill (`skills/substrate/SKILL.md`).

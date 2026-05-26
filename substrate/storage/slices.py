@@ -447,7 +447,7 @@ class SliceRepo:
              last ``window_seconds`` (proxy for Curator + reinforcement
              activity)
 
-        Surfaced by ``hermes substrate inspect curator pressure``. Phase
+        Surfaced by ``hermes substrate curator pressure``. Phase
         B doesn't consume this programmatically — it's an operator
         observability window into what Phase F's real Conductor will
         eventually read for opportunity-forecast inputs.

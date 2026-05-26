@@ -1331,7 +1331,7 @@ print_success() {
     echo -e "   ${GREEN}$CLI_NAME${NC}                Start chatting"
     echo -e "   ${GREEN}$CLI_NAME setup${NC}          Configure API keys & settings"
     echo -e "   ${GREEN}$CLI_NAME config${NC}         View/edit configuration"
-    echo -e "   ${GREEN}$CLI_NAME substrate inspect${NC}  Show running sub-agents + stream stats"
+    echo -e "   ${GREEN}$CLI_NAME substrate${NC}      Show running sub-agents + stream stats"
     echo -e "   ${GREEN}$CLI_NAME gateway install${NC}    Background gateway service (messaging + cron)"
     echo ""
 

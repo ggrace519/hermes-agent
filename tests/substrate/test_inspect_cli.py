@@ -43,14 +43,16 @@ def _now_utc() -> datetime:
 
 
 def test_register_subparser_adds_inspect_tree():
-    """The ``substrate`` parser plus ``inspect`` subparsers must be
-    addable to a fresh top-level parser without errors."""
+    """The ``substrate`` parser and its inspection subparsers must be
+    addable to a fresh top-level parser without errors. Post-flatten
+    (PR #100) the commands sit directly under ``substrate`` rather than
+    under a redundant ``inspect`` verb."""
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
     inspect_mod.register_subparser(sub)
 
-    # Successful parse of `substrate inspect streams`.
-    ns = parser.parse_args(["substrate", "inspect", "streams"])
+    # Successful parse of `substrate streams`.
+    ns = parser.parse_args(["substrate", "streams"])
     assert ns.command == "substrate"
     assert callable(ns.func)
 
@@ -61,7 +63,7 @@ def test_register_subparser_slices_requires_stream_arg():
     inspect_mod.register_subparser(sub)
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["substrate", "inspect", "slices"])  # --stream missing
+        parser.parse_args(["substrate", "slices"])  # --stream missing
 
 
 # ---------------------------------------------------------------------------
@@ -208,27 +210,28 @@ async def test_print_profiles_lists_4_seeded(booted_substrate):
 
 
 def test_register_subparser_recall_subtree():
-    """The recall subparser tree parses cleanly."""
+    """The recall subparser tree parses cleanly. Post-flatten
+    (PR #100) ``recall`` sits directly under ``substrate``."""
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
     inspect_mod.register_subparser(sub)
 
     # Default 'recall' → summary.
-    ns = parser.parse_args(["substrate", "inspect", "recall"])
+    ns = parser.parse_args(["substrate", "recall"])
     assert callable(ns.func)
 
     # recall recent --limit 5.
-    ns = parser.parse_args(["substrate", "inspect", "recall", "recent", "--limit", "5"])
+    ns = parser.parse_args(["substrate", "recall", "recent", "--limit", "5"])
     assert ns.limit == 5
 
     # recall sample requires session-id.
     ns = parser.parse_args(
-        ["substrate", "inspect", "recall", "sample", "--session-id", "sess-A"]
+        ["substrate", "recall", "sample", "--session-id", "sess-A"]
     )
     assert ns.session_id == "sess-A"
 
     # recall config takes no args.
-    ns = parser.parse_args(["substrate", "inspect", "recall", "config"])
+    ns = parser.parse_args(["substrate", "recall", "config"])
     assert callable(ns.func)
 
 

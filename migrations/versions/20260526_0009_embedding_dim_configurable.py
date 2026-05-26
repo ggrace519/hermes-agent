@@ -54,6 +54,7 @@ from __future__ import annotations
 import os
 
 from alembic import op
+from sqlalchemy import text
 
 
 revision = "20260526_0009"
@@ -94,13 +95,15 @@ def _current_dim(conn) -> int | None:
     None if the column doesn't exist or isn't a vector type (shouldn't
     happen — Phase C 0006 created it — but defensive)."""
     row = conn.execute(
-        """
-        SELECT format_type(atttypid, atttypmod) AS coltype
-          FROM pg_attribute
-         WHERE attrelid = 'substrate_slices'::regclass
-           AND attname  = 'embedding'
-           AND NOT attisdropped
-        """
+        text(
+            """
+            SELECT format_type(atttypid, atttypmod) AS coltype
+              FROM pg_attribute
+             WHERE attrelid = 'substrate_slices'::regclass
+               AND attname  = 'embedding'
+               AND NOT attisdropped
+            """
+        )
     ).fetchone()
     if row is None:
         return None

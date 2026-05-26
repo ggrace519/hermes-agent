@@ -112,10 +112,10 @@ async def test_session_roundtrip_emits_substrate_slices(booted):
 
 @pytest.mark.asyncio
 async def test_inspect_summary_after_roundtrip_is_nonempty(booted):
-    """After a session round-trip, ``hermes substrate inspect`` reports
+    """After a session round-trip, ``hermes substrate`` reports
     non-zero slice counts and the expected sub-agent section.
 
-    This is the §12 acceptance #4 surrogate: *"hermes substrate inspect
+    This is the §12 acceptance #4 surrogate: *"hermes substrate
     returns a non-empty summary with sensible counts after one or more
     real sessions."*
     """

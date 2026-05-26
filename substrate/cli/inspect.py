@@ -1,21 +1,25 @@
-"""``hermes substrate inspect`` — Phase A debug subcommand.
+"""``hermes substrate`` — substrate state inspection commands.
 
-Surface (per spec §10):
+Surface (flattened from earlier ``hermes substrate inspect <thing>``;
+the redundant ``inspect`` verb was removed 2026-05-26):
 
-    hermes substrate inspect              # default summary
-    hermes substrate inspect streams      # list streams + slice counts
-    hermes substrate inspect slices --stream NAME --limit 20
-    hermes substrate inspect pending      # current pending-queue depth
-    hermes substrate inspect profiles     # decay profiles
+    hermes substrate                       # default summary
+    hermes substrate streams               # list streams + slice counts
+    hermes substrate slices --stream NAME --limit 20
+    hermes substrate pending               # current pending-queue depth
+    hermes substrate profiles              # decay profiles
+    hermes substrate curator [SUB]         # Curator subtree (Phase B)
+    hermes substrate recall  [SUB]         # Recall subtree (Phase C)
 
 The CLI does not boot the full substrate (no sub-agent loops) — it just
 initialises the asyncpg pool, runs read-only queries against the substrate
-tables, and prints a fixed-format report. This keeps the inspect command
-safe to run against a Hermes deployment that is already booted in another
-process.
+tables, and prints a fixed-format report. Safe to run against a Hermes
+deployment that is already booted in another process.
 
 Wired into Hermes's top-level argparse via :func:`register_subparser`
-called from ``hermes_cli/main.py``.
+called from ``hermes_cli/main.py``. Mutating/admin operations on
+embeddings live under the separate ``hermes embed`` namespace; see
+``substrate/cli/embed.py``.
 """
 
 from __future__ import annotations
@@ -43,71 +47,64 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     """
     substrate_parser = subparsers.add_parser(
         "substrate",
-        help="Cognitive substrate debug surface (Phase A)",
-        description="Inspect the substrate's perception streams, slices, "
-        "decay profiles, and pending queue.",
+        help="Inspect substrate state (streams, slices, curator, recall)",
+        description="Read-only inspection of the substrate's perception "
+        "streams, slices, decay profiles, pending queue, and the Curator + "
+        "recall subsystems. With no subcommand, prints the default summary. "
+        "Embedding admin (reshape, backfill) lives under ``hermes embed``.",
     )
     substrate_sub = substrate_parser.add_subparsers(dest="substrate_command")
+    # Default for ``hermes substrate`` with no subcommand: print the summary
+    # (the same content the old ``hermes substrate inspect`` printed).
+    substrate_parser.set_defaults(func=_cmd_inspect_summary)
 
-    inspect_parser = substrate_sub.add_parser(
-        "inspect",
-        help="Inspect substrate state",
-        description="Print a summary of substrate state. Without an argument, "
-        "prints the default summary (streams, slice counts, pending queue).",
-    )
-    inspect_sub = inspect_parser.add_subparsers(dest="inspect_command")
-    inspect_parser.set_defaults(func=_cmd_inspect_summary)
-
-    inspect_streams = inspect_sub.add_parser(
+    substrate_sub.add_parser(
         "streams", help="List streams + per-stream slice counts"
-    )
-    inspect_streams.set_defaults(func=_cmd_inspect_streams)
+    ).set_defaults(func=_cmd_inspect_streams)
 
-    inspect_slices = inspect_sub.add_parser(
+    slices_p = substrate_sub.add_parser(
         "slices", help="List the most-recent N slices on a given stream"
     )
-    inspect_slices.add_argument(
+    slices_p.add_argument(
         "--stream",
         required=True,
         help="Stream name (e.g. hermes.world.user_message.cli)",
     )
-    inspect_slices.add_argument(
+    slices_p.add_argument(
         "--limit",
         type=int,
         default=20,
         help="Max number of slices to show (default 20)",
     )
-    inspect_slices.set_defaults(func=_cmd_inspect_slices)
+    slices_p.set_defaults(func=_cmd_inspect_slices)
 
-    inspect_pending = inspect_sub.add_parser(
+    substrate_sub.add_parser(
         "pending", help="Show pending-queue depth + oldest entry age"
-    )
-    inspect_pending.set_defaults(func=_cmd_inspect_pending)
+    ).set_defaults(func=_cmd_inspect_pending)
 
-    inspect_profiles = inspect_sub.add_parser(
+    substrate_sub.add_parser(
         "profiles", help="List decay profiles"
-    )
-    inspect_profiles.set_defaults(func=_cmd_inspect_profiles)
+    ).set_defaults(func=_cmd_inspect_profiles)
 
     # ── Phase B: curator subtree ──────────────────────────────────────
-    inspect_curator = inspect_sub.add_parser(
+    curator_p = substrate_sub.add_parser(
         "curator",
         help="Inspect Curator state (Phase B)",
         description="Show Curator decay/release activity. Without a sub "
         "subcommand, prints the default summary.",
     )
-    inspect_curator_sub = inspect_curator.add_subparsers(dest="curator_subcommand")
-    inspect_curator.set_defaults(func=_cmd_inspect_curator_summary)
+    curator_sub = curator_p.add_subparsers(dest="curator_subcommand")
+    curator_p.set_defaults(func=_cmd_inspect_curator_summary)
 
-    inspect_curator_sub.add_parser(
+    curator_sub.add_parser(
         "summary", help="Curator summary (default)"
     ).set_defaults(func=_cmd_inspect_curator_summary)
 
-    inspect_curator_sub.add_parser(
+    curator_sub.add_parser(
         "histogram", help="Per-profile salience histogram (10 buckets)"
     ).set_defaults(func=_cmd_inspect_curator_histogram)
 
-    curator_recent = inspect_curator_sub.add_parser(
+    curator_recent = curator_sub.add_parser(
         "recent", help="Recent curator.* self-state emissions"
     )
     curator_recent.add_argument(
@@ -115,25 +112,25 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     curator_recent.set_defaults(func=_cmd_inspect_curator_recent)
 
-    inspect_curator_sub.add_parser(
+    curator_sub.add_parser(
         "pressure",
         help="Per-stream salience pressure (Conductor opportunity-forecast inputs)",
     ).set_defaults(func=_cmd_inspect_curator_pressure)
 
     # ── Phase C: recall subtree ───────────────────────────────────────
-    inspect_recall = inspect_sub.add_parser(
+    recall_p = substrate_sub.add_parser(
         "recall",
         help="Inspect recall pipeline state (Phase C)",
         description="Show recent recall calls + embedding coverage + config.",
     )
-    inspect_recall_sub = inspect_recall.add_subparsers(dest="recall_subcommand")
-    inspect_recall.set_defaults(func=_cmd_inspect_recall_summary)
+    recall_sub = recall_p.add_subparsers(dest="recall_subcommand")
+    recall_p.set_defaults(func=_cmd_inspect_recall_summary)
 
-    inspect_recall_sub.add_parser(
+    recall_sub.add_parser(
         "summary", help="Recall summary (default) — last 1h call stats + coverage"
     ).set_defaults(func=_cmd_inspect_recall_summary)
 
-    recall_recent = inspect_recall_sub.add_parser(
+    recall_recent = recall_sub.add_parser(
         "recent", help="Recent recall calls (substrate_recall_log)"
     )
     recall_recent.add_argument(
@@ -141,7 +138,7 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     recall_recent.set_defaults(func=_cmd_inspect_recall_recent)
 
-    recall_sample = inspect_recall_sub.add_parser(
+    recall_sample = recall_sub.add_parser(
         "sample", help="Last recall log row for a given session"
     )
     recall_sample.add_argument(
@@ -149,20 +146,9 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     recall_sample.set_defaults(func=_cmd_inspect_recall_sample)
 
-    inspect_recall_sub.add_parser(
+    recall_sub.add_parser(
         "config", help="Dump RECALL_* config knobs"
     ).set_defaults(func=_cmd_inspect_recall_config)
-
-    substrate_parser.set_defaults(func=_cmd_substrate_help)
-
-
-def _cmd_substrate_help(args: argparse.Namespace) -> int:
-    """Default for ``hermes substrate`` with no subcommand."""
-    print(
-        "usage: hermes substrate inspect [streams|slices|pending|profiles]",
-        file=sys.stderr,
-    )
-    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +237,7 @@ def _run_inspect(action) -> int:
     if not hermes_db.ensure_pool_sync():
         print(
             "error: HERMES_PG_DSN is not set and no pool is initialised; "
-            "configure it before running `hermes substrate inspect`.",
+            "configure it before running `hermes substrate`.",
             file=sys.stderr,
         )
         return 1
@@ -317,7 +303,7 @@ async def _print_summary(conn: "asyncpg.Connection") -> None:
     print("Sub-agents (intensity):")
     # Sub-agent state lives in-process; the CLI doesn't have a handle to
     # the booted Substrate. Print the static expected list — operators
-    # wanting live intensity should run `hermes substrate inspect`
+    # wanting live intensity should run `hermes substrate`
     # against a Hermes process via an admin surface (Phase B+).
     print("   sentinel        FULL    (Phase A stub — see process logs)")
     print("   force-reject    LOW     (Phase A — see process logs)")
@@ -472,7 +458,7 @@ def _short_payload(payload) -> str:
 
 
 async def _print_curator_summary(conn: "asyncpg.Connection") -> None:
-    """Default ``hermes substrate inspect curator`` output. Matches the
+    """Default ``hermes substrate curator`` output. Matches the
     format documented in Phase B spec §9.2."""
     now = datetime.now(timezone.utc)
     print(f"Curator state @ {now.isoformat()}")
