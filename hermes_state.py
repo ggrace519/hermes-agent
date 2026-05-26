@@ -39,6 +39,13 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
     return f"{prefix}."
 
 
+# Module-level once-per-process flag for the "substrate not bound" warn
+# in _emit_substrate_message_hook. Without this, a hot append_message
+# loop spams the log line for every message. False at import time;
+# flipped to True after first warn fires.
+_SUBSTRATE_UNBOUND_WARNED = False
+
+
 # ---------------------------------------------------------------------------
 # Substrate perception hook bridge — Phase A §7 wiring.
 #
@@ -68,13 +75,44 @@ async def _emit_substrate_message_hook(
         from datetime import datetime, timezone
 
         from substrate.events import hermes_hooks
-    except Exception:  # pragma: no cover — substrate import failure
+    except Exception as _imp_exc:  # pragma: no cover — substrate import failure
+        # Was a silent return. Surface it so operators can spot a broken
+        # install (missing substrate package, partial site-packages, etc.)
+        # instead of staring at empty user_message streams.
+        logger.warning(
+            "substrate.hooks import failed in _emit_substrate_message_hook: %s",
+            _imp_exc,
+        )
         return
 
     # No-op when substrate isn't booted (CLI subcommands that touch
     # SessionDB without going through bootstrap_substrate).
     if hermes_hooks._substrate is None:
+        # Was also silent. Single log per process via a module-level
+        # flag so we don't spam every append_message call.
+        global _SUBSTRATE_UNBOUND_WARNED
+        if not _SUBSTRATE_UNBOUND_WARNED:
+            _SUBSTRATE_UNBOUND_WARNED = True
+            logger.warning(
+                "substrate hooks NOT firing — hermes_hooks._substrate is None "
+                "(substrate boot probably skipped or failed; user/tool/assistant "
+                "stream coverage will be 0). First append_message at "
+                "session=%s role=%s; further occurrences suppressed.",
+                session_id, role,
+            )
         return
+
+    # Trace EVERY hook attempt at DEBUG so a single log scan can
+    # diagnose stream-coverage gaps:
+    #     grep "substrate.hook.attempt" ~/.hermes/logs/agent.log
+    # Should produce one line per append_message in a healthy install.
+    # Zero lines = hook code not reached.
+    logger.debug(
+        "substrate.hook.attempt role=%s session=%s content_len=%s "
+        "tool_calls=%s tool_name=%s",
+        role, session_id, len(content) if content else 0,
+        bool(tool_calls), tool_name,
+    )
 
     t_event = datetime.now(timezone.utc)
 
