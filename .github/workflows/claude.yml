@@ -1,0 +1,73 @@
+name: Claude (@mention handler)
+
+# Responds to "@claude" mentions in PR comments, PR review comments,
+# PR review summaries, and issue bodies/comments. Companion to
+# ``claude-review.yml`` (which auto-reviews every PR on open). This
+# workflow handles the conversational surface: ask Claude a question,
+# request a fix, or push back on its auto-review output, and it replies
+# in-thread.
+#
+# Why a separate workflow:
+# - ``claude-review.yml`` listens on ``pull_request`` (PR open / sync /
+#   reopen / ready_for_review). It can't see ``issue_comment`` or
+#   ``pull_request_review_comment`` events without a different
+#   ``on:`` block, and mixing the two trigger sets in one workflow
+#   makes the if-gate brittle.
+# - Two workflows = one purpose each. Each one's permissions, concurrency,
+#   and trigger predicate stay legible.
+#
+# Required repository secret:
+#   ANTHROPIC_API_KEY — shared with ``claude-review.yml``. If missing the
+#   action no-ops with a warning rather than failing the workflow.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened, assigned]
+
+permissions:
+  contents: write          # claude can land suggested fixes when asked
+  pull-requests: write
+  issues: write
+  id-token: write          # required for the v1 action's OIDC GitHub auth
+
+concurrency:
+  # Serialize per (issue|pr, user) so two rapid mentions don't race.
+  group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.actor }}
+  cancel-in-progress: false   # don't cancel mid-response; let prior finish
+
+jobs:
+  claude:
+    # Only run when "@claude" actually appears in the event payload. The
+    # alternation covers each event type's body field — without this
+    # gate, every comment on every issue/PR would spin up the action.
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          # Shallow clone — the mention handler doesn't usually need
+          # deep history. Diff-against-base reviews live in
+          # ``claude-review.yml`` with ``fetch-depth: 0``.
+          fetch-depth: 1
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: --model claude-sonnet-4-5
+          # No ``prompt`` here — Claude reads the @mention and the
+          # surrounding thread context, then responds in-thread.
+          # ``trigger_phrase`` defaults to ``@claude`` which matches our
+          # ``if:`` gate above.
