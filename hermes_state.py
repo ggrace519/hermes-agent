@@ -102,12 +102,17 @@ async def _emit_substrate_message_hook(
             )
         return
 
-    # Trace EVERY hook attempt at DEBUG so a single log scan can
+    # Trace EVERY hook attempt at INFO so a single log scan can
     # diagnose stream-coverage gaps:
     #     grep "substrate.hook.attempt" ~/.hermes/logs/agent.log
     # Should produce one line per append_message in a healthy install.
-    # Zero lines = hook code not reached.
-    logger.debug(
+    # Zero lines + at least one "substrate.hook.about_to_call" line
+    # below = an exception is being swallowed somewhere in the hook
+    # path. Bumped from DEBUG to INFO because the CLI gates DEBUG
+    # behind ``hermes -v`` and most operators won't have it set; this
+    # diagnostic is temporary and the line will be demoted back to
+    # DEBUG once the missing-streams bug is closed.
+    logger.info(
         "substrate.hook.attempt role=%s session=%s content_len=%s "
         "tool_calls=%s tool_name=%s",
         role, session_id, len(content) if content else 0,
@@ -1033,8 +1038,32 @@ class _AsyncSessionDB:
             # slice and the message row commit together. Failures are
             # logged + swallowed inside the helper so message persistence
             # is never blocked by a substrate problem.
-            await _emit_substrate_message_hook(
-                conn, session_id, role, content, tool_calls, tool_name,
+            #
+            # TEMPORARY (diag/append-message-call-trace): bracket the
+            # hook call with INFO logs to confirm reachability. Open
+            # issue: production has 0 user_message slices despite many
+            # append_message calls landing in PG. Either this line
+            # never runs (then "about_to_call" won't appear) OR the
+            # hook silently swallows an exception (then "about_to_call"
+            # appears but no "substrate.hook.attempt" follows). Remove
+            # both INFO lines once the bug is closed.
+            logger.info(
+                "substrate.hook.about_to_call role=%s session=%s msg_id=%s",
+                role, session_id, msg_id,
+            )
+            try:
+                await _emit_substrate_message_hook(
+                    conn, session_id, role, content, tool_calls, tool_name,
+                )
+            except Exception:
+                logger.exception(
+                    "substrate.hook.raised_uncaught role=%s session=%s — "
+                    "the hook is documented as never-raises; this is a bug",
+                    role, session_id,
+                )
+            logger.info(
+                "substrate.hook.returned role=%s session=%s",
+                role, session_id,
             )
         return msg_id
 
