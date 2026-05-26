@@ -81,8 +81,16 @@ jobs:
           # Pin the review to actionable items so the comment stays useful
           # for the human reviewer.
           prompt: |
-            You are reviewing a pull request against ``main``. Produce a
-            short Markdown summary (under 400 words) covering:
+            You are reviewing a pull request against ``main``. After
+            reading the diff, **post a single sticky review comment on
+            this PR** (use the ``mcp__github_inline_comment__post_pr_comment``
+            tool, or any equivalent GitHub-comment tool available to you —
+            the action wires one of these in for you). Without that tool
+            call the review is invisible to the human reviewer no matter
+            how long you spend analysing.
+
+            The comment body must be a short Markdown summary (under 400
+            words) covering:
 
             1. **Correctness risks** — concrete bugs, off-by-one errors,
                broken invariants. Cite file:line. Skip stylistic nits.
@@ -92,5 +100,6 @@ jobs:
             4. **Migration / compatibility** — schema changes, breaking
                API edits, data migration safety.
 
-            If the diff is clean, say so in one line. Do NOT restate the
-            PR description.
+            If the diff is clean, post a one-line comment saying so. Do
+            NOT restate the PR description. Always post — silence is a
+            failure mode, not "looks fine."
