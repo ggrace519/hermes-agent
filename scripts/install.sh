@@ -88,12 +88,25 @@ PG_DATABASE_DEFAULT="hermes"
 ROOT_FHS_LAYOUT=false
 DETECTED_BROWSER_EXECUTABLE=""
 
+# ── Update vs. fresh install (set by detect_install_mode after arg parsing) ─
+# IS_UPDATE=true when the installer is re-running against an existing install
+# (detected by ``$HERMES_HOME/.install_log`` or an existing git checkout at
+# $INSTALL_DIR). On updates we preserve user-customized config, skip the
+# setup wizard when API keys are already configured, and back up .env
+# before any in-place mutation.
+IS_UPDATE=false
+
 # ── Options ─────────────────────────────────────────────────────────────────
 USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 SKIP_POSTGRES=false        # NEW: skip docker compose up + alembic upgrade
 SKIP_NODE=false            # NEW: skip ui-tui/web npm installs
+# Force-rewrite preserves nothing: HERMES_PG_DSN, browser env, etc. get
+# rewritten even if the user customized them. Existing values are backed
+# up to ``$HERMES_HOME/.install-backup/`` first. Off by default — the
+# installer auto-detects updates and keeps user config intact.
+FORCE_REWRITE_CONFIG=false
 BRANCH="main"
 
 # Detect non-interactive mode (curl | bash)
@@ -116,6 +129,7 @@ while [[ $# -gt 0 ]]; do
         --hermes-home)     HERMES_HOME="$2"; shift 2 ;;
         --cli-name)        CLI_NAME="$2"; shift 2 ;;
         --pg-dsn)          PG_DSN_OVERRIDE="$2"; shift 2 ;;
+        --force-rewrite-config) FORCE_REWRITE_CONFIG=true; shift ;;
         -h|--help)
             cat <<HELP_EOF
 Hermes Agent installer
@@ -145,6 +159,12 @@ Options:
   --pg-dsn URL        PostgreSQL DSN to use
                         default: postgresql://hermes:hermes@localhost:5432/hermes
                         (matches the docker-compose service shipped with this repo)
+  --force-rewrite-config
+                      On updates, rewrite HERMES_PG_DSN and other installer-
+                      managed entries in .env even when they have been
+                      customized (a timestamped backup is written to
+                      $HERMES_HOME/.install-backup/ first). Default: preserve
+                      user-customized values.
   -h, --help          Show this help
 
 Side-by-side install (coexist with an existing upstream Hermes):
@@ -228,6 +248,27 @@ is_termux() {
 
 # Resolve installation layout. Substrate edition keeps the same layout
 # decision tree as upstream but with new defaults.
+detect_install_mode() {
+    # An "update" is when ANY of these markers exist from a prior install
+    # against this $HERMES_HOME / $INSTALL_DIR pair:
+    #   - $HERMES_HOME/.install_log    — written at the end of every install
+    #   - $HERMES_HOME/.hermes_install — written by copy_config_templates
+    #   - $HERMES_HOME/.substrate_install — legacy marker (pre-2026-05-26)
+    #   - $INSTALL_DIR/.git            — repo is already cloned
+    # Any one of these indicates the user has run the installer before, so
+    # we preserve their config/state and skip first-run wizards.
+    if [ -f "$HERMES_HOME/.install_log" ] \
+       || [ -f "$HERMES_HOME/.hermes_install" ] \
+       || [ -f "$HERMES_HOME/.substrate_install" ] \
+       || [ -d "$INSTALL_DIR/.git" ]; then
+        IS_UPDATE=true
+        log_info "Existing installation detected — running in UPDATE mode."
+        log_info "  Your config (.env, config.yaml, SOUL.md) will be preserved."
+        log_info "  Setup wizard will be skipped if API keys are already configured."
+        log_info "  Pass --force-rewrite-config to override (rare; backs up existing first)."
+    fi
+}
+
 resolve_install_layout() {
     if [ "$INSTALL_DIR_EXPLICIT" = true ]; then
         log_info "Install directory: $INSTALL_DIR (explicit)"
@@ -1082,6 +1123,32 @@ EOF
     export PATH="$link_dir:$PATH"
 }
 
+# Back up $HERMES_HOME/.env before any in-place mutation. Backup name
+# embeds an ISO timestamp + a short reason tag so users can tell which
+# rewrite produced each file. No-op if .env doesn't exist yet.
+_backup_env_file() {
+    local reason="${1:-rewrite}"
+    local env_file="$HERMES_HOME/.env"
+    [ -f "$env_file" ] || return 0
+    local backup_dir="$HERMES_HOME/.install-backup"
+    mkdir -p "$backup_dir"
+    local ts
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    local backup_path="$backup_dir/.env.$ts.$reason"
+    cp "$env_file" "$backup_path"
+    log_info "Backed up .env to $backup_path"
+}
+
+# Predicate: does the user already have a usable provider API key in .env?
+# Used by run_setup_wizard to skip re-prompting on updates when the user
+# clearly already finished setup. Conservative — only checks the most
+# common provider keys; if none match we still run the wizard.
+_env_has_provider_api_key() {
+    local env_file="$HERMES_HOME/.env"
+    [ -f "$env_file" ] || return 1
+    grep -qE '^(OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENROUTER_API_KEY|NOUS_API_KEY|GEMINI_API_KEY|GROQ_API_KEY|XAI_API_KEY|MISTRAL_API_KEY|DEEPSEEK_API_KEY|OLLAMA_BASE_URL|CUSTOM_API_KEY)=..*' "$env_file"
+}
+
 copy_config_templates() {
     log_info "Setting up configuration files in $HERMES_HOME..."
     mkdir -p "$HERMES_HOME"/{cron,sessions,logs,pairing,hooks,image_cache,audio_cache,memories,skills}
@@ -1100,18 +1167,41 @@ copy_config_templates() {
 
     # Ensure HERMES_PG_DSN in .env matches THIS install's PG so non-launcher
     # entry points (gateway, cron jobs spawned outside the shim) can find
-    # the database. Always rewrite — an earlier run that picked a different
-    # port (e.g. 5432 before the user passed --pg-dsn :5434 on the re-run)
-    # would otherwise leave a stale line .env that gets loaded preferentially
-    # over the launcher's HERMES_PG_DSN default.
+    # the database. On updates we preserve user customizations: only rewrite
+    # when the existing DSN looks installer-managed (points at the local
+    # docker-compose PG via localhost/127.0.0.1/postgres host) AND the port
+    # drifted. Custom DSNs — remote PG, custom creds, hosted Postgres
+    # (Neon/Supabase/RDS) — are left untouched.
     local pg_dsn="${PG_DSN_OVERRIDE:-postgresql://${PG_USER_DEFAULT}:${PG_PASSWORD_DEFAULT}@${PG_HOST_DEFAULT}:${PG_PORT_DEFAULT}/${PG_DATABASE_DEFAULT}}"
     if grep -q '^HERMES_PG_DSN=' "$HERMES_HOME/.env" 2>/dev/null; then
         local cur
         cur=$(grep '^HERMES_PG_DSN=' "$HERMES_HOME/.env" | head -1 | cut -d= -f2-)
         if [ "$cur" != "$pg_dsn" ]; then
-            # Use a delimiter that can't appear in the DSN.
-            sed -i "s|^HERMES_PG_DSN=.*|HERMES_PG_DSN=$pg_dsn|" "$HERMES_HOME/.env"
-            log_success "Updated HERMES_PG_DSN in $HERMES_HOME/.env ($cur → $pg_dsn)"
+            # Detect "looks installer-managed" via host segment matching one
+            # of the docker-compose-friendly localhost aliases.
+            local _looks_local=false
+            case "$cur" in
+                *@localhost:*|*@127.0.0.1:*|*@postgres:*) _looks_local=true ;;
+            esac
+
+            if [ "$FORCE_REWRITE_CONFIG" = true ]; then
+                _backup_env_file "force-rewrite-config"
+                sed -i "s|^HERMES_PG_DSN=.*|HERMES_PG_DSN=$pg_dsn|" "$HERMES_HOME/.env"
+                log_success "Updated HERMES_PG_DSN in $HERMES_HOME/.env ($cur → $pg_dsn) [--force-rewrite-config]"
+            elif [ "$_looks_local" = true ]; then
+                # Local DSN whose port drifted (typical after a port-bump
+                # on an upgrade). Safe to rewrite — but back up first.
+                _backup_env_file "pg-dsn-port-drift"
+                sed -i "s|^HERMES_PG_DSN=.*|HERMES_PG_DSN=$pg_dsn|" "$HERMES_HOME/.env"
+                log_success "Updated HERMES_PG_DSN in $HERMES_HOME/.env ($cur → $pg_dsn)"
+            else
+                # Non-local DSN — almost certainly user-customized
+                # (remote PG, hosted service, custom creds). Leave it.
+                log_warn "HERMES_PG_DSN in $HERMES_HOME/.env points at a non-local cluster:"
+                log_warn "  $cur"
+                log_warn "  This install's local PG is at $pg_dsn — NOT rewriting."
+                log_warn "  Pass --force-rewrite-config to overwrite (backs up .env first)."
+            fi
         fi
     else
         printf '\n# Substrate PostgreSQL DSN (added by installer)\nHERMES_PG_DSN=%s\n' "$pg_dsn" >> "$HERMES_HOME/.env"
@@ -1295,6 +1385,14 @@ run_setup_wizard() {
         log_info "No TTY — skipping wizard. Run '$CLI_NAME setup' interactively when you have one."
         return 0
     fi
+    # On updates, only re-run the wizard if the user hasn't already
+    # configured a provider. They almost certainly don't want to walk
+    # through model/provider selection again on every upgrade.
+    if [ "$IS_UPDATE" = true ] && _env_has_provider_api_key; then
+        log_info "Update mode: provider API key already in .env — skipping wizard."
+        log_info "  Re-run interactively any time with: $CLI_NAME setup"
+        return 0
+    fi
     echo ""
     log_info "Starting setup wizard..."
     cd "$INSTALL_DIR"
@@ -1366,6 +1464,7 @@ main() {
 
     detect_os
     resolve_install_layout
+    detect_install_mode
     warn_upstream_collision
 
     install_uv
