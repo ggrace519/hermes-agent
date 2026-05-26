@@ -404,10 +404,22 @@ def _termux_should_prefetch_update_check() -> bool:
 
 
 def _relative_time(ts) -> str:
-    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
+    """Format a timestamp as relative time (e.g., '2h ago', 'yesterday').
+
+    Accepts either a Unix-epoch ``float``/``int`` (legacy SQLite session
+    store rows) or a ``datetime`` (PG ``TIMESTAMPTZ`` columns returned by
+    asyncpg post-Phase-0 migration). Naive datetimes assumed UTC.
+    """
     if not ts:
         return "?"
-    delta = _time.time() - ts
+    if isinstance(ts, datetime):
+        from datetime import timezone as _tz
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        ts_epoch = ts.timestamp()
+    else:
+        ts_epoch = float(ts)
+    delta = _time.time() - ts_epoch
     if delta < 60:
         return "just now"
     if delta < 3600:
@@ -418,7 +430,7 @@ def _relative_time(ts) -> str:
         return "yesterday"
     if delta < 604800:
         return f"{int(delta / 86400)}d ago"
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ts_epoch).strftime("%Y-%m-%d")
 
 
 def _has_any_provider_configured() -> bool:
