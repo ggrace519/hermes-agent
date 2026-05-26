@@ -9,7 +9,25 @@ async def initialized_db(hermes_db_dsn):
     """`hermes_db_dsn` fixture comes from tests/conftest.py (Task 6).
 
     For Task 5's red phase the fixture does not exist yet; this test will
-    fail at fixture collection. That's expected — Task 6 makes it pass."""
+    fail at fixture collection. That's expected — Task 6 makes it pass.
+
+    Defensive loop-binding check mirrors ``hermes_db_initialized`` in
+    conftest: a prior sync test (or a ``run_sync`` call that lazy-
+    bootstrapped the pool on ``hermes_db._sync_loop``) may have left
+    ``hermes_db._pool`` bound to a different loop. ``init()`` is
+    idempotent — it would silently return without rebinding — so the
+    test body would inherit the stale pool and explode on teardown
+    with a cross-loop error from ``PoolConnectionHolder.close()``.
+    """
+    import asyncio
+    if hermes_db._pool is not None:
+        current = asyncio.get_running_loop()
+        pool_loop = getattr(hermes_db._pool, "_loop", None)
+        if pool_loop is not current:
+            try:
+                hermes_db.run_sync(hermes_db.close())
+            except Exception:
+                hermes_db._pool = None
     await hermes_db.init(hermes_db_dsn)
     yield
     await hermes_db.close()
