@@ -161,6 +161,9 @@ async def test_alarm_emits_self_state_slice(substrate):
         )
 
     curator = Curator(substrate)
+    # Production cooldown (1 hour) would suppress this freshly-seeded
+    # slice. Disable cooldown so the alarm fires on the first tick.
+    curator.ALARM_COOLDOWN_SECONDS = 0
     alarmed = await curator._alarm_pathological()
     assert len(alarmed) == 1
     await curator._emit_alarm_audit(alarmed)
@@ -183,7 +186,10 @@ async def test_alarm_emits_self_state_slice(substrate):
     assert payload["slice_id"] == str(slice_id)
     assert payload["age_seconds"] >= 60
     assert payload["consolidation_window_seconds"] == 60
-    assert payload["bumped_to"] == pytest.approx(0.7, abs=0.001)
+    # ``bumped_to`` historically reflected the post-bump salience. After
+    # the alarm-amplification fix, alarm no longer modifies salience —
+    # the field now records the current (unchanged) salience for audit.
+    assert payload["bumped_to"] == pytest.approx(0.4, abs=0.001)
     assert "alarmed_at" in payload
 
 

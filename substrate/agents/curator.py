@@ -50,6 +50,18 @@ _DECAY_MIN_INTERVAL_SECONDS = 1.0
 _RELEASE_BATCH_LIMIT = 200
 _ALARM_BATCH_LIMIT = 100
 
+# Don't re-alarm a slice we already touched in the last hour. Before
+# this, every tick re-found the same overdue slices and bumped them
+# again, producing 900+ alarm audit slices/hour at saturation and
+# defeating the decay loop entirely. The cooldown means an alarmed
+# slice gets ONE alarm per hour until something else (Parser
+# consolidation in Phase D, recall reinforcement, manual operator
+# intervention) changes its state.
+# Exposed as a class attribute on ``Curator`` (overridable) for tests
+# that need to fire the alarm against freshly-seeded data without
+# waiting an hour for the cooldown to expire.
+_ALARM_COOLDOWN_SECONDS = 3600
+
 
 class Curator(SubAgent):
     """Real Phase B Curator. Tick body runs decay → release → alarm.
@@ -65,6 +77,7 @@ class Curator(SubAgent):
 
     DECAY_MIN_INTERVAL_SECONDS = _DECAY_MIN_INTERVAL_SECONDS
     RELEASE_BATCH_LIMIT = _RELEASE_BATCH_LIMIT
+    ALARM_COOLDOWN_SECONDS = _ALARM_COOLDOWN_SECONDS
     ALARM_BATCH_LIMIT = _ALARM_BATCH_LIMIT
 
     def __init__(self, substrate: "Substrate") -> None:
@@ -244,49 +257,73 @@ class Curator(SubAgent):
     # ------------------------------------------------------------------
 
     async def _alarm_pathological(self) -> list[dict]:
-        """Find + bump + report up to ``ALARM_BATCH_LIMIT`` overdue slices.
+        """Find + report up to ``ALARM_BATCH_LIMIT`` overdue slices.
 
         Returns the per-alarm dicts so ``_emit_alarm_audit`` can write
         them without re-querying.
+
+        Three changes from the original Phase B spec implementation
+        (observed in production to be in a feedback loop, see
+        commit message):
+
+        1. No salience bump. The alarm is observational ("this slice
+           rotted past its consolidation_window without an upstream
+           consumer"). Bumping salience to 1.0 every tick defeats the
+           decay mechanism — once promoted, the slice never decays
+           again. We just record the rot in the audit slice and let
+           natural decay continue.
+
+        2. Per-slice cooldown via ``salience_updated_at``. After we
+           alarm a slice once, suppress re-alarms for the next hour
+           so an unconsolidated slice produces ONE alarm/hour instead
+           of one per tick. ``salience_updated_at`` is touched here so
+           subsequent ticks see it inside the cooldown window. Recall
+           reinforcement also touches this column, which is fine —
+           a slice the foreground keeps re-contacting doesn't need
+           pathological-forgetting alarms either.
+
+        3. Exclude alarms on the ``substrate.self_state`` stream
+           itself — alarm audit slices live there, and without this
+           exclusion they age past their own consolidation_window and
+           become alarm-eligible, producing a feedback loop that
+           saturated the curator at 900+ alarms/hour in production.
         """
         import hermes_db
 
-        # Read + bump in one transaction so concurrent Curators don't
-        # double-bump. The SELECT uses FOR UPDATE SKIP LOCKED.
         alarmed: list[dict] = []
         async with hermes_db.transaction() as conn:
             rows = await conn.fetch(
                 """
                 SELECT sl.slice_id, sl.stream_id, sl.ingest_time_world,
+                       sl.salience_score,
                        EXTRACT(EPOCH FROM (now() - sl.ingest_time_world))::bigint AS age_seconds,
-                       EXTRACT(EPOCH FROM dp.consolidation_window)::bigint AS window_seconds,
-                       dp.reinforcement_bump
+                       EXTRACT(EPOCH FROM dp.consolidation_window)::bigint AS window_seconds
                   FROM substrate_slices         sl
                   JOIN substrate_streams        st ON st.stream_id  = sl.stream_id
                   JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
                  WHERE sl.sentinel_state      = 'passed'
                    AND sl.consolidation_state = 'unconsolidated'
                    AND sl.ingest_time_world + dp.consolidation_window < now()
+                   AND sl.salience_updated_at < now() - make_interval(secs => $2)
+                   AND st.name != 'substrate.self_state'
                  ORDER BY sl.ingest_time_world ASC
                  LIMIT $1
                  FOR UPDATE OF sl SKIP LOCKED
                 """,
                 self.ALARM_BATCH_LIMIT,
+                self.ALARM_COOLDOWN_SECONDS,
             )
             for r in rows:
-                bump = float(r["reinforcement_bump"])
-                # Bump in the same txn so the SELECT lock chain stays
-                # tight. Returns the post-bump salience for the audit.
-                post = await conn.fetchval(
+                # Touch salience_updated_at so the cooldown predicate
+                # excludes this slice from the next ALARM_COOLDOWN_SECONDS
+                # of ticks. Salience itself is left alone — see docstring.
+                await conn.execute(
                     """
                     UPDATE substrate_slices
-                       SET salience_score = LEAST(1.0, salience_score + $2),
-                           salience_updated_at = now()
-                     WHERE slice_id = $1 AND ingest_time_world = $3
-                    RETURNING salience_score
+                       SET salience_updated_at = now()
+                     WHERE slice_id = $1 AND ingest_time_world = $2
                     """,
                     r["slice_id"],
-                    bump,
                     r["ingest_time_world"],
                 )
                 alarmed.append(
@@ -295,7 +332,10 @@ class Curator(SubAgent):
                         "stream_id": r["stream_id"],
                         "age_seconds": int(r["age_seconds"]),
                         "window_seconds": int(r["window_seconds"]),
-                        "bumped_to": float(post) if post is not None else None,
+                        # Kept in the audit payload for back-compat with
+                        # existing emit code; reflects current (un-bumped)
+                        # salience now rather than a post-bump value.
+                        "bumped_to": float(r["salience_score"]),
                     }
                 )
         return alarmed
