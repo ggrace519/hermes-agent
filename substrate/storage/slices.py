@@ -78,8 +78,11 @@ class SliceRepo:
         payload_modality: Modality,
         metadata: dict,
         summary_of: Optional[list[dict]] = None,
+        born_passed: bool = False,
     ) -> tuple[UUID, datetime]:
-        """Insert a fresh slice with ``sentinel_state='pending'``.
+        """Insert a fresh slice. Default ``sentinel_state='pending'``;
+        set ``born_passed=True`` for self-emitted audit slices that
+        must NOT re-enter the Sentinel queue.
 
         Always called from within a caller-supplied transaction; the
         L0 :func:`commit_slice` API acquires/opens that transaction as
@@ -99,7 +102,12 @@ class SliceRepo:
           decision.
         * ``pending_committed_at`` is set to ``now()`` so the
           partial-index queries (Section 5.2 of the spec) can sort by
-          oldest pending.
+          oldest pending. ``born_passed`` rows set it to NULL so they
+          are immediately excluded from the pending-queue partial
+          index — without that, the Sentinel sees its own audit slices
+          on the next tick and emits MORE audits per audit, in an
+          unbounded recursion (the 398k-slice production incident on
+          2026-05-26 that motivated this kwarg).
         """
         slice_id = uuid4()
         # Clock-skew safety: cap caller-supplied timestamps to PG's
@@ -119,8 +127,25 @@ class SliceRepo:
         #   - E > now (skew):           stored = (now, now).
         # In every case stored_event ≤ stored_perception ≤ now (ingest),
         # so the CHECK constraints are satisfied.
+        # ``born_passed`` sets sentinel_state directly to 'passed' and
+        # NULLs pending_committed_at so the row never matches the
+        # ``WHERE sentinel_state='pending'`` partial-index queries the
+        # Sentinel uses to find work. Reserved for self-emitted audits
+        # (Sentinel/Curator status events on substrate.self_state) and
+        # any future agent that writes its own audit trail — using
+        # ``born_passed=False`` for those would create an unbounded
+        # audit-of-audits recursion. The trust_score column stays NULL:
+        # there's no Sentinel decision attached to a born-passed row,
+        # so callers/readers should not interpret a non-NULL trust on
+        # these rows.
+        state_value = "passed" if born_passed else "pending"
+        # When born_passed, pending_committed_at must be NULL so the
+        # partial indexes (queue depth, oldest pending, list_pending)
+        # exclude this row. When pending, set to now() so the indexes
+        # can sort by oldest pending.
+        pending_committed_clause = "NULL" if born_passed else "now()"
         row = await conn.fetchrow(
-            """
+            f"""
             INSERT INTO substrate_slices
                 (slice_id, stream_id,
                  time_start_world, time_end_world,
@@ -133,7 +158,7 @@ class SliceRepo:
                  LEAST($5, now()),
                  LEAST(GREATEST($6, $5), now()),
                  $7, $8, $9,
-                 'pending', now(), 1.0, $10, $11)
+                 '{state_value}', {pending_committed_clause}, 1.0, $10, $11)
             RETURNING slice_id, ingest_time_world
             """,
             slice_id,
