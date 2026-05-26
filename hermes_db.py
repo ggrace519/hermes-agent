@@ -244,6 +244,19 @@ def run_sync(coro: Awaitable[T]) -> T:
         _run_sync_local.in_run_sync = True
         try:
             with _sync_loop_mutex:
+                # Auto-bootstrap the pool from the env DSN inside the
+                # mutex so concurrent run_sync callers don't both race
+                # to drive ``run_until_complete(init(...))``. ``pool()``'s
+                # own lazy bootstrap only fires from a pure sync context
+                # (no running loop); by the time inner code calls
+                # ``pool()`` we're inside ``run_until_complete`` and the
+                # lazy path is locked out. Priming here covers every CLI
+                # subcommand that bridges async DB code via run_sync,
+                # without each subcommand having to call
+                # ``ensure_pool_sync`` explicitly. No-op when the pool
+                # is already initialised or no DSN is set.
+                if _pool is None and os.environ.get("HERMES_PG_DSN"):
+                    loop.run_until_complete(init(os.environ["HERMES_PG_DSN"]))
                 return loop.run_until_complete(coro)
         finally:
             _run_sync_local.in_run_sync = False
@@ -262,6 +275,9 @@ def run_sync(coro: Awaitable[T]) -> T:
         _run_sync_local.in_run_sync = True
         try:
             with _sync_loop_mutex:
+                # Same lazy-pool bootstrap as Case 1 — see comment above.
+                if _pool is None and os.environ.get("HERMES_PG_DSN"):
+                    loop.run_until_complete(init(os.environ["HERMES_PG_DSN"]))
                 return loop.run_until_complete(coro)
         finally:
             _run_sync_local.in_run_sync = False

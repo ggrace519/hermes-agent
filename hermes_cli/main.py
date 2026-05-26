@@ -12878,6 +12878,19 @@ Examples:
             import hermes_db as _hermes_db
 
             db = SessionDB()
+            # Bootstrap the asyncpg pool from the sync entry-point so the
+            # subsequent ``_hermes_db.run_sync(...)`` calls don't hit the
+            # ``hermes_db.init() not called`` raise. The lazy bootstrap in
+            # ``pool()`` only fires when no loop is running; inside
+            # ``run_sync``'s ``run_until_complete`` the loop IS running,
+            # so we need to prime the pool here from sync context.
+            if not _hermes_db.ensure_pool_sync():
+                print(
+                    "Error: HERMES_PG_DSN not set. Set it in your shell "
+                    "or run via the launcher (~/.local/bin/hermes) which "
+                    "injects it from the install-time defaults."
+                )
+                return
         except Exception as e:
             print(f"Error: Could not open session database: {e}")
             return
