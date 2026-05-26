@@ -1,12 +1,9 @@
 #!/bin/bash
 # ============================================================================
-# Hermes Agent — Cognitive Substrate Edition: installer
+# Hermes Agent installer
 # ============================================================================
-# This fork (ggrace519/hermes-agent) layers a PostgreSQL-backed cognitive
-# substrate (Phase A skeleton + Phase B Curator + Phase C recall with
-# pgvector embeddings) on top of the upstream NousResearch/hermes-agent
-# project. It REPLACES SQLite with PostgreSQL for all state — session
-# transcripts, kanban, substrate slices.
+# Hermes uses PostgreSQL 17 + pgvector for all state (session transcripts,
+# kanban, substrate slices). No SQLite.
 #
 # Defaults:
 #
@@ -121,7 +118,7 @@ while [[ $# -gt 0 ]]; do
         --pg-dsn)          PG_DSN_OVERRIDE="$2"; shift 2 ;;
         -h|--help)
             cat <<HELP_EOF
-Hermes Agent — Cognitive Substrate Edition installer
+Hermes Agent installer
 
 Usage: install.sh [OPTIONS]
 
@@ -168,10 +165,7 @@ print_banner() {
     echo ""
     echo -e "${MAGENTA}${BOLD}"
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│   ⚕ Hermes Agent — Cognitive Substrate Edition          │"
-    echo "├─────────────────────────────────────────────────────────┤"
-    echo "│  PostgreSQL-backed substrate: skills, memory, recall.   │"
-    echo "│  Fork of NousResearch/hermes-agent.                     │"
+    echo "│   ⚕ Hermes Agent                                        │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo -e "${NC}"
 }
@@ -284,31 +278,42 @@ get_hermes_command_path() {
     fi
 }
 
-# Warn loudly if we're about to overwrite an existing upstream Hermes install.
-# This is only triggered when ~/.hermes already exists and was not previously
-# created by this installer (no .substrate_install marker), or when an existing
-# `hermes` command on PATH would be shadowed by ours. Pass --hermes-home and
-# --cli-name to install side-by-side instead.
+# Warn ONLY when we'd actually overwrite a foreign install, not on a
+# normal re-install of our own launcher. Two checks:
+#
+#   1. ``$HERMES_HOME`` already contains a directory that's NOT one of
+#      ours (no ``.hermes_install`` marker file).
+#   2. An existing ``hermes`` on PATH resolves to a different real file
+#      than the one we're about to write. ``command -v`` plus
+#      ``readlink -f`` canonicalize both sides so re-installing the
+#      same launcher from a path that includes ``~`` vs ``/home/user``
+#      vs a symlinked dir compares equal and the check stays quiet.
+#
+# When neither check fires (which is the common case — first-time install
+# OR a re-install of the same Hermes), the function exits silently.
 warn_upstream_collision() {
-    local upstream_home="$HOME/.hermes"
+    local hermes_home_dir="$HOME/.hermes"
     local saw_collision=false
 
-    if [ "$HERMES_HOME" = "$upstream_home" ] && [ -d "$upstream_home" ] && [ ! -f "$upstream_home/.substrate_install" ]; then
-        log_warn "HERMES_HOME=$upstream_home already exists and looks like an upstream Hermes install."
-        log_warn "  Substrate-backed data (sessions, slices) lives in PostgreSQL, not SQLite,"
-        log_warn "  so this is non-destructive for transcripts — but skills/config/SOUL.md will be SHARED."
+    if [ "$HERMES_HOME" = "$hermes_home_dir" ] && [ -d "$hermes_home_dir" ] && [ ! -f "$hermes_home_dir/.hermes_install" ] && [ ! -f "$hermes_home_dir/.substrate_install" ]; then
+        log_warn "$hermes_home_dir already exists and wasn't created by this installer."
+        log_warn "  skills/config/SOUL.md in that directory will be SHARED with the existing install."
         saw_collision=true
     fi
 
     if [ "$CLI_NAME" = "hermes" ] && command -v hermes >/dev/null 2>&1; then
-        local existing
+        local existing existing_canon target_link target_canon
         existing="$(command -v hermes)"
-        local target_dir
-        target_dir="$(get_command_link_display_dir)"
-        # If we're about to replace the same launcher path, that's a re-run,
-        # not a collision — skip the warning.
-        if [ "$existing" != "$target_dir/hermes" ]; then
-            log_warn "CLI_NAME=hermes will install a launcher at $target_dir/hermes"
+        target_link="$(get_command_link_dir)/hermes"
+        # Canonicalize both sides so the same physical file (reached via
+        # different paths — symlinks, ``~`` vs ``$HOME``, /usr/local
+        # shims) compares equal. ``readlink -f`` returns the path even
+        # for regular files (just resolves any symlinks in path
+        # components). Falls back to the raw path if readlink fails.
+        existing_canon="$(readlink -f "$existing" 2>/dev/null || echo "$existing")"
+        target_canon="$(readlink -f "$target_link" 2>/dev/null || echo "$target_link")"
+        if [ "$existing_canon" != "$target_canon" ]; then
+            log_warn "CLI_NAME=hermes will install a launcher at $(get_command_link_display_dir)/hermes"
             log_warn "  which shadows the existing 'hermes' command at: $existing"
             saw_collision=true
         fi
@@ -450,17 +455,17 @@ check_git() {
     exit 1
 }
 
-# Docker is required for the substrate's PostgreSQL. (Or pass --skip-postgres
-# and set HERMES_PG_DSN to your own cluster.)
+# Docker is required for the bundled PostgreSQL service. (Or pass
+# --skip-postgres and set HERMES_PG_DSN to your own cluster.)
 check_docker() {
     if [ "$SKIP_POSTGRES" = true ]; then
         log_info "Skipping Docker check (--skip-postgres)"
         return 0
     fi
-    log_info "Checking Docker (for PostgreSQL substrate)..."
+    log_info "Checking Docker (for PostgreSQL)..."
     if ! command -v docker >/dev/null 2>&1; then
         log_error "Docker not found"
-        log_info "Substrate needs PostgreSQL. Install Docker Desktop or Docker Engine, then re-run."
+        log_info "Hermes needs PostgreSQL. Install Docker Desktop or Docker Engine, then re-run."
         case "$OS" in
             linux)   log_info "  https://docs.docker.com/engine/install/" ;;
             macos)   log_info "  https://docs.docker.com/desktop/install/mac-install/" ;;
@@ -1083,8 +1088,10 @@ SOUL_EOF
     fi
 
     # Marker so warn_upstream_collision can tell if HERMES_HOME has previously
-    # been used by a substrate install (avoid the warning on re-installs).
-    touch "$HERMES_HOME/.substrate_install"
+    # been used by this installer (avoid the warning on re-installs). The
+    # legacy filename ``.substrate_install`` is also still accepted on read so
+    # earlier installs aren't surprised by the warning.
+    touch "$HERMES_HOME/.hermes_install"
 
     log_info "Syncing bundled skills..."
     if [ -x "$INSTALL_DIR/venv/bin/python" ] && [ -f "$INSTALL_DIR/tools/skills_sync.py" ]; then
