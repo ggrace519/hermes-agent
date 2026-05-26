@@ -34,6 +34,13 @@ permissions:
   # for the inline-review-comment API. Without ``id-token: write`` the
   # action fails immediately with "Could not fetch an OIDC token".
   id-token: write
+  # ``actions: read`` lets the action load its ``github_ci`` MCP server,
+  # which gives the model visibility into the PR's CI status (queued /
+  # running / passed / failed per check). Without this the action prints
+  # ``The github_ci MCP server requires 'actions: read' permission.
+  # Skipping CI server installation.`` and the review can't reference
+  # which checks broke.
+  actions: read
 
 concurrency:
   # Only one Claude review per PR ref at a time. A new push cancels the
