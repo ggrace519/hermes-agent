@@ -54,14 +54,26 @@ async def commit_slice(
     metadata: Optional[dict] = None,
     payload_blob_ref: Optional[str] = None,
     conn: "Optional[asyncpg.Connection]" = None,
+    born_passed: bool = False,
 ) -> Address:
-    """Commit a slice durably with ``sentinel_state='pending'``.
+    """Commit a slice durably. Default ``sentinel_state='pending'``;
+    set ``born_passed=True`` for self-emitted audit slices that must
+    bypass the Sentinel queue (Sentinel/Curator self-state events).
 
     See module docstring for the full contract.
 
     ``trust_hint`` is accepted for forward-compatibility with Phase B+
     Sentinel logic but is ignored in Phase A — the stub Sentinel
     computes trust from the stream's modality.
+
+    ``born_passed=True`` is mandatory for any agent that writes its own
+    audit-trail slices on ``substrate.self_state`` (or any other stream
+    its own ``tick()`` will subsequently process). Without it, the
+    Sentinel sees the audit slice on its next tick, decides it, emits
+    a new audit slice ABOUT the previous audit, and that audit becomes
+    pending — unbounded recursion. The 2026-05-26 production incident
+    that motivated this kwarg had the stub Sentinel emit 398,014
+    sentinel_batch_decision audit slices about itself in ~12 hours.
     """
     # ---- 1. Validate inputs that don't need DB access ------------------
     if event_time_world.tzinfo is None:
@@ -164,6 +176,7 @@ async def commit_slice(
             payload_modality=modality,
             metadata=meta,
             summary_of=summary_of_json,
+            born_passed=born_passed,
         )
     else:
         async with substrate.pool.acquire() as own_conn:
@@ -179,6 +192,7 @@ async def commit_slice(
                 payload_modality=modality,
                 metadata=meta,
                 summary_of=summary_of_json,
+                born_passed=born_passed,
             )
 
     return Address(

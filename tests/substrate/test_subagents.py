@@ -145,6 +145,83 @@ async def test_sentinel_emits_batch_summary(substrate):
 
 
 @pytest.mark.asyncio
+async def test_sentinel_audit_does_not_reenter_pending_queue(substrate):
+    """Regression: the Sentinel's own ``sentinel_batch_decision`` audit
+    slices must NOT re-enter the pending queue. Without the
+    ``born_passed=True`` fix on ``commit_slice``, every audit commits
+    as pending → the next ``tick()`` picks them up → emits MORE
+    audits-of-audits → unbounded recursion. The 2026-05-26 production
+    incident accumulated 398,014 self-audit slices in ~12 hours.
+
+    This test commits one ordinary pending slice, runs the Sentinel
+    twice, and asserts that the second tick is a no-op (no new audit
+    emitted) because the first tick's audit is born-passed and never
+    matches ``list_pending``.
+    """
+    import hermes_db
+
+    stream = await substrate.streams.register(
+        name="hermes.test.sentinel_no_reentry",
+        family=Family.SELF_STATE,
+        modality=Modality.STRUCTURED_EVENT,
+        source="test",
+        organ="pytest",
+        decay_profile_id=DEFAULT_STRUCTURED_PROFILE,
+    )
+    await commit_slice(
+        substrate, stream.stream_id, {"x": 1}, event_time_world=_now_utc()
+    )
+
+    self_state = await substrate.streams.get_by_name("substrate.self_state")
+
+    sentinel = StubSentinel(substrate)
+    # First tick decides the seeded slice + emits one audit.
+    await sentinel.tick()
+    async with hermes_db.connection() as conn:
+        after_first = await conn.fetchval(
+            """
+            SELECT count(*) FROM substrate_slices
+             WHERE stream_id = $1 AND payload @> $2
+            """,
+            self_state.stream_id,
+            {"event": "sentinel_batch_decision"},
+        )
+        # And: zero pending rows anywhere (the audit must NOT be pending).
+        pending_audits = await conn.fetchval(
+            """
+            SELECT count(*) FROM substrate_slices
+             WHERE stream_id = $1
+               AND sentinel_state = 'pending'
+            """,
+            self_state.stream_id,
+        )
+    assert after_first == 1, "First tick emitted exactly one audit slice"
+    assert pending_audits == 0, (
+        f"Sentinel's own audit slice landed in pending state "
+        f"({pending_audits} pending audits) — would feed back into "
+        f"list_pending and cause unbounded recursion."
+    )
+
+    # Second tick. With the fix, there's nothing pending → no audit.
+    # Without the fix, the audit from tick #1 is pending → Sentinel
+    # would emit a second audit referencing it.
+    await sentinel.tick()
+    async with hermes_db.connection() as conn:
+        after_second = await conn.fetchval(
+            """
+            SELECT count(*) FROM substrate_slices
+             WHERE stream_id = $1 AND payload @> $2
+            """,
+            self_state.stream_id,
+            {"event": "sentinel_batch_decision"},
+        )
+    assert after_second == 1, (
+        f"Second Sentinel tick emitted another audit (total now "
+        f"{after_second}) — the audit-of-audit loop is back."
+    )
+
+
+@pytest.mark.asyncio
 async def test_sentinel_empty_pending_queue_is_noop(substrate):
     """A tick with no pending slices does not emit an audit slice."""
     import hermes_db

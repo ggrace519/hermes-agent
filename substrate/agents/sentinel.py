@@ -121,6 +121,13 @@ class StubSentinel(SubAgent):
             },
             event_time_world=datetime.now(timezone.utc),
             metadata={"agent": "sentinel"},
+            # MANDATORY: without born_passed=True this audit slice
+            # lands in 'pending' state and the Sentinel's next tick
+            # picks it up, decides it 'passed', emits ANOTHER audit
+            # about that audit — recursing forever. 2026-05-26 prod
+            # incident: 398k self-audit slices in ~12 hours. See the
+            # ``commit_slice`` docstring for the full rationale.
+            born_passed=True,
         )
 
 
