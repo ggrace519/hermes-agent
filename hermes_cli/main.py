@@ -10865,11 +10865,24 @@ def _try_termux_fast_tui_launch() -> bool:
 
 def main():
     """Main entry point for hermes CLI."""
-    # PG pool initialisation is lazy: ``hermes_db.pool()`` auto-inits from
-    # HERMES_PG_DSN on first use. Subcommands like ``hermes --help`` or
-    # ``hermes version`` that never touch the DB do not require a live
-    # PG connection (or even a configured DSN). This is what lets the Nix
-    # sandbox smoke (`hermes --help | grep gateway`) succeed without PG.
+    # PG pool initialisation: eager when ``HERMES_PG_DSN`` is set, no-op
+    # otherwise. ``hermes_db.ensure_pool_sync()`` returns False without
+    # raising when the DSN env var isn't configured, so subcommands like
+    # ``hermes --help`` or ``hermes version`` that never touch the DB
+    # still work in environments without a live PG (Nix sandbox smoke,
+    # CI smoke tests, fresh installs before first ``setup``). When the
+    # DSN IS set, the pool gets created up-front on
+    # ``hermes_db._sync_loop`` so downstream ``run_sync(coro)`` calls
+    # don't have to (``run_sync`` used to lazy-bootstrap, which fired
+    # asyncpg's segfault-prone pool init inside pytest unit tests that
+    # exercise mocked DB code paths).
+    try:
+        import hermes_db as _hermes_db_eager_init
+        _hermes_db_eager_init.ensure_pool_sync()
+    except Exception:
+        # Never block CLI startup on pool issues — if PG is unreachable,
+        # subcommands that need it will surface a clear error themselves.
+        pass
 
     # Force UTF-8 stdio on Windows before anything prints.  No-op elsewhere.
     try:

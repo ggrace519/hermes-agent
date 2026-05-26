@@ -106,6 +106,48 @@ def test_run_sync_executes_coroutine_synchronously():
     assert hermes_db.run_sync(make_seven()) == 7
 
 
+def test_ssl_kwarg_skips_ssl_for_local_dsns():
+    """Local DSNs (docker-compose PG via localhost/127.0.0.1/[::1] or
+    any single-label compose service hostname) get ``ssl=False`` so
+    asyncpg skips its SSL upgrade negotiation. The negotiation runs
+    ``_create_ssl_connection`` even for ``sslmode=prefer``-then-
+    downgrade and intermittently segfaults inside CPython's ssl module
+    on GitHub Actions runners — taking pytest workers down with no
+    Python traceback. Local compose PG has no SSL anyway; this is just
+    skipping a no-op handshake."""
+    for dsn in (
+        "postgresql://hermes:hermes@localhost:5432/hermes",
+        "postgresql://hermes:hermes@127.0.0.1:5433/hermes",
+        "postgresql://hermes:hermes@[::1]:5432/hermes",
+        "postgresql://hermes:hermes@postgres:5432/hermes",
+        "postgresql://hermes:hermes@postgres-test:5432/hermes",
+        "postgresql://hermes:hermes@db:5432/myapp",
+    ):
+        assert hermes_db._ssl_kwarg_for_dsn(dsn) == {"ssl": False}, dsn
+
+
+def test_ssl_kwarg_respects_explicit_sslmode_in_dsn():
+    """Operators who set ``sslmode=`` in their DSN have made an explicit
+    choice — never override it. Without the explicit-sslmode bail, our
+    local-host heuristic could downgrade a deliberately-configured TLS
+    connection."""
+    dsn = "postgresql://hermes:hermes@localhost:5432/hermes?sslmode=require"
+    assert hermes_db._ssl_kwarg_for_dsn(dsn) == {}
+
+
+def test_ssl_kwarg_lets_asyncpg_negotiate_remote_dsns():
+    """Remote DSNs (anything outside the docker-compose host aliases)
+    pass through unmodified so asyncpg's default sslmode=prefer negotiates
+    with the remote cluster — which is the correct behaviour for Neon /
+    Supabase / RDS / any production Postgres."""
+    for dsn in (
+        "postgresql://user:pw@db.neon.tech:5432/proddb",
+        "postgresql://user:pw@some-rds.amazonaws.com:5432/db",
+        "postgresql://user:pw@10.0.0.5:5432/db",
+    ):
+        assert hermes_db._ssl_kwarg_for_dsn(dsn) == {}, dsn
+
+
 @pytest.mark.asyncio
 async def test_jsonb_codec_returns_python_objects(initialized_db):
     # Per DECISIONS.md "Phase 0 delivered" ADR: never use ``::jsonb`` casts

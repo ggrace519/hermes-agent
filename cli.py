@@ -1093,6 +1093,31 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         import hermes_db as _hermes_db
         _hermes_home_maint = _get_hermes_home()
 
+        # Skip maintenance unless the asyncpg pool is already initialised.
+        # This is best-effort one-time cleanup — if no one has primed the
+        # pool yet, defer to the next CLI startup that does. Avoids two
+        # problems:
+        #   1. CLI unit tests construct CLI(session_db=Mock()) without
+        #      expecting a real DB. Triggering ``run_sync``'s lazy
+        #      bootstrap here drives ``asyncpg.create_pool(...)`` against
+        #      whatever DSN is in the env (CI sets one globally), and
+        #      asyncpg's second-pool-in-same-process protocol init
+        #      segfaults on GitHub Actions runners. The maintenance was
+        #      never load-bearing for those tests; skip it cleanly.
+        #   2. Production CLIs that run before any explicit ``init()``
+        #      (rare; the launcher normally primes via ensure_pool_sync
+        #      before getting here) would also drive lazy bootstrap with
+        #      no error handling around the SSL/protocol code. Skipping
+        #      here means maintenance runs on the NEXT CLI invocation
+        #      where the pool is properly inited — acceptable for
+        #      one-time-flagged cleanups.
+        if _hermes_db._pool is None:
+            logger.debug(
+                "Skipping session-DB maintenance: asyncpg pool not "
+                "initialised. Will retry on next CLI startup."
+            )
+            return
+
         # One-time prune of empty TUI ghost sessions.
         try:
             if not _hermes_db.run_sync(session_db.get_meta("ghost_session_prune_v1")):
