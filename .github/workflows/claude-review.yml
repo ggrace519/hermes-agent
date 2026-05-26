@@ -63,6 +63,13 @@ jobs:
           # through to the underlying ``claude`` CLI). v0's top-level
           # ``model:`` input was removed.
           claude_args: --model claude-sonnet-4-5
+          # Post (and update on subsequent pushes) a single sticky review
+          # comment per PR. Without this, v1 runs the model and produces
+          # output but has nowhere to publish it — log shows "No buffered
+          # inline comments" and the run completes silently. v1 defaults
+          # this to ``false`` because its primary mode is @claude-mention
+          # response; for auto-review-on-open we need it on.
+          use_sticky_comment: true
           # v1 schema: ``prompt`` replaces v0's ``direct_prompt``.
           # Pin the review to actionable items so the comment stays useful
           # for the human reviewer.
