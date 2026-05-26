@@ -150,6 +150,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "config", help="Dump RECALL_* config knobs"
     ).set_defaults(func=_cmd_inspect_recall_config)
 
+    # ── Sub-agent worker subprocess ────────────────────────────────────
+    # ``hermes substrate worker run`` blocks while running Sentinel +
+    # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
+    # dedicated process. Managed by the systemd unit
+    # ``hermes-substrate-worker.service``; rare for operators to invoke
+    # by hand. Lives in its own module because the run loop is meaty.
+    from substrate.cli import worker as _worker_mod
+
+    _worker_mod.register_subparser(substrate_sub)
+
 
 # ---------------------------------------------------------------------------
 # Command handlers — each one is sync and bridges via hermes_db.run_sync.

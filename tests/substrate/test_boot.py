@@ -265,3 +265,78 @@ async def test_boot_completes_under_ceiling(hermes_db_initialized):
         )
     finally:
         await sub.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Writer / worker boot-mode split — added 2026-05-26 after the gateway
+# cross-loop-pool incident. boot_writer (gateway/CLI/cron) starts no
+# sub-agents but binds hooks + recall log. boot_worker (the dedicated
+# substrate-worker subprocess) starts sub-agents but skips hooks + recall.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_boot_writer_skips_subagents_keeps_hooks_and_recall(
+    hermes_db_initialized,
+):
+    """Writer mode: no sub-agent tick tasks; hooks bound; recall_log started."""
+    sub = await Substrate.boot_writer()
+    try:
+        # No tick loops spawned.
+        assert sub._subagents == {}, (
+            f"boot_writer started sub-agent tasks ({list(sub._subagents)}); "
+            "those belong in the worker subprocess. The cross-loop pool "
+            "incident on 2026-05-26 is why we split."
+        )
+        # Conductor instance exists (no tick, just state).
+        assert sub._conductor is not None, "boot_writer should still hold a Conductor for inspect"
+        # Hooks bound so perception emit works in this process.
+        assert hermes_hooks._substrate_for_tests() is sub, (
+            "boot_writer must bind perception hooks so gateway/CLI emits land"
+        )
+        # Recall log writer started so recall() can log calls.
+        assert sub.recall_log is not None, (
+            "boot_writer must start the recall log writer — writer processes "
+            "serve recall queries and need to log them"
+        )
+    finally:
+        await sub.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_boot_worker_starts_subagents_skips_hooks_and_recall(
+    hermes_db_initialized,
+):
+    """Worker mode: sub-agent tick tasks running; hooks NOT bound;
+    recall_log NOT started.
+
+    The worker subprocess doesn't receive perception hook calls (those
+    fire in the writer process that owns the chat/gateway loop) and
+    doesn't serve recall queries, so both subsystems stay off."""
+    # Pre-condition: clear hook binding so we can assert worker mode
+    # leaves it untouched even when it starts clean.
+    hermes_hooks._unbind()
+    sub = await Substrate.boot_worker()
+    try:
+        # Sub-agent tasks must be alive.
+        assert sub._subagents, "boot_worker MUST start sub-agent tick tasks"
+        # Specifically: Sentinel + Curator + ForceReject + PartitionMaintenance.
+        names = set(sub._subagents)
+        for required in ("sentinel", "curator"):
+            assert required in names, (
+                f"boot_worker missing required sub-agent {required!r}; "
+                f"got {sorted(names)}"
+            )
+        # Hooks NOT bound — the writer process owns that binding.
+        assert hermes_hooks._substrate_for_tests() is None, (
+            "boot_worker must NOT bind perception hooks; doing so would "
+            "redirect Hermes hook emits to a process that doesn't have "
+            "the chat/gateway loop. Only writer processes bind hooks."
+        )
+        # Recall log writer NOT started.
+        assert sub.recall_log is None, (
+            "boot_worker must NOT start recall_log; the worker subprocess "
+            "doesn't serve recall queries."
+        )
+    finally:
+        await sub.shutdown()
