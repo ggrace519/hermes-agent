@@ -190,6 +190,9 @@ async def transaction() -> AsyncIterator[asyncpg.Connection]:
             yield conn
 
 
+_run_sync_local = threading.local()
+_sync_loop_mutex = threading.Lock()
+
 def run_sync(coro: Awaitable[T]) -> T:
     """Bridge a sync caller to an async DB call.
 
@@ -222,9 +225,8 @@ def run_sync(coro: Awaitable[T]) -> T:
     an event loop, and ``ensure_pool_sync()`` for code that knows it's
     about to acquire connections from inside ``run_sync``.
     """
-    loop = _get_sync_loop()
-    if loop.is_running():
-        # Case 2: re-entrant into our own sync loop.
+    if getattr(_run_sync_local, "in_run_sync", False):
+        # Case 2: true re-entrant into our own sync loop.
         raise RuntimeError(
             "hermes_db.run_sync called from inside its own sync loop; "
             "refactor caller to `await` the coroutine directly."
@@ -235,15 +237,36 @@ def run_sync(coro: Awaitable[T]) -> T:
     except RuntimeError:
         current = None
 
+    loop = _get_sync_loop()
+
     if current is None:
         # Case 1: pure sync context, run on this thread.
-        return loop.run_until_complete(coro)
+        _run_sync_local.in_run_sync = True
+        try:
+            with _sync_loop_mutex:
+                return loop.run_until_complete(coro)
+        finally:
+            _run_sync_local.in_run_sync = False
 
     # Case 3: a different loop is running in this thread (pytest-asyncio,
     # ACP server callback, etc.). Offload to a worker thread so Python's
     # one-loop-per-thread check doesn't reject us.
     executor = _get_sync_offload_executor()
-    future = executor.submit(loop.run_until_complete, coro)
+
+    def _offload():
+        if getattr(_run_sync_local, "in_run_sync", False):
+            raise RuntimeError(
+                "hermes_db.run_sync called from inside its own sync loop; "
+                "refactor caller to `await` the coroutine directly."
+            )
+        _run_sync_local.in_run_sync = True
+        try:
+            with _sync_loop_mutex:
+                return loop.run_until_complete(coro)
+        finally:
+            _run_sync_local.in_run_sync = False
+
+    future = executor.submit(_offload)
     return future.result()
 
 
