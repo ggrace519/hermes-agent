@@ -108,9 +108,26 @@ RECALL_REINFORCE_RATE_LIMIT_PER_MIN = _envint(
 RECALL_LOG_QUEUE_DEPTH = _envint("HERMES_RECALL_LOG_QUEUE_DEPTH", default=1024)
 
 # Embedding pipeline.
-RECALL_EMBEDDING_MODEL = os.environ.get(
-    "HERMES_RECALL_EMBEDDING_MODEL", "text-embedding-3-small"
-)
+#
+# ``RECALL_EMBEDDING_MODEL`` is an *override* knob, not a fallback.
+# When unset (the default), the Curator passes ``model=None`` to
+# ``substrate.recall.embeddings.embed()`` so it reads
+# ``auxiliary.embedding.model`` from config.yaml — keeping the Curator's
+# choice in lock-step with whatever provider/model the operator wired
+# in (e.g. Ollama's ``nomic-embed-text``, Voyage's ``voyage-3``).
+#
+# The earlier hardcoded ``"text-embedding-3-small"`` default was the
+# 2026-05-26 production embedding-failure bug: installs running local
+# Ollama had ``auxiliary.embedding.model = nomic-embed-text`` in
+# config.yaml, but the Curator overrode it with ``text-embedding-3-small``
+# at every embed() call. Ollama doesn't know that model name → embed()
+# returned ``[None]*N`` for every batch → 100% of slices marked
+# ``embedding_failed`` after retry exhaustion.
+#
+# Set ``HERMES_RECALL_EMBEDDING_MODEL`` to pin a specific model
+# independent of the rest of the auxiliary.embedding config — useful for
+# A/B comparison or running a recall-specific model on a shared cluster.
+RECALL_EMBEDDING_MODEL = os.environ.get("HERMES_RECALL_EMBEDDING_MODEL")
 RECALL_EMBEDDING_DIM = _envint("HERMES_RECALL_EMBEDDING_DIM", default=1536)
 RECALL_EMBEDDING_TIMEOUT_MS = _envint(
     "HERMES_RECALL_EMBEDDING_TIMEOUT_MS", default=800

@@ -213,3 +213,64 @@ async def test_no_emit_when_nothing_to_audit(substrate):
             """
         )
     assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_curator_embed_omits_model_kwarg_when_config_default(
+    substrate, monkeypatch
+):
+    """Regression: when ``HERMES_RECALL_EMBEDDING_MODEL`` is unset,
+    the Curator must NOT pass ``model=`` to ``embed()`` — letting
+    ``embed()`` resolve from ``auxiliary.embedding.model`` in config.
+
+    The 2026-05-26 production bug: ``RECALL_EMBEDDING_MODEL`` defaulted
+    to the hardcoded ``"text-embedding-3-small"`` even when the operator
+    had ``auxiliary.embedding.model: nomic-embed-text`` in config.yaml.
+    The Curator passed that hardcoded name to Ollama → 404 → embed()
+    returned ``[None]*N`` → every backfill marked slices ``embedding_failed``.
+
+    With the fix, the Curator passes no ``model=`` kwarg when the env
+    var is unset, so embed() reads config.yaml's value.
+    """
+    from substrate import config as _cfg
+    from substrate.agents import curator as _curator_mod
+
+    # Force RECALL_EMBEDDING_MODEL=None (the env-unset default).
+    monkeypatch.setattr(_cfg, "RECALL_EMBEDDING_MODEL", None)
+
+    # Seed one passed slice on a stream so list_unembedded returns it.
+    profile_id = await _register_profile(substrate.pool, "embed_kwarg_test")
+    stream = await substrate.streams.register(
+        name="hermes.test.embed_kwarg",
+        family=Family.EXTEROCEPTIVE,
+        modality=Modality.TEXT,
+        source="test",
+        organ="pytest",
+        decay_profile_id=profile_id,
+    )
+    await commit_slice(
+        substrate, stream.stream_id, "hello", event_time_world=_now_utc(),
+    )
+    # Promote to passed via the Sentinel so it's a candidate for embedding.
+    from substrate.agents import StubSentinel
+    await StubSentinel(substrate).tick()
+
+    # Capture the kwargs ``embed`` is called with.
+    captured: list[dict] = []
+
+    async def _spy_embed(texts, **kw):
+        captured.append(kw)
+        return [[0.0] * 1536 for _ in texts]
+
+    monkeypatch.setattr(_curator_mod, "embed", _spy_embed)
+
+    curator = Curator(substrate)
+    await curator._emit_embeddings_for_unembedded()
+
+    assert captured, "Curator never called embed()"
+    assert "model" not in captured[0], (
+        f"Curator passed model={captured[0].get('model')!r} to embed() "
+        "even though RECALL_EMBEDDING_MODEL is None. This overrides the "
+        "auxiliary.embedding.model from config.yaml and breaks every "
+        "non-OpenAI provider (the 2026-05-26 prod incident)."
+    )
