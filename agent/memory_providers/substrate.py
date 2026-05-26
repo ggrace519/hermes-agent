@@ -46,7 +46,12 @@ _RECALL_MORE_DEFAULT_WINDOW_HOURS = 168  # 1 week
 
 
 def _is_enabled() -> bool:
-    raw = os.environ.get(_ENABLE_ENV_VAR, "0")
+    # Default ON: this fork installs the substrate as the primary memory
+    # backend; recall opting out makes sense for power users who want to
+    # diff substrate-vs-built-in behavior, not as a normal default.
+    # Set HERMES_SUBSTRATE_RECALL=0 to fall back to the upstream
+    # built-in provider exclusively.
+    raw = os.environ.get(_ENABLE_ENV_VAR, "1")
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
