@@ -100,10 +100,17 @@ async def _seed_passed_unconsolidated(
     return slice_id
 
 
+def _curator_no_cooldown(substrate) -> Curator:
+    """Curator with cooldown disabled — for tests that seed a slice and
+    immediately expect an alarm. Production default is 1 hour; we drop
+    it to 0 here so freshly-seeded data fires on the first tick."""
+    c = Curator(substrate)
+    c.ALARM_COOLDOWN_SECONDS = 0
+    return c
+
+
 @pytest.mark.asyncio
 async def test_alarm_fires_when_consolidation_window_passed(substrate):
-    import hermes_db
-
     profile_id = await _register_profile_with_short_window(
         substrate.pool, "test-alarm-fires", window_seconds=60,
     )
@@ -122,22 +129,26 @@ async def test_alarm_fires_when_consolidation_window_passed(substrate):
         salience=0.4,
     )
 
-    curator = Curator(substrate)
+    curator = _curator_no_cooldown(substrate)
     alarmed = await curator._alarm_pathological()
     assert len(alarmed) == 1
     assert alarmed[0]["slice_id"] == slice_id
 
 
 @pytest.mark.asyncio
-async def test_alarm_bumps_salience(substrate):
+async def test_alarm_does_not_bump_salience(substrate):
+    """Post-fix contract (was test_alarm_bumps_salience): alarm is
+    observational. It does NOT modify salience_score — bumping defeats
+    the decay loop and produced the production amplification observed
+    on 2026-05-26 (913 alarms/hour saturating slices at salience 1.0)."""
     import hermes_db
 
     profile_id = await _register_profile_with_short_window(
-        substrate.pool, "test-alarm-bump",
+        substrate.pool, "test-alarm-no-bump",
         window_seconds=60, reinforcement_bump=0.25,
     )
     stream = await substrate.streams.register(
-        name="hermes.test.alarm_bump",
+        name="hermes.test.alarm_no_bump",
         family=Family.SELF_STATE,
         modality=Modality.STRUCTURED_EVENT,
         source="test",
@@ -150,17 +161,84 @@ async def test_alarm_bumps_salience(substrate):
         salience=0.3,
     )
 
-    curator = Curator(substrate)
+    curator = _curator_no_cooldown(substrate)
     alarmed = await curator._alarm_pathological()
     assert len(alarmed) == 1
-    assert alarmed[0]["bumped_to"] == pytest.approx(0.55, abs=0.001)
+    # ``bumped_to`` now reflects current (unchanged) salience.
+    assert alarmed[0]["bumped_to"] == pytest.approx(0.3, abs=0.001)
 
     async with hermes_db.connection() as conn:
         salience = await conn.fetchval(
             "SELECT salience_score FROM substrate_slices WHERE slice_id = $1",
             slice_id,
         )
-    assert salience == pytest.approx(0.55, abs=0.001)
+    # DB salience untouched by the alarm.
+    assert salience == pytest.approx(0.3, abs=0.001)
+
+
+@pytest.mark.asyncio
+async def test_alarm_cooldown_suppresses_repeat_alarms(substrate):
+    """Within ALARM_COOLDOWN_SECONDS of an alarm, the same slice must
+    not re-fire. Production observed the same slice being alarmed every
+    Curator tick — without a cooldown the salience landscape never
+    settles."""
+    profile_id = await _register_profile_with_short_window(
+        substrate.pool, "test-alarm-cooldown", window_seconds=60,
+    )
+    stream = await substrate.streams.register(
+        name="hermes.test.alarm_cooldown",
+        family=Family.SELF_STATE,
+        modality=Modality.STRUCTURED_EVENT,
+        source="test",
+        organ="pytest",
+        decay_profile_id=profile_id,
+    )
+    await _seed_passed_unconsolidated(
+        substrate, stream.stream_id,
+        ingest_offset_seconds=120.0,
+        salience=0.4,
+    )
+
+    # Production cooldown (3600s) — freshly-touched slice should NOT alarm.
+    curator = Curator(substrate)
+    assert await curator._alarm_pathological() == []
+
+    # With cooldown=0 the same slice fires once...
+    curator.ALARM_COOLDOWN_SECONDS = 0
+    first = await curator._alarm_pathological()
+    assert len(first) == 1
+
+    # ...and re-running immediately with the production cooldown back
+    # in place suppresses it (the first alarm touched
+    # salience_updated_at to now()).
+    curator.ALARM_COOLDOWN_SECONDS = 3600
+    assert await curator._alarm_pathological() == []
+
+
+@pytest.mark.asyncio
+async def test_alarm_excludes_substrate_self_state_stream(substrate):
+    """Alarm audit slices live on ``substrate.self_state``. Without
+    excluding that stream from the alarm-eligible set, alarm slices
+    age past their own consolidation_window and become alarm-eligible
+    themselves — producing a feedback loop that saturated production
+    at 900+ alarms/hour."""
+    # The ``substrate.self_state`` stream is seeded by Alembic. Look it
+    # up rather than registering a duplicate.
+    self_state = await substrate.streams.get_by_name("substrate.self_state")
+    assert self_state is not None, (
+        "substrate.self_state should be seeded by the substrate-skeleton migration"
+    )
+
+    await _seed_passed_unconsolidated(
+        substrate, self_state.stream_id,
+        ingest_offset_seconds=86400.0,  # 1 day old — well past any window
+        salience=0.5,
+    )
+
+    curator = _curator_no_cooldown(substrate)
+    alarmed = await curator._alarm_pathological()
+    # Old, unconsolidated, on substrate.self_state → still NOT alarmed.
+    assert alarmed == []
 
 
 @pytest.mark.asyncio
@@ -237,6 +315,6 @@ async def test_alarm_bounded_by_batch_limit(substrate):
             ingest_offset_seconds=120.0, salience=0.4,
         )
 
-    curator = Curator(substrate)
+    curator = _curator_no_cooldown(substrate)
     alarmed = await curator._alarm_pathological()
     assert len(alarmed) == Curator.ALARM_BATCH_LIMIT  # 100
