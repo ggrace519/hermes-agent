@@ -1,11 +1,17 @@
 name: Publish to PyPI
 
-# Triggered by CalVer tag pushes from scripts/release.py (e.g. v2026.5.15)
-# Can also be triggered manually from the Actions tab as an escape hatch.
+# MANUAL TRIGGER ONLY — auto-on-tag publishing has been intentionally disabled.
+#
+# Why: this repo is a substrate fork (ggrace519/hermes-agent) of the upstream
+# NousResearch/hermes-agent. It does not own the 'hermes-agent' PyPI package and
+# has no active PyPI release pipeline. The original `push: tags: v20*` trigger
+# was a foot-gun: pushing any CalVer-style tag would silently attempt a PyPI
+# publish (which would either fail with a credentials error or, worse, succeed
+# under the wrong package name). All 13 upstream vYYYY.M.D tags were removed
+# from this fork; the trigger has been replaced with workflow_dispatch so the
+# workflow remains available if a proper PyPI setup is established later, but
+# will never fire automatically.
 on:
-  push:
-    tags:
-      - 'v20*'  # CalVer tags: v2026.5.15, v2026.5.15.2, etc.
   workflow_dispatch:
     inputs:
       confirm_tag:
