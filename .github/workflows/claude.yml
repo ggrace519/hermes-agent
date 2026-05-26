@@ -35,6 +35,10 @@ permissions:
   pull-requests: write
   issues: write
   id-token: write          # required for the v1 action's OIDC GitHub auth
+  actions: read            # enables the ``github_ci`` MCP server so the model
+                           # can read CI status when answering ``@claude why is
+                           # CI red?`` style questions. See claude-review.yml
+                           # for the same rationale.
 
 concurrency:
   # Serialize per (issue|pr, user) so two rapid mentions don't race.
