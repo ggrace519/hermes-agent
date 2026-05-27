@@ -181,6 +181,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0010",
         "20260527_0011",
         "20260527_0012",
+        # - ``20260527_0013`` — Phase E1 L2 (substrate_associations + edits).
+        "20260527_0013",
     }
 )
 
@@ -545,6 +547,7 @@ class Substrate:
         Phase B adds the push-on-set_intensity hook so live agents
         pick up intensity changes within one tick).
         """
+        from substrate.agents.associator import Associator
         from substrate.agents.conductor import StubConductor
         from substrate.agents.curator import Curator
         from substrate.agents.force_reject import ForceRejectWorker
@@ -559,9 +562,10 @@ class Substrate:
         partition = PartitionMaintenanceWorker(self)
         force_reject = ForceRejectWorker(self)
         curator = Curator(self)
-        parser = Parser(self)
+        parser = Parser(self)        # Phase D — no-op unless HERMES_SUBSTRATE_PARSER=1
+        associator = Associator(self)  # Phase E1 — no-op unless HERMES_SUBSTRATE_ASSOCIATOR=1
         sentinel = StubSentinel(self)
-        for agent in (partition, force_reject, curator, parser, sentinel):
+        for agent in (partition, force_reject, curator, parser, associator, sentinel):
             agent.start()
             self._subagents[agent.name] = agent
 

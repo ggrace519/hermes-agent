@@ -217,6 +217,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     parser_recent.add_argument("--limit", type=int, default=20)
     parser_recent.set_defaults(func=_cmd_inspect_parser_recent)
 
+    l2_p = substrate_sub.add_parser(
+        "l2", help="Inspect L2 (associations + edit history)"
+    )
+    l2_sub = l2_p.add_subparsers(dest="l2_subcommand")
+    l2_p.set_defaults(func=_cmd_inspect_l2_associations)
+    l2_assoc = l2_sub.add_parser("associations", help="Densest / per-entity edges (default)")
+    l2_assoc.add_argument("--entity", default=None, help="Filter to one entity (by name)")
+    l2_assoc.add_argument("--limit", type=int, default=20)
+    l2_assoc.set_defaults(func=_cmd_inspect_l2_associations)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -340,6 +350,12 @@ def _cmd_inspect_parser_summary(args: argparse.Namespace) -> int:
 def _cmd_inspect_parser_recent(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 20)
     return _run_inspect(lambda conn: _print_parser_recent(conn, limit=limit))
+
+
+def _cmd_inspect_l2_associations(args: argparse.Namespace) -> int:
+    entity = getattr(args, "entity", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l2_associations(conn, entity=entity, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -550,6 +566,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("force-reject", False),
     ("partition-maintenance", False),
     ("parser", False),  # Phase D — heartbeats even when its tick is env-gated off
+    ("associator", False),  # Phase E1 — same staged-rollout shape
 )
 
 
@@ -899,6 +916,41 @@ async def _print_parser_recent(conn, *, limit=20) -> None:
             f"  [{ts}] {r['outcome']:11s} batch={r['batch_size']} "
             f"ents={r['entities_emitted']} rels={r['relationships_emitted']} "
             f"consol={r['slices_consolidated']} {r['latency_ms']}ms{extra}"
+        )
+
+
+async def _print_l2_associations(conn, *, entity=None, limit=20) -> None:
+    if entity:
+        rows = await conn.fetch(
+            """
+            SELECT s.name AS src, o.name AS dst, a.edge_type, a.weight
+              FROM substrate_associations a
+              JOIN l1_entities s ON s.id = a.src_id
+              JOIN l1_entities o ON o.id = a.dst_id
+             WHERE s.name ILIKE $1 OR o.name ILIKE $1
+             ORDER BY a.weight DESC LIMIT $2
+            """,
+            f"%{entity}%",
+            limit,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT s.name AS src, o.name AS dst, a.edge_type, a.weight
+              FROM substrate_associations a
+              JOIN l1_entities s ON s.id = a.src_id
+              JOIN l1_entities o ON o.id = a.dst_id
+             ORDER BY a.weight DESC LIMIT $1
+            """,
+            limit,
+        )
+    if not rows:
+        print("(no L2 associations — is the Associator running with "
+              "HERMES_SUBSTRATE_ASSOCIATOR=1?)")
+        return
+    for r in rows:
+        print(
+            f"  {r['src']} <-> {r['dst']}  [{r['edge_type']}]  weight {r['weight']:.1f}"
         )
 
 
