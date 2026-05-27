@@ -571,6 +571,7 @@ class Substrate:
         )
         from substrate.agents.reflector import Reflector
         from substrate.agents.sentinel import StubSentinel
+        from substrate.agents.summarizer import Summarizer
 
         self._conductor = StubConductor(self)
 
@@ -583,13 +584,15 @@ class Substrate:
         critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
         reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
         dreamer = Dreamer(self)          # Phase F  — gated HERMES_SUBSTRATE_DREAMER
+        summarizer = Summarizer(self)    # polish    — gated HERMES_SUBSTRATE_SUMMARIZER
         # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
         # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
         conductor_policy = AdaptiveConductor(self)
         sentinel = StubSentinel(self)
         for agent in (
             partition, force_reject, curator, parser, associator,
-            pattern_finder, critic, reflector, dreamer, conductor_policy, sentinel,
+            pattern_finder, critic, reflector, dreamer, summarizer,
+            conductor_policy, sentinel,
         ):
             agent.start()
             self._subagents[agent.name] = agent

@@ -704,6 +704,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("conductor", False),  # Phase F — adaptive policy loop (gated)
     ("reflector", False),  # Phase F — L3/L4 synthesis (gated)
     ("dreamer", False),  # Phase F — counterfactual exploration (gated)
+    ("summarizer", False),  # polish — retrospective summarization (gated)
 )
 
 

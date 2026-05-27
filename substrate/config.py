@@ -190,6 +190,9 @@ DEFAULT_RECALL_STREAMS: tuple[str, ...] = (
     "hermes.world.user_message.signal",
     "hermes.world.user_message.acp",
     "hermes.self_action.assistant_response",
+    # Retrospective summaries (the Summarizer): dense, carry older context
+    # forward so recall surfaces a summary instead of the faded originals.
+    "hermes.self_action.summary",
 )
 
 
