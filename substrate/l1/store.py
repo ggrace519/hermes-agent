@@ -370,9 +370,9 @@ async def list_citations_for_entity(
 
 
 # ---------------------------------------------------------------------------
-# Curation / hygiene — merge, forget, edit, duplicate suggestion.
-# Addresses the substrate feedback: dedup/merge fragmented entities (#3/#8)
-# and let users curate what the substrate knows (#4).
+# Curation / hygiene — merge, forget, edit, duplicate suggestion:
+# dedup/merge fragmented entities + let users curate what the
+# substrate knows.
 # ---------------------------------------------------------------------------
 
 

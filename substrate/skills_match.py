@@ -1,7 +1,7 @@
 """Skill suggestion — match the substrate's current context to bundled skills.
 
-Substrate feedback #6: "suggest relevant skills when it detects we're
-working in a domain that has established procedures." Skills are
+Suggest bundled skills relevant to the substrate's current context —
+useful when working in a domain with established procedures. Skills are
 self-describing (``skills/**/SKILL.md`` with ``name`` / ``description`` /
 ``metadata.hermes.tags`` frontmatter); this scans them once (cached) and
 ranks them against a context string (the recall query + whatever entities/

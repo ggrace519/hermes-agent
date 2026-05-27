@@ -584,7 +584,7 @@ class Substrate:
         critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
         reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
         dreamer = Dreamer(self)          # Phase F  — gated HERMES_SUBSTRATE_DREAMER
-        summarizer = Summarizer(self)    # polish    — gated HERMES_SUBSTRATE_SUMMARIZER
+        summarizer = Summarizer(self)    # gated HERMES_SUBSTRATE_SUMMARIZER
         # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
         # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
         conductor_policy = AdaptiveConductor(self)
