@@ -66,6 +66,14 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+# ``CI`` is forwarded only when set, so a developer can reproduce CI's
+# behaviour locally with ``CI=true scripts/run_tests.sh``. The
+# environment-sensitive perf microbenchmarks (test_commit_perf,
+# test_recall_perf) skip under ``CI=true`` (they measure host I/O, not
+# code, and flake on shared/variance-prone machines). CI itself runs
+# run_tests_parallel.py directly with the runner's ambient ``CI=true``, so
+# this passthrough makes ``CI=true scripts/run_tests.sh`` match CI exactly
+# while the default (unset) local run still exercises the benchmarks.
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
@@ -73,6 +81,7 @@ exec env -i \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
   PYTHONHASHSEED=0 \
+  ${CI:+CI="$CI"} \
   ${EXTRA_PYTHONPATH:+PYTHONPATH="$EXTRA_PYTHONPATH"} \
   ${EXTRA_PYTEST_PLUGINS:+PYTEST_PLUGINS="$EXTRA_PYTEST_PLUGINS"} \
   "$PYTHON" "$SCRIPT_DIR/run_tests_parallel.py" "$@"
