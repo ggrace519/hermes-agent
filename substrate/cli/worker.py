@@ -105,6 +105,14 @@ async def _run_worker_async() -> int:
         return 1
 
     log.info("substrate worker starting — dsn=%s", _redacted(dsn))
+    # ``hermes_cli.main.main()`` eagerly binds the global asyncpg pool to
+    # ``hermes_db._sync_loop`` via ``ensure_pool_sync()``. This worker runs
+    # its own ``asyncio.run`` loop, and asyncpg pools are loop-bound — so we
+    # must drop any inherited pool and re-init on THIS loop. Otherwise every
+    # DB call (alembic check, stream registration, sub-agent ticks) raises
+    # ``got Future ... attached to a different loop`` and the worker
+    # crash-loops on boot.
+    hermes_db.reset_pool_for_new_loop()
     try:
         await hermes_db.init(dsn)
     except Exception:

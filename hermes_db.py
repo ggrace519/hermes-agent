@@ -212,6 +212,26 @@ async def close() -> None:
         await p.close()
 
 
+def reset_pool_for_new_loop() -> None:
+    """Discard the current pool synchronously, without awaiting ``close()``.
+
+    asyncpg pools are bound to the event loop that created them. A process
+    that runs its own loop via ``asyncio.run`` (e.g. ``hermes substrate
+    worker run``) must not inherit the pool that a sync entry point —
+    ``main()``'s ``ensure_pool_sync()`` — bound to ``_sync_loop``: every DB
+    call on the new loop would raise ``got Future ... attached to a
+    different loop``. ``Pool.terminate()`` is synchronous and loop-agnostic
+    (it aborts the transports), so it is safe to call from the new loop's
+    thread even though the stale pool belongs to ``_sync_loop``. The caller
+    re-creates the pool on its own loop via ``init()``.
+    """
+    global _pool
+    with _pool_lock:
+        p, _pool = _pool, None
+    if p is not None:
+        p.terminate()
+
+
 def pool() -> asyncpg.Pool:
     if _pool is None:
         # Lazy bootstrap: if a DSN is in the environment but init() was never
