@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+import pytest_asyncio
 
+from substrate import Substrate
 from substrate.agents.base import Level, SubAgent
 
 
@@ -192,3 +194,92 @@ async def test_start_is_idempotent():
     assert task1 is task2
     agent.stop()
     await agent.stop_and_wait(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Liveness heartbeat — upsert into substrate_agent_heartbeat.
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def from_pool_substrate(hermes_db_initialized):
+    """A Substrate over the real test pool, no boot side effects — enough
+    for the base class's heartbeat upsert (it only needs ``.pool``)."""
+    import hermes_db
+
+    return Substrate.from_pool(hermes_db.pool())
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_noop_without_substrate():
+    """An agent with no substrate (the base-class unit-test shape) beats
+    silently — no exception, no DB."""
+    agent = _CountingAgent(substrate=None)
+    await agent._maybe_heartbeat(force=True)  # must not raise
+    assert agent._last_beat_mono is None  # nothing was written
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_writes_row(from_pool_substrate):
+    import hermes_db
+
+    agent = _CountingAgent(from_pool_substrate)
+    agent._tick_count = 7
+    await agent._maybe_heartbeat(force=True)
+
+    async with hermes_db.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT agent_name, level, tick_count, is_sentinel, pid "
+            "FROM substrate_agent_heartbeat WHERE agent_name = 'counter'"
+        )
+    assert row is not None
+    assert row["level"] == Level.FULL.value
+    assert row["tick_count"] == 7
+    assert row["is_sentinel"] is False
+    assert row["pid"] > 0
+    assert agent._last_beat_mono is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_rate_limited(from_pool_substrate):
+    """A second, non-forced beat inside the cadence window does not write
+    (the stored last_beat_at must not advance)."""
+    import hermes_db
+
+    agent = _CountingAgent(from_pool_substrate)
+    await agent._maybe_heartbeat(force=True)
+    async with hermes_db.connection() as conn:
+        first = await conn.fetchval(
+            "SELECT last_beat_at FROM substrate_agent_heartbeat "
+            "WHERE agent_name = 'counter'"
+        )
+
+    # Immediate, non-forced beat: inside the ~10s cadence → skipped.
+    await agent._maybe_heartbeat()
+    async with hermes_db.connection() as conn:
+        second = await conn.fetchval(
+            "SELECT last_beat_at FROM substrate_agent_heartbeat "
+            "WHERE agent_name = 'counter'"
+        )
+    assert first == second  # no second write happened
+
+
+@pytest.mark.asyncio
+async def test_run_loop_emits_startup_heartbeat(from_pool_substrate):
+    """Starting the run loop beats once immediately, before any tick, so
+    the inspect CLI sees the agent right away."""
+    import hermes_db
+
+    agent = _CountingAgent(from_pool_substrate)
+    agent.start()
+    # The startup beat is forced; give the loop a moment to issue it.
+    await asyncio.sleep(0.1)
+    agent.stop()
+    await agent.stop_and_wait(timeout=1.0)
+
+    async with hermes_db.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT agent_name, last_beat_at FROM substrate_agent_heartbeat "
+            "WHERE agent_name = 'counter'"
+        )
+    assert row is not None

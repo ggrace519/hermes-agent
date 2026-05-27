@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -66,6 +69,48 @@ _OFF_POLL_INTERVAL = 1.0
 
 
 # ---------------------------------------------------------------------------
+# Liveness heartbeat. The sub-agent run loop upserts a row into
+# ``substrate_agent_heartbeat`` on this cadence so a *different process*
+# (the ``hermes substrate`` inspect CLI) can tell a live worker subprocess
+# from a dead one. Before this existed, the inspect CLI printed a static
+# "all healthy" sub-agent list — a dead worker was invisible (the
+# 2026-05-26 production incident).
+#
+# The cadence is intentionally decoupled from tick interval: the
+# partition-maintenance agent ticks once per 24h, but it must still report
+# liveness every few seconds or it would look dead within minutes. The run
+# loop therefore chunks its inter-tick sleep at this cadence and beats each
+# chunk.
+_HEARTBEAT_INTERVAL_S = float(
+    os.environ.get("HERMES_SUBSTRATE_HEARTBEAT_S", "10") or "10"
+)
+
+
+# Last-writer-wins UPSERT keyed on ``agent_name``. ``last_beat_at`` uses
+# PG's ``now()`` (not the host clock) so the inspect CLI's staleness math
+# is skew-free. A worker restart simply overwrites the row with the new
+# pid — no stale-row accumulation.
+_HEARTBEAT_UPSERT_SQL = """
+    INSERT INTO substrate_agent_heartbeat
+        (agent_name, pid, host, level, is_sentinel,
+         tick_count, started_at, last_beat_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+    ON CONFLICT (agent_name) DO UPDATE SET
+        pid          = EXCLUDED.pid,
+        host         = EXCLUDED.host,
+        level        = EXCLUDED.level,
+        is_sentinel  = EXCLUDED.is_sentinel,
+        tick_count   = EXCLUDED.tick_count,
+        started_at   = EXCLUDED.started_at,
+        last_beat_at = now()
+"""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
 
@@ -96,6 +141,16 @@ class SubAgent(ABC):
         self._stopped: asyncio.Event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
         self._log = logging.getLogger(f"substrate.agents.{self.name}")
+
+        # Liveness heartbeat bookkeeping. ``_tick_count`` is reported in
+        # the heartbeat so operators can see a stuck-but-alive agent
+        # (count frozen) vs. a healthy one (count climbing).
+        # ``_started_at`` is set when ``run()`` begins. ``_last_beat_mono``
+        # rate-limits the upsert to ``_HEARTBEAT_INTERVAL_S`` using a
+        # monotonic clock (immune to wall-clock jumps).
+        self._tick_count: int = 0
+        self._started_at: Optional[datetime] = None
+        self._last_beat_mono: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -138,18 +193,15 @@ class SubAgent(ABC):
         (3–10s) would always exceed the 2-second shutdown grace and
         log spurious ``subagent.stop.timeout`` warnings on clean exit.
         """
+        self._started_at = _utcnow()
         self._log.debug(
             "subagent.run.start name=%s level=%s", self.name, self._level.value
         )
 
-        async def _wait(seconds: float) -> None:
-            """Sleep for *seconds*, but return early if ``stop()`` is called."""
-            try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=seconds)
-            except asyncio.TimeoutError:
-                pass  # normal: the interval elapsed without a stop request
-
         try:
+            # Beat once at startup so the agent is visible to the inspect
+            # CLI immediately, before its first (possibly slow) tick.
+            await self._maybe_heartbeat(force=True)
             while not self._stopped.is_set():
                 # Call ``self._interval_for(...)`` so subclasses can
                 # override the mapping (e.g. partition-maintenance
@@ -157,17 +209,86 @@ class SubAgent(ABC):
                 # The base implementation looks up _INTERVAL_BY_LEVEL.
                 interval = self._interval_for(self._level)
                 if interval is None:  # OFF
-                    await _wait(_OFF_POLL_INTERVAL)
+                    await self._wait(_OFF_POLL_INTERVAL)
                     continue
                 try:
                     await self.tick()
+                    self._tick_count += 1
                 except Exception:
                     # Log with exc_info so the traceback lands in the
                     # substrate's log; never re-raise to the loop.
                     self._log.exception("subagent.tick.error name=%s", self.name)
-                await _wait(interval)
+                await self._wait(interval)
         finally:
             self._log.debug("subagent.run.stop name=%s", self.name)
+
+    async def _wait(self, seconds: float) -> None:
+        """Sleep up to *seconds*, returning early if ``stop()`` is called.
+
+        Chunked at ``_HEARTBEAT_INTERVAL_S`` so liveness beats keep firing
+        even while a long-interval agent (24h partition maintenance) is
+        between ticks. ``stop()`` still wakes the loop immediately —
+        ``stop_and_wait``'s 2-second grace is never threatened because the
+        chunk boundary checks the stop event every heartbeat cadence.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + seconds
+        while not self._stopped.is_set():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            chunk = min(remaining, _HEARTBEAT_INTERVAL_S)
+            try:
+                await asyncio.wait_for(self._stopped.wait(), timeout=chunk)
+                return  # stop requested mid-sleep
+            except asyncio.TimeoutError:
+                # A heartbeat-cadence chunk elapsed without a stop; beat
+                # and keep waiting out the remaining interval.
+                await self._maybe_heartbeat()
+
+    async def _maybe_heartbeat(self, *, force: bool = False) -> None:
+        """Upsert this agent's liveness row, rate-limited to the heartbeat
+        cadence. Best-effort: a DB hiccup (or a missing table on a
+        pre-migration DB) is logged at debug and never propagates — a
+        heartbeat failure must not perturb the tick loop.
+
+        Guarded against a ``None`` substrate / poolless substrate so the
+        base-class unit tests (which construct agents with ``substrate=None``)
+        exercise the run loop without a database.
+        """
+        substrate = self._substrate
+        pool = getattr(substrate, "pool", None) if substrate is not None else None
+        if pool is None:
+            return
+
+        loop = asyncio.get_event_loop()
+        now_mono = loop.time()
+        if (
+            not force
+            and self._last_beat_mono is not None
+            and now_mono - self._last_beat_mono < _HEARTBEAT_INTERVAL_S
+        ):
+            return
+
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    _HEARTBEAT_UPSERT_SQL,
+                    self.name,
+                    os.getpid(),
+                    socket.gethostname(),
+                    self._level.value,
+                    self.is_sentinel,
+                    self._tick_count,
+                    self._started_at or _utcnow(),
+                )
+            # Only advance the rate-limit clock on a successful write so a
+            # transient failure retries on the next loop iteration.
+            self._last_beat_mono = now_mono
+        except Exception:
+            self._log.debug(
+                "subagent.heartbeat.failed name=%s", self.name, exc_info=True
+            )
 
     def stop(self) -> None:
         """Request graceful stop. The run loop checks ``_stopped`` at
