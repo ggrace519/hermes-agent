@@ -438,13 +438,14 @@ when no auxiliary provider is configured.
 
 | Env var (default `1`) | Sub-agent | Produces |
 |---|---|---|
-| `HERMES_SUBSTRATE_PARSER` | Parser (Phase D) | L1 entities/relationships |
-| `HERMES_SUBSTRATE_ASSOCIATOR` | Associator (E1) | L2 associations |
-| `HERMES_SUBSTRATE_PATTERNFINDER` | Pattern-finder (E2) | L3 patterns |
-| `HERMES_SUBSTRATE_CRITIC` | Critic (F) | L4 calibration + coherence |
-| `HERMES_SUBSTRATE_REFLECTOR` | Reflector (F) | L3/L4 synthesis |
-| `HERMES_SUBSTRATE_DREAMER` | Dreamer (F) | counterfactual exploration log |
-| `HERMES_SUBSTRATE_CONDUCTOR` | Conductor (F) | adaptive intensity dialing |
+| `HERMES_SUBSTRATE_PARSER` | Parser | L1 entities/relationships |
+| `HERMES_SUBSTRATE_ASSOCIATOR` | Associator | L2 associations |
+| `HERMES_SUBSTRATE_PATTERNFINDER` | Pattern-finder | L3 patterns |
+| `HERMES_SUBSTRATE_CRITIC` | Critic | L4 calibration + coherence |
+| `HERMES_SUBSTRATE_REFLECTOR` | Reflector | L3/L4 synthesis |
+| `HERMES_SUBSTRATE_DREAMER` | Dreamer | counterfactual exploration log |
+| `HERMES_SUBSTRATE_CONDUCTOR` | Conductor | adaptive intensity dialing |
+| `HERMES_SUBSTRATE_SUMMARIZER` | Summarizer | compress older context |
 
 All require the worker subprocess (`hermes substrate worker run`) to be
 running. They depend bottom-up (Parser feeds the rest), so on a fresh

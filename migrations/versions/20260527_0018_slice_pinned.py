@@ -1,9 +1,9 @@
-"""substrate slice pinning — decay-immune memories (polish #4/#5)
+"""substrate slice pinning — decay-immune memories
 
 Adds ``substrate_slices.pinned``. A pinned slice is exempt from the
 Curator's natural decay and from release — the operator's "this matters,
-never forget it" override (substrate feedback #4 user controls / #5
-importance weighting). Reinforcement-on-recall already provides the
+never forget it" override (manual importance). Reinforcement-on-recall
+already provides the
 *automatic* importance signal (frequently-recalled slices keep high
 salience); pinning is the *manual* one.
 

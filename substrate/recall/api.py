@@ -306,7 +306,7 @@ async def recall(
         text = l1_header + ("\n\n" + text if text else "")
         tokens += header_tokens
 
-    # 4b. Opt-in skill suggestion (feedback #6) — append a compact
+    # 4b. Opt-in skill suggestion — append a compact
     # "## Relevant skills" footer when the query maps to bundled skills.
     # Default OFF so it never adds noise unless wanted; best-effort.
     if _cfg.RECALL_SUGGEST_SKILLS and (query or "").strip():

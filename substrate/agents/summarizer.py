@@ -1,4 +1,4 @@
-"""Polish — Summarizer: compress older perception into summary slices.
+"""Summarizer — compress older perception into summary slices.
 
 Long sessions inject raw history; this keeps recent slices verbatim but
 folds *older* ones (per session) into a single dense summary slice in a
@@ -6,7 +6,7 @@ paired ``hermes.self_action.summary`` stream, citing the originals via
 ``summary_of`` (MVS §4.7 retrospective summarization). The summary is a
 fresh, high-salience perception that carries the originals' meaning
 forward; the originals are then faded so the substrate's past compresses
-instead of accumulating (substrate feedback #2 auto-summarization).
+instead of accumulating (automatic summarization of older context).
 
 LLM-driven (mockable ``_summarize`` seam); gated by
 ``HERMES_SUBSTRATE_SUMMARIZER`` (default ON, like the other cognitive

@@ -89,7 +89,7 @@ RECALL_TIMEOUT_MS = _envint("HERMES_RECALL_TIMEOUT_MS", default=300)
 RECALL_MIN_SALIENCE = _envfloat("HERMES_RECALL_MIN_SALIENCE", default=0.05)
 RECALL_CANDIDATE_LIMIT = _envint("HERMES_RECALL_CANDIDATE_LIMIT", default=50)
 
-# Precision controls (volume-vs-precision polish). After ranking, a
+# Precision controls. After ranking, a
 # candidate is injected only if its composite score clears BOTH floors:
 #   * an absolute floor (drops near-zero, loosely-related slices), and
 #   * a relative floor = fraction of the top candidate's score (adapts
@@ -112,7 +112,7 @@ RECALL_SHOW_PROVENANCE = _envbool("HERMES_RECALL_SHOW_PROVENANCE", default=False
 RECALL_INCLUDE_L1 = _envbool("RECALL_INCLUDE_L1", default=True)
 RECALL_L1_LIMIT = _envint("RECALL_L1_LIMIT", default=5)
 
-# Skill suggestion in the recall projection (feedback #6). Opt-in (default
+# Skill suggestion in the recall projection. Opt-in (default
 # OFF) so it never adds noise to the per-turn block unless wanted; the
 # `hermes substrate skills <query>` CLI works regardless.
 RECALL_SUGGEST_SKILLS = _envbool("RECALL_SUGGEST_SKILLS", default=False)
