@@ -111,6 +111,28 @@ def _format_block(candidate: "RecallCandidate") -> str:
     return f"{header}\n{body}"
 
 
+def render_l1_header(entities: list[dict]) -> str:
+    """Render the Phase D ``## Known entities`` block (spec §7).
+
+    Pure: takes already-fetched entity dicts (``name``, ``entity_type``,
+    ``summary``, ``cites`` — a list of short slice-id strings) so the
+    composer stays DB-free. Returns "" for an empty list so the caller can
+    skip prepending.
+    """
+    if not entities:
+        return ""
+    lines = [f"## Known entities ({len(entities)})"]
+    for e in entities:
+        name = e.get("name", "?")
+        etype = e.get("entity_type", "other")
+        summary = (e.get("summary") or "").strip()[:200]
+        cites = e.get("cites") or []
+        cite_str = f" (cites: {', '.join(cites)})" if cites else ""
+        body = f" — {summary}" if summary else ""
+        lines.append(f"- {name} ({etype}){body}{cite_str}")
+    return "\n".join(lines)
+
+
 def compose_projection(
     ranked: "list[RecallCandidate]",
     *,

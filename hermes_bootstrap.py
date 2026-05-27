@@ -194,12 +194,83 @@ def init_db_sync() -> None:
 # from inside asyncio.run(); sync entry points use the sync wrapper which
 # bridges via hermes_db.run_sync.
 #
-# Bootstrap failure is non-fatal: a logged warning, no substrate emission,
-# Hermes runs as before (Phase A spec §0 — substrate failures must not
-# crash Hermes).
+# Bootstrap failure is non-fatal for writer-mode callers: a logged error,
+# no substrate emission, Hermes runs as before (Phase A spec §0 — substrate
+# failures must not crash Hermes). Worker-mode boot failure is critical (no
+# decay / Sentinel / embeddings) and the worker subprocess exits non-zero
+# so systemd restarts it.
+#
+# Either way, the outcome is recorded durably so an operator can SEE it
+# without grepping logs: ``hermes substrate boot`` (and the default
+# summary) read the last boot status per mode from the ``state_meta`` KV
+# table. Before this, a writer-mode boot failure silently stopped all
+# perception with no cross-process signal.
 
 _substrate_booted = False
 _substrate_handle: "object | None" = None
+
+# In-process cache of the last boot status per mode, for programmatic
+# health checks (``get_boot_status()``) that must not touch the DB.
+_last_boot_status: "dict[str, dict]" = {}
+
+# state_meta key prefix; one row per mode (writer / worker) so the two
+# process roles don't clobber each other's status.
+_BOOT_STATUS_KEY_PREFIX = "substrate.boot_status."
+
+
+def get_boot_status(mode: "str | None" = None):
+    """Return the last in-process boot status.
+
+    With ``mode`` → that mode's status dict (or ``None`` if this process
+    hasn't attempted that mode). Without ``mode`` → the whole
+    ``{mode: status}`` map. Process-local: reflects only boots attempted
+    in *this* process. The cross-process view is the ``state_meta`` rows
+    surfaced by ``hermes substrate boot``.
+    """
+    if mode is not None:
+        return _last_boot_status.get(mode)
+    return dict(_last_boot_status)
+
+
+async def _record_boot_status(mode: str, *, ok: bool, error_text=None, log=None) -> None:
+    """Best-effort record of a boot outcome to the ``state_meta`` KV table
+    (and the in-process cache). Never raises — a failure to record status
+    must not turn a successful boot into a failure, nor mask the original
+    error on the failure path. If the pool is down we simply can't record,
+    but then the inspect CLI can't read it either, so nothing is lost.
+    """
+    import datetime
+    import json
+    import os
+    import socket
+
+    status = {
+        "mode": mode,
+        "ok": ok,
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "error": error_text,
+        "booted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _last_boot_status[mode] = status
+
+    try:
+        import hermes_db
+
+        async with hermes_db.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO state_meta (key, value) VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """,
+                _BOOT_STATUS_KEY_PREFIX + mode,
+                json.dumps(status),
+            )
+    except Exception:
+        if log is not None:
+            log.debug(
+                "substrate.boot_status.record_failed mode=%s", mode, exc_info=True
+            )
 
 
 async def bootstrap_substrate(log=None, *, mode: str = "writer"):
@@ -242,9 +313,28 @@ async def bootstrap_substrate(log=None, *, mode: str = "writer"):
             )
         _substrate_handle = substrate
         _substrate_booted = True
+        await _record_boot_status(mode, ok=True, log=log)
         return substrate
-    except Exception:
-        log.exception("substrate.bootstrap.failed — Hermes continues without substrate emission")
+    except Exception as exc:
+        # Loud, mode-appropriate logging — a boot failure is never benign.
+        if mode == "worker":
+            log.error(
+                "substrate.bootstrap.failed mode=worker — the sub-agent "
+                "worker cannot start; decay, Sentinel decisions, and "
+                "embedding backfill will NOT run until this is fixed",
+                exc_info=True,
+            )
+        else:
+            log.error(
+                "substrate.bootstrap.failed mode=%s — Hermes keeps running "
+                "but emits NO perception (no recall, no L0 growth) until "
+                "this is fixed and the process restarted",
+                mode,
+                exc_info=True,
+            )
+        await _record_boot_status(
+            mode, ok=False, error_text=f"{type(exc).__name__}: {exc}", log=log
+        )
         return None
 
 

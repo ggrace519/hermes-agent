@@ -25,6 +25,7 @@ embeddings live under the separate ``hermes embed`` namespace; see
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
@@ -87,6 +88,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     ).set_defaults(func=_cmd_inspect_profiles)
 
     substrate_sub.add_parser(
+        "health",
+        help="One-glance operator rollup: worker liveness, boot, coherence, "
+        "L0–L4 counts, consolidation backlog",
+        description="The substrate operator dashboard — aggregates sub-agent "
+        "liveness, last boot, the Critic's coherence vital sign, per-layer "
+        "object counts, and consolidation backlog into a single report. The "
+        "first thing to run when asking 'is the substrate healthy?'.",
+    ).set_defaults(func=_cmd_inspect_health)
+
+    substrate_sub.add_parser(
         "agents",
         help="Sub-agent liveness (heartbeats from the worker subprocess)",
         description="Show each substrate sub-agent's last heartbeat, "
@@ -94,6 +105,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "substrate_agent_heartbeat, which the worker subprocess upserts "
         "every ~10s. If every agent shows DOWN, the worker is not running.",
     ).set_defaults(func=_cmd_inspect_agents)
+
+    substrate_sub.add_parser(
+        "boot",
+        help="Last substrate boot outcome per process role (writer/worker)",
+        description="Show the last recorded boot status for each substrate "
+        "process role. A writer-mode FAILED means the gateway/CLI is "
+        "emitting no perception; a worker-mode FAILED means decay/Sentinel/"
+        "embeddings aren't running. Reads the state_meta KV rows that "
+        "bootstrap_substrate writes on every boot attempt.",
+    ).set_defaults(func=_cmd_inspect_boot)
 
     # ── Phase B: curator subtree ──────────────────────────────────────
     curator_p = substrate_sub.add_parser(
@@ -159,6 +180,93 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "config", help="Dump RECALL_* config knobs"
     ).set_defaults(func=_cmd_inspect_recall_config)
 
+    recall_validate = recall_sub.add_parser(
+        "validate",
+        help="Run a real recall + print the composed block and a readiness verdict",
+        description="Go/no-go health probe: runs the same recall() the "
+        "foreground would, prints the composed <memory-context> block, "
+        "embedding coverage, and a READY/DEGRADED/NOT READY verdict. Useful "
+        "after a worker outage to confirm recall isn't silently degraded.",
+    )
+    recall_validate.add_argument(
+        "--query",
+        default=None,
+        help="Probe query (default: the most-recent user-message slice's text)",
+    )
+    recall_validate.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help="Override the composer token budget for this probe",
+    )
+    recall_validate.set_defaults(func=_cmd_inspect_recall_validate)
+
+    # ── Phase D: L1 + Parser subtrees ─────────────────────────────────
+    l1_p = substrate_sub.add_parser(
+        "l1", help="Inspect L1 (entities + relationships)"
+    )
+    l1_sub = l1_p.add_subparsers(dest="l1_subcommand")
+    l1_p.set_defaults(func=_cmd_inspect_l1_entities)
+    l1_ents = l1_sub.add_parser("entities", help="List L1 entities (default)")
+    l1_ents.add_argument("--type", default=None, help="Filter by entity_type")
+    l1_ents.add_argument("--limit", type=int, default=20)
+    l1_ents.set_defaults(func=_cmd_inspect_l1_entities)
+    l1_rels = l1_sub.add_parser("relationships", help="List L1 relationships")
+    l1_rels.add_argument("--limit", type=int, default=20)
+    l1_rels.set_defaults(func=_cmd_inspect_l1_relationships)
+
+    parser_p = substrate_sub.add_parser(
+        "parser", help="Inspect Parser activity (substrate_parser_log)"
+    )
+    parser_sub = parser_p.add_subparsers(dest="parser_subcommand")
+    parser_p.set_defaults(func=_cmd_inspect_parser_summary)
+    parser_sub.add_parser("summary", help="Parser summary (default)").set_defaults(
+        func=_cmd_inspect_parser_summary
+    )
+    parser_recent = parser_sub.add_parser("recent", help="Recent parser_log rows")
+    parser_recent.add_argument("--limit", type=int, default=20)
+    parser_recent.set_defaults(func=_cmd_inspect_parser_recent)
+
+    l2_p = substrate_sub.add_parser(
+        "l2", help="Inspect L2 (associations + edit history)"
+    )
+    l2_sub = l2_p.add_subparsers(dest="l2_subcommand")
+    l2_p.set_defaults(func=_cmd_inspect_l2_associations)
+    l2_assoc = l2_sub.add_parser("associations", help="Densest / per-entity edges (default)")
+    l2_assoc.add_argument("--entity", default=None, help="Filter to one entity (by name)")
+    l2_assoc.add_argument("--limit", type=int, default=20)
+    l2_assoc.set_defaults(func=_cmd_inspect_l2_associations)
+
+    l3_p = substrate_sub.add_parser("l3", help="Inspect L3 (patterns)")
+    l3_sub = l3_p.add_subparsers(dest="l3_subcommand")
+    l3_p.set_defaults(func=_cmd_inspect_l3_patterns)
+    l3_pat = l3_sub.add_parser("patterns", help="List L3 patterns (default)")
+    l3_pat.add_argument("--kind", default=None, help="Filter by pattern kind")
+    l3_pat.add_argument("--limit", type=int, default=20)
+    l3_pat.set_defaults(func=_cmd_inspect_l3_patterns)
+
+    l4_p = substrate_sub.add_parser(
+        "l4", help="Inspect L4 (self-model: coherence + calibration)"
+    )
+    l4_sub = l4_p.add_subparsers(dest="l4_subcommand")
+    l4_p.set_defaults(func=_cmd_inspect_l4)
+    l4_obs = l4_sub.add_parser("observations", help="Recent L4 observations (default)")
+    l4_obs.add_argument("--subject", default=None)
+    l4_obs.add_argument("--limit", type=int, default=20)
+    l4_obs.set_defaults(func=_cmd_inspect_l4)
+
+    dreamer_p = substrate_sub.add_parser(
+        "dreamer", help="Recent Dreamer explorations (persistent log)"
+    )
+    dreamer_p.add_argument("--limit", type=int, default=10)
+    dreamer_p.set_defaults(func=_cmd_inspect_dreamer)
+
+    conductor_p = substrate_sub.add_parser(
+        "conductor", help="Conductor decisions + backlog forecast (learned rhythm)"
+    )
+    conductor_p.add_argument("--limit", type=int, default=15)
+    conductor_p.set_defaults(func=_cmd_inspect_conductor)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -201,6 +309,14 @@ def _cmd_inspect_profiles(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_agents(args: argparse.Namespace) -> int:
     return _run_inspect(_print_agents)
+
+
+def _cmd_inspect_health(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_health)
+
+
+def _cmd_inspect_boot(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_boot_status)
 
 
 def _cmd_inspect_curator_summary(args: argparse.Namespace) -> int:
@@ -248,6 +364,64 @@ def _cmd_inspect_recall_config(args: argparse.Namespace) -> int:
     from substrate.recall.cli_inspect import print_config
 
     return _run_inspect(print_config)
+
+
+def _cmd_inspect_recall_validate(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import validate
+
+    return _run_inspect(
+        lambda conn: validate(
+            conn, query=args.query, token_budget=args.token_budget
+        )
+    )
+
+
+def _cmd_inspect_l1_entities(args: argparse.Namespace) -> int:
+    kind = getattr(args, "type", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l1_entities(conn, kind=kind, limit=limit))
+
+
+def _cmd_inspect_l1_relationships(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l1_relationships(conn, limit=limit))
+
+
+def _cmd_inspect_parser_summary(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_parser_summary)
+
+
+def _cmd_inspect_parser_recent(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_parser_recent(conn, limit=limit))
+
+
+def _cmd_inspect_l2_associations(args: argparse.Namespace) -> int:
+    entity = getattr(args, "entity", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l2_associations(conn, entity=entity, limit=limit))
+
+
+def _cmd_inspect_l3_patterns(args: argparse.Namespace) -> int:
+    kind = getattr(args, "kind", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l3_patterns(conn, kind=kind, limit=limit))
+
+
+def _cmd_inspect_l4(args: argparse.Namespace) -> int:
+    subject = getattr(args, "subject", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l4(conn, subject=subject, limit=limit))
+
+
+def _cmd_inspect_dreamer(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 10)
+    return _run_inspect(lambda conn: _print_dreamer(conn, limit=limit))
+
+
+def _cmd_inspect_conductor(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 15)
+    return _run_inspect(lambda conn: _print_conductor(conn, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -342,6 +516,15 @@ async def _print_summary(conn: "asyncpg.Connection") -> None:
             "     Start it with `hermes substrate worker run` (or the "
             "hermes-substrate-worker systemd unit)."
         )
+
+    print()
+    print("Last boot:")
+    boot_status = await _boot_status_rows(conn)
+    if not boot_status:
+        print("   (no boot status recorded)")
+    else:
+        for line in _format_boot_lines(boot_status):
+            print(f"   {line}")
 
 
 async def _print_streams(conn: "asyncpg.Connection") -> None:
@@ -448,6 +631,13 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("curator", False),
     ("force-reject", False),
     ("partition-maintenance", False),
+    ("parser", False),  # Phase D — heartbeats even when its tick is env-gated off
+    ("associator", False),  # Phase E1 — same staged-rollout shape
+    ("pattern-finder", False),  # Phase E2 — same staged-rollout shape
+    ("critic", False),  # Phase F — same staged-rollout shape
+    ("conductor", False),  # Phase F — adaptive policy loop (gated)
+    ("reflector", False),  # Phase F — L3/L4 synthesis (gated)
+    ("dreamer", False),  # Phase F — counterfactual exploration (gated)
 )
 
 
@@ -580,6 +770,460 @@ async def _print_agents(conn: "asyncpg.Connection") -> None:
         )
     else:
         print("✓ substrate worker is reporting heartbeats.")
+
+
+# ---------------------------------------------------------------------------
+# Operator health rollup (Phase G) — one-glance "is the substrate healthy?".
+# ---------------------------------------------------------------------------
+
+
+async def _layer_counts(conn: "asyncpg.Connection") -> dict:
+    """Per-layer object counts. Upper-layer tables (l1_/l2_/l3_/l4_) may not
+    exist on a pre-Phase-D DB; each is guarded so the rollup degrades."""
+    async def _scalar(sql: str, default=0):
+        try:
+            return int(await conn.fetchval(sql) or 0)
+        except Exception:
+            return None  # table absent / not migrated this far
+
+    slice_states = await _slice_state_counts(conn)
+    consolidated = await _scalar(
+        "SELECT COUNT(*) FROM substrate_slices WHERE consolidation_state='consolidated'"
+    )
+    pending_parse = await _scalar(
+        "SELECT COUNT(*) FROM substrate_slices "
+        "WHERE consolidation_state='unconsolidated' AND sentinel_state='passed'"
+    )
+    return {
+        "l0_passed": slice_states.get("passed", 0),
+        "l0_consolidated": consolidated,
+        "l0_pending_parse": pending_parse,
+        "l1_entities": await _scalar("SELECT COUNT(*) FROM l1_entities"),
+        "l1_relationships": await _scalar("SELECT COUNT(*) FROM l1_relationships"),
+        "l2_associations": await _scalar("SELECT COUNT(*) FROM substrate_associations"),
+        "l3_patterns": await _scalar("SELECT COUNT(*) FROM l3_patterns"),
+        "l4_observations": await _scalar("SELECT COUNT(*) FROM l4_observations"),
+    }
+
+
+async def _print_health(conn: "asyncpg.Connection") -> None:
+    now = datetime.now(timezone.utc)
+    print(f"Substrate health @ {now.isoformat()}")
+    print()
+
+    # 1. Worker liveness.
+    agents = await _agent_liveness(conn)
+    live = sum(1 for a in agents if a["status"] == "live")
+    print(f"Worker: ", end="")
+    if _all_agents_down(agents):
+        print("⚠ DOWN — no sub-agent heartbeat (run `hermes substrate worker run`)")
+    else:
+        print(f"✓ up — {live}/{len(agents)} sub-agents live")
+
+    # 2. Boot status.
+    boot = await _boot_status_rows(conn)
+    failed = sorted(m for m, st in boot.items() if st and not st.get("ok"))
+    if failed:
+        print(f"Boot:   ⚠ last boot FAILED for {', '.join(failed)}")
+    elif boot:
+        print(f"Boot:   ✓ {', '.join(sorted(boot))} OK")
+
+    # 3. Coherence vital sign (Critic / L4).
+    try:
+        coh = await conn.fetchrow(
+            "SELECT score, created_at FROM l4_observations WHERE kind='coherence' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+    except Exception:
+        coh = None
+    if coh and coh["score"] is not None:
+        age = _age_str(coh["created_at"].isoformat(), now)
+        print(f"Coherence: {coh['score']:.2f}  (assessed {age})")
+    else:
+        print("Coherence: (no assessment — Critic off or not yet run)")
+
+    # 4. Layer counts.
+    print()
+    lc = await _layer_counts(conn)
+
+    def _fmt(v):
+        return "—" if v is None else f"{v:,}"
+
+    print("Layers:")
+    print(f"  L0 perception   passed {_fmt(lc['l0_passed'])}  "
+          f"consolidated {_fmt(lc['l0_consolidated'])}  "
+          f"awaiting-parse {_fmt(lc['l0_pending_parse'])}")
+    print(f"  L1 knowledge    entities {_fmt(lc['l1_entities'])}  "
+          f"relationships {_fmt(lc['l1_relationships'])}")
+    print(f"  L2 associations {_fmt(lc['l2_associations'])}")
+    print(f"  L3 patterns     {_fmt(lc['l3_patterns'])}")
+    print(f"  L4 self-model   observations {_fmt(lc['l4_observations'])}")
+
+    # 5. Backlog one-liner.
+    pend = lc["l0_pending_parse"] or 0
+    done = lc["l0_consolidated"] or 0
+    if pend + done:
+        ratio = pend / (pend + done)
+        print()
+        print(f"Consolidation backlog: {ratio:.0%} "
+              f"({pend:,} awaiting parse / {pend + done:,} parseable)")
+
+
+# ---------------------------------------------------------------------------
+# Substrate boot status — reads the state_meta KV rows that
+# bootstrap_substrate writes on every boot attempt (success or failure),
+# so an operator can see a *writer*-mode boot failure (which silently stops
+# all perception) without grepping process logs.
+# ---------------------------------------------------------------------------
+
+
+# Key prefix must match hermes_bootstrap._BOOT_STATUS_KEY_PREFIX.
+_BOOT_STATUS_KEY_PREFIX = "substrate.boot_status."
+# Roster shown even when a mode has never booted, so a never-started worker
+# is visible rather than simply absent.
+_BOOT_MODES = ("writer", "worker")
+
+
+def _age_str(iso: Optional[str], now: datetime) -> str:
+    """Format an ISO-8601 timestamp as a coarse '12s ago' / '3.4m ago'."""
+    if not iso:
+        return "?"
+    try:
+        ts = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return "?"
+    secs = max(0.0, (now - ts).total_seconds())
+    if secs < 90:
+        return f"{secs:.0f}s ago"
+    if secs < 5400:
+        return f"{secs / 60:.1f}m ago"
+    return f"{secs / 3600:.1f}h ago"
+
+
+async def _boot_status_rows(conn: "asyncpg.Connection") -> dict:
+    """Return ``{mode: status_dict_or_None}`` parsed from state_meta. A
+    missing table or unparseable value degrades to an empty/None entry
+    rather than raising."""
+    try:
+        rows = await conn.fetch(
+            "SELECT key, value FROM state_meta WHERE key LIKE $1",
+            _BOOT_STATUS_KEY_PREFIX + "%",
+        )
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows:
+        mode = r["key"][len(_BOOT_STATUS_KEY_PREFIX):]
+        try:
+            out[mode] = json.loads(r["value"]) if r["value"] else None
+        except (ValueError, TypeError):
+            out[mode] = None
+    return out
+
+
+def _format_boot_lines(status_by_mode: dict) -> list[str]:
+    """One line per boot mode (expected roster first, then any extras)."""
+    now = datetime.now(timezone.utc)
+    lines: list[str] = []
+
+    def _line(mode: str, st) -> str:
+        if not st:
+            return f"{mode:8s} (no boot recorded)"
+        verdict = "OK" if st.get("ok") else "FAILED"
+        age = _age_str(st.get("booted_at"), now)
+        detail = f"pid {st.get('pid')}"
+        if not st.get("ok") and st.get("error"):
+            detail += f"   {st['error']}"
+        return f"{mode:8s} {verdict:6s} {age:>10s}   {detail}"
+
+    for mode in _BOOT_MODES:
+        lines.append(_line(mode, status_by_mode.get(mode)))
+    for mode, st in status_by_mode.items():
+        if mode not in _BOOT_MODES:
+            lines.append(_line(mode, st))
+    return lines
+
+
+async def _print_boot_status(conn: "asyncpg.Connection") -> None:
+    """``hermes substrate boot`` — last boot outcome per process role."""
+    now = datetime.now(timezone.utc)
+    print(f"Substrate boot status @ {now.isoformat()}")
+    print()
+    status = await _boot_status_rows(conn)
+    if not status:
+        print(
+            "  (no boot status recorded — bootstrap_substrate has not run "
+            "against this database, or this deployment predates boot-status "
+            "recording)"
+        )
+        return
+    for line in _format_boot_lines(status):
+        print(f"  {line}")
+    failed = sorted(m for m, st in status.items() if st and not st.get("ok"))
+    if failed:
+        print()
+        print(f"⚠ last boot FAILED for: {', '.join(failed)} — see process logs.")
+
+
+# ---------------------------------------------------------------------------
+# Phase D: L1 + Parser printers.
+# ---------------------------------------------------------------------------
+
+
+async def _print_l1_entities(conn, *, kind=None, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT e.name, e.entity_type, e.summary, e.salience_score,
+               e.last_seen_at,
+               (SELECT COUNT(*) FROM l1_relationships r
+                 WHERE r.subject_id = e.id OR r.object_id = e.id) AS rels,
+               (SELECT COUNT(*) FROM l1_citations c WHERE c.entity_id = e.id) AS cites
+          FROM l1_entities e
+         WHERE ($1::text IS NULL OR e.entity_type = $1)
+         ORDER BY e.salience_score DESC, e.last_seen_at DESC
+         LIMIT $2
+        """,
+        kind,
+        limit,
+    )
+    if not rows:
+        print("(no L1 entities — is the Parser running with HERMES_SUBSTRATE_PARSER=1?)")
+        return
+    print(f"{'name':32s}  {'type':10s}  {'sal':>5s}  {'rels':>4s}  {'cites':>5s}  summary")
+    print("-" * 100)
+    for r in rows:
+        summary = (r["summary"] or "")[:40]
+        print(
+            f"{r['name'][:32]:32s}  {r['entity_type']:10s}  "
+            f"{r['salience_score']:>5.2f}  {r['rels']:>4d}  {r['cites']:>5d}  {summary}"
+        )
+
+
+async def _print_l1_relationships(conn, *, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT s.name AS subj, r.predicate, o.name AS obj, r.confidence, r.last_seen_at
+          FROM l1_relationships r
+          JOIN l1_entities s ON s.id = r.subject_id
+          JOIN l1_entities o ON o.id = r.object_id
+         ORDER BY r.last_seen_at DESC
+         LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        print("(no L1 relationships)")
+        return
+    for r in rows:
+        print(f"  {r['subj']} --{r['predicate']}--> {r['obj']}  (conf {r['confidence']:.2f})")
+
+
+async def _print_parser_summary(conn) -> None:
+    now = datetime.now(timezone.utc)
+    print(f"Parser state @ {now.isoformat()}")
+    print()
+    row = await conn.fetchrow(
+        """
+        SELECT COUNT(*)::int AS calls,
+               COALESCE(SUM(entities_emitted),0)::int AS ents,
+               COALESCE(SUM(relationships_emitted),0)::int AS rels,
+               COALESCE(SUM(slices_consolidated),0)::int AS consolidated,
+               COALESCE(AVG(latency_ms),0)::int AS avg_ms
+          FROM substrate_parser_log
+         WHERE t_call > now() - interval '24 hours'
+        """
+    )
+    print("Last 24h:")
+    print(f"  calls                {row['calls']}")
+    print(f"  entities emitted     {row['ents']}")
+    print(f"  relationships emitted {row['rels']}")
+    print(f"  slices consolidated  {row['consolidated']}")
+    print(f"  avg latency          {row['avg_ms']} ms")
+    print()
+    outcomes = await conn.fetch(
+        """
+        SELECT outcome, COUNT(*)::int AS n FROM substrate_parser_log
+         WHERE t_call > now() - interval '24 hours' GROUP BY outcome ORDER BY n DESC
+        """
+    )
+    print("Outcomes (24h):")
+    if not outcomes:
+        print("  (no parser activity — HERMES_SUBSTRATE_PARSER off, or worker down?)")
+    for o in outcomes:
+        print(f"  {o['outcome']:12s} {o['n']}")
+    totals = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE consolidation_state='consolidated')::int AS consolidated,
+            COUNT(*) FILTER (WHERE consolidation_state='unconsolidated' AND sentinel_state='passed')::int AS pending
+          FROM substrate_slices
+        """
+    )
+    print()
+    print("L0 consolidation:")
+    print(f"  consolidated slices  {totals['consolidated']}")
+    print(f"  awaiting parse       {totals['pending']}")
+
+
+async def _print_parser_recent(conn, *, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT t_call, session_id, batch_size, entities_emitted,
+               relationships_emitted, slices_consolidated, latency_ms, outcome, error
+          FROM substrate_parser_log ORDER BY t_call DESC LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        print("(no parser_log rows yet)")
+        return
+    for r in rows:
+        ts = r["t_call"].isoformat() if r["t_call"] else "-"
+        extra = f" err={r['error']}" if r["error"] else ""
+        print(
+            f"  [{ts}] {r['outcome']:11s} batch={r['batch_size']} "
+            f"ents={r['entities_emitted']} rels={r['relationships_emitted']} "
+            f"consol={r['slices_consolidated']} {r['latency_ms']}ms{extra}"
+        )
+
+
+async def _print_l2_associations(conn, *, entity=None, limit=20) -> None:
+    if entity:
+        rows = await conn.fetch(
+            """
+            SELECT s.name AS src, o.name AS dst, a.edge_type, a.weight
+              FROM substrate_associations a
+              JOIN l1_entities s ON s.id = a.src_id
+              JOIN l1_entities o ON o.id = a.dst_id
+             WHERE s.name ILIKE $1 OR o.name ILIKE $1
+             ORDER BY a.weight DESC LIMIT $2
+            """,
+            f"%{entity}%",
+            limit,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT s.name AS src, o.name AS dst, a.edge_type, a.weight
+              FROM substrate_associations a
+              JOIN l1_entities s ON s.id = a.src_id
+              JOIN l1_entities o ON o.id = a.dst_id
+             ORDER BY a.weight DESC LIMIT $1
+            """,
+            limit,
+        )
+    if not rows:
+        print("(no L2 associations — is the Associator running with "
+              "HERMES_SUBSTRATE_ASSOCIATOR=1?)")
+        return
+    for r in rows:
+        print(
+            f"  {r['src']} <-> {r['dst']}  [{r['edge_type']}]  weight {r['weight']:.1f}"
+        )
+
+
+async def _print_l3_patterns(conn, *, kind=None, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT kind, statement, salience_score, confidence,
+               jsonb_array_length(cites) AS n_cites, last_seen_at
+          FROM l3_patterns
+         WHERE ($1::text IS NULL OR kind = $1)
+         ORDER BY salience_score DESC, last_seen_at DESC
+         LIMIT $2
+        """,
+        kind,
+        limit,
+    )
+    if not rows:
+        print("(no L3 patterns — is the Pattern-finder running with "
+              "HERMES_SUBSTRATE_PATTERNFINDER=1?)")
+        return
+    for r in rows:
+        print(
+            f"  [{r['kind']:18s}] sal={r['salience_score']:.2f} "
+            f"conf={r['confidence']:.2f} cites={r['n_cites']}  {r['statement']}"
+        )
+
+
+async def _print_conductor(conn, *, limit=15) -> None:
+    try:
+        latest = await conn.fetchrow(
+            "SELECT backlog_ratio, forecast FROM substrate_conductor_log "
+            "ORDER BY at DESC LIMIT 1"
+        )
+        rows = await conn.fetch(
+            "SELECT at, backlog_ratio, forecast, targets FROM substrate_conductor_log "
+            "ORDER BY at DESC LIMIT $1",
+            limit,
+        )
+    except Exception:
+        print("(no conductor log — is the Conductor running with "
+              "HERMES_SUBSTRATE_CONDUCTOR=1?)")
+        return
+    if latest is not None:
+        print(f"Backlog forecast (EMA): {latest['forecast']:.2%}  "
+              f"(latest observed {latest['backlog_ratio']:.2%})")
+        print()
+    if not rows:
+        print("(no conductor decisions logged yet)")
+        return
+    print("Recent decisions:")
+    for r in rows:
+        ts = r["at"].isoformat() if r["at"] else "-"
+        targets = r["targets"] or {}
+        parser_t = targets.get("parser", "?")
+        print(f"  [{ts}] backlog {r['backlog_ratio']:.0%} → parser={parser_t}")
+
+
+async def _print_dreamer(conn, *, limit=10) -> None:
+    try:
+        rows = await conn.fetch(
+            "SELECT seed, exploration, created_at FROM substrate_dreamer_log "
+            "ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
+    except Exception:
+        print("(no dreamer log — is the Dreamer running with "
+              "HERMES_SUBSTRATE_DREAMER=1?)")
+        return
+    if not rows:
+        print("(no dreamer explorations yet)")
+        return
+    for r in rows:
+        ts = r["created_at"].isoformat() if r["created_at"] else "-"
+        print(f"  [{ts}] seed: {r['seed'][:70]}")
+        print(f"      {r['exploration'][:200]}")
+
+
+async def _print_l4(conn, *, subject=None, limit=20) -> None:
+    coherence = await conn.fetchrow(
+        "SELECT score, statement, created_at FROM l4_observations "
+        "WHERE kind='coherence' ORDER BY created_at DESC LIMIT 1"
+    )
+    if coherence and coherence["score"] is not None:
+        print(f"Coherence (latest): {coherence['score']:.2f}  —  {coherence['statement']}")
+    else:
+        print("Coherence (latest): (none — is the Critic running with "
+              "HERMES_SUBSTRATE_CRITIC=1?)")
+    print()
+    rows = await conn.fetch(
+        """
+        SELECT kind, subject, statement, score, created_at
+          FROM l4_observations
+         WHERE ($1::text IS NULL OR subject = $1)
+         ORDER BY created_at DESC LIMIT $2
+        """,
+        subject,
+        limit,
+    )
+    if not rows:
+        print("(no L4 observations)")
+        return
+    print("Recent observations:")
+    for r in rows:
+        score = f" [{r['score']:.2f}]" if r["score"] is not None else ""
+        print(f"  ({r['kind']}/{r['subject']}){score}  {r['statement']}")
 
 
 # ---------------------------------------------------------------------------

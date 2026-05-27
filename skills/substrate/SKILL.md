@@ -395,3 +395,51 @@ restart Hermes.
   going even if every slice write fails. If you see "recall returned empty"
   consistently, check the Hermes log for substrate exceptions before
   concluding the data isn't there.
+
+## Observability & layer commands (Phases D–G)
+
+Start here when asking "is the substrate healthy?":
+
+- **`hermes substrate health`** — one-glance operator rollup: worker
+  liveness, last boot, the Critic's coherence vital sign, per-layer
+  L0–L4 counts, and consolidation backlog. The first thing to run.
+- **`hermes substrate agents`** — per-sub-agent liveness (live/stale/down
+  by heartbeat age). All DOWN ⇒ the worker subprocess isn't running.
+- **`hermes substrate boot`** — last boot outcome per process role.
+- **`hermes substrate recall validate`** — runs a real recall and prints the
+  composed `<memory-context>` block + a READY/DEGRADED/NOT-READY verdict.
+- **`hermes substrate l1 entities|relationships`** — L1 knowledge (Parser).
+- **`hermes substrate parser summary|recent`** — Parser activity + outcomes.
+- **`hermes substrate l2 associations`** — L2 graph (Associator).
+- **`hermes substrate l3 patterns`** — L3 generalizations (Pattern-finder).
+- **`hermes substrate l4 observations`** — L4 self-model + coherence (Critic).
+
+The cognitive sub-agents are **ON by default** — set the env var to `0` to
+disable a given one. Each still registers + heartbeats regardless; the gate
+only controls whether its tick does work. LLM-driven agents no-op silently
+when no auxiliary provider is configured.
+
+| Env var (default `1`) | Sub-agent | Produces |
+|---|---|---|
+| `HERMES_SUBSTRATE_PARSER` | Parser (Phase D) | L1 entities/relationships |
+| `HERMES_SUBSTRATE_ASSOCIATOR` | Associator (E1) | L2 associations |
+| `HERMES_SUBSTRATE_PATTERNFINDER` | Pattern-finder (E2) | L3 patterns |
+| `HERMES_SUBSTRATE_CRITIC` | Critic (F) | L4 calibration + coherence |
+| `HERMES_SUBSTRATE_REFLECTOR` | Reflector (F) | L3/L4 synthesis |
+| `HERMES_SUBSTRATE_DREAMER` | Dreamer (F) | counterfactual exploration log |
+| `HERMES_SUBSTRATE_CONDUCTOR` | Conductor (F) | adaptive intensity dialing |
+
+All require the worker subprocess (`hermes substrate worker run`) to be
+running. They depend bottom-up (Parser feeds the rest), so on a fresh
+install L1+ fills only after the Parser has consolidated some L0.
+
+`HERMES_SUBSTRATE_SENTINEL_DEFENSE` (Sentinel content defense — quarantine
+of suspected prompt-injection) is the one feature still **default OFF**: a
+false-positive silently drops a slice from recall, so enable + tune it
+against your own traffic during local testing.
+
+**Refinements still deferred (flagged in the phase PRs):** the L2-grounding
+coherence signal (needs L1/L2 decay), per-stream-family Sentinel trust +
+embedding/LLM detection + re-Sentineling, multi-horizon Conductor
+forecasting / policy-learning, foreground-attention definition (MVS §8.6),
+and entity merge/dedup.

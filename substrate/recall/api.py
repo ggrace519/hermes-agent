@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
 from substrate import config as _cfg
-from substrate.recall.composer import compose_projection
+from substrate.recall.composer import compose_projection, render_l1_header
 from substrate.recall.embeddings import embed_query
 from substrate.recall.log import RecallLogRow
 from substrate.recall.projection import (
@@ -262,8 +262,25 @@ async def recall(
         recency_half_life_hours=_cfg.RECALL_RECENCY_HALF_LIFE_HOURS,
     )
 
-    # 4. Compose.
-    text, composed, tokens = compose_projection(ranked, token_budget=token_budget)
+    # 3b. Phase D: fetch a bounded L1 entity header (best-effort — a
+    # missing L1 layer / DB hiccup degrades to no header, never an error).
+    # The header shares the token budget: it's prepended ahead of the L0
+    # quotes, so the L0 composer gets the remaining budget.
+    l1_header = ""
+    if _cfg.RECALL_INCLUDE_L1 and (query or "").strip():
+        try:
+            l1_header = await _build_l1_header(query)
+        except Exception as exc:  # pragma: no cover — defensive
+            _log.debug("recall L1 header fetch failed: %s", exc)
+            l1_header = ""
+    header_tokens = max(1, len(l1_header) // 4) if l1_header else 0
+
+    # 4. Compose (L0 quotes get the budget left after the L1 header).
+    l0_budget = max(0, token_budget - header_tokens)
+    text, composed, tokens = compose_projection(ranked, token_budget=l0_budget)
+    if l1_header:
+        text = l1_header + ("\n\n" + text if text else "")
+        tokens += header_tokens
 
     # 5. Reinforce hits (no await on failure — fire-and-forget).
     # Note: we await here for testability; the actual work is per-slice
@@ -308,6 +325,31 @@ async def recall(
         substrate, t_now, session_id, query, proj, extra_meta, error_text=None,
     )
     return proj
+
+
+async def _build_l1_header(query: str) -> str:
+    """Fetch the top L1 entities for *query* (+ up to 2 citations each) and
+    render the ``## Known entities`` block. Returns "" when L1 is empty or
+    nothing matches. Used by :func:`recall` (Phase D §7)."""
+    from substrate.l1 import store as l1_store
+
+    entities = await l1_store.get_entities_for_query(
+        query, limit=_cfg.RECALL_L1_LIMIT
+    )
+    if not entities:
+        return ""
+    rendered: list[dict] = []
+    for e in entities:
+        cites = await l1_store.list_citations_for_entity(e.id, limit=2)
+        rendered.append(
+            {
+                "name": e.name,
+                "entity_type": e.entity_type,
+                "summary": e.summary,
+                "cites": [str(c.slice_id)[:6] for c in cites],
+            }
+        )
+    return render_l1_header(rendered)
 
 
 async def _fetch_candidates(

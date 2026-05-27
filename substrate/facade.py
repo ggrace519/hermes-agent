@@ -167,6 +167,10 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 #   telemetry). Strictly additive — one new table the run loop upserts and
 #   the inspect CLI reads. Sub-agent heartbeat writes swallow a missing
 #   table, so the substrate also boots fine against the prior head.
+# - ``20260527_0011`` — Phase D L1 (l1_entities/relationships/citations).
+#   Strictly additive — new tables; only the Parser + L1 store touch them.
+# - ``20260527_0012`` — Phase D parser audit (substrate_parser_log).
+#   Strictly additive — Parser observability, parallel to substrate_recall_log.
 _EXPECTED_REVISIONS = frozenset(
     {
         "20260523_0003",
@@ -175,6 +179,18 @@ _EXPECTED_REVISIONS = frozenset(
         "20260525_0006",
         "20260526_0009",
         "20260527_0010",
+        "20260527_0011",
+        "20260527_0012",
+        # - ``20260527_0013`` — Phase E1 L2 (substrate_associations + edits).
+        "20260527_0013",
+        # - ``20260527_0014`` — Phase E2 L3 (l3_patterns).
+        "20260527_0014",
+        # - ``20260527_0015`` — Phase F L4 (l4_observations).
+        "20260527_0015",
+        # - ``20260527_0016`` — Phase F Dreamer (substrate_dreamer_log).
+        "20260527_0016",
+        # - ``20260527_0017`` — Phase F learned Conductor (substrate_conductor_log).
+        "20260527_0017",
     }
 )
 
@@ -532,17 +548,26 @@ class Substrate:
           * partition-maintenance first — touches storage DDL, cheap.
           * force-reject second — protects the pending queue.
           * curator third — real decay/release loop (Phase B).
+          * parser fourth — L0→L1 consolidation (Phase D); no-op tick
+            unless HERMES_SUBSTRATE_PARSER=1, so registering it is free.
           * sentinel last — the highest-frequency tick.
         Conductor is instantiated but doesn't tick (still a stub —
         Phase B adds the push-on-set_intensity hook so live agents
         pick up intensity changes within one tick).
         """
+        from substrate.agents.associator import Associator
         from substrate.agents.conductor import StubConductor
+        from substrate.agents.conductor_policy import AdaptiveConductor
+        from substrate.agents.critic import Critic
         from substrate.agents.curator import Curator
+        from substrate.agents.dreamer import Dreamer
         from substrate.agents.force_reject import ForceRejectWorker
+        from substrate.agents.parser import Parser
+        from substrate.agents.pattern_finder import PatternFinder
         from substrate.agents.partition_maintenance import (
             PartitionMaintenanceWorker,
         )
+        from substrate.agents.reflector import Reflector
         from substrate.agents.sentinel import StubSentinel
 
         self._conductor = StubConductor(self)
@@ -550,8 +575,20 @@ class Substrate:
         partition = PartitionMaintenanceWorker(self)
         force_reject = ForceRejectWorker(self)
         curator = Curator(self)
+        parser = Parser(self)            # Phase D  — gated HERMES_SUBSTRATE_PARSER
+        associator = Associator(self)    # Phase E1 — gated HERMES_SUBSTRATE_ASSOCIATOR
+        pattern_finder = PatternFinder(self)  # Phase E2 — gated HERMES_SUBSTRATE_PATTERNFINDER
+        critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
+        reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
+        dreamer = Dreamer(self)          # Phase F  — gated HERMES_SUBSTRATE_DREAMER
+        # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
+        # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
+        conductor_policy = AdaptiveConductor(self)
         sentinel = StubSentinel(self)
-        for agent in (partition, force_reject, curator, sentinel):
+        for agent in (
+            partition, force_reject, curator, parser, associator,
+            pattern_finder, critic, reflector, dreamer, conductor_policy, sentinel,
+        ):
             agent.start()
             self._subagents[agent.name] = agent
 

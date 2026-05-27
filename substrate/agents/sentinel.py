@@ -1,20 +1,26 @@
-"""Stub Sentinel — Phase A pass-through.
+"""Sentinel — guards L0 ingestion.
 
-Polls the pending queue, passes every slice with a modality-derived
-trust score, and emits a batch-summary audit slice on
-``substrate.self_state``.
+Polls the pending queue and decides each slice ``passed`` (with a trust
+score) or ``quarantined``. By default it's the Phase A pass-through
+(modality-derived trust, quarantines nothing); when
+``HERMES_SUBSTRATE_SENTINEL_DEFENSE=1`` it runs the real content defense
+(``sentinel_defense.assess`` — heuristic prompt-injection / impersonation /
+exfiltration detection) and quarantines hostile slices so they never reach
+consolidation or recall (MVS §6.2).
 
-Real defense logic (prompt-injection detection, content poisoning,
-source impersonation) lands in Phase B+. This stub exists so the
-pending → passed lifecycle and the SKIP-LOCKED concurrency contract
-are exercised from day one.
+The defense is gated OFF by default because quarantining is a behaviour
+change (a false positive silently drops a slice from recall); operators
+opt in after tuning. The pass-through path and the SKIP-LOCKED concurrency
+contract are unchanged.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from substrate.agents import sentinel_defense
 from substrate.agents.base import SubAgent
 from substrate.storage.types import Modality, SentinelState
 
@@ -61,11 +67,25 @@ class StubSentinel(SubAgent):
         # other Sentinel instances can grab their own slices.
         self._batch_limit = 100
 
+    @staticmethod
+    def _defense_enabled() -> bool:
+        raw = (os.environ.get("HERMES_SUBSTRATE_SENTINEL_DEFENSE") or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _decide(self, s) -> tuple:
+        """Return a ``decide_many`` tuple for one pending slice.
+
+        Pass-through (default) → PASSED at modality trust. With defense on,
+        the content assessor may QUARANTINE or reduce trust.
+        """
+        base = _trust_for_modality(s.payload_modality)
+        if not self._defense_enabled():
+            return (s.slice_id, SentinelState.PASSED, base, None)
+        v = sentinel_defense.assess(s.payload, s.payload_modality, base)
+        return (s.slice_id, v.state, v.trust_score, v.reason)
+
     async def tick(self) -> None:
         import hermes_db
-        from substrate.l0.api import commit_slice
-
-        from substrate.storage import DEFAULT_STRUCTURED_PROFILE  # noqa: F401
 
         # 1) Read pending batch + decide everyone, all in one txn so a
         #    partial failure leaves the pending queue unchanged.
@@ -76,28 +96,21 @@ class StubSentinel(SubAgent):
             if not batch:
                 return
 
-            decisions = [
-                (
-                    s.slice_id,
-                    SentinelState.PASSED,
-                    _trust_for_modality(s.payload_modality),
-                    None,  # reason: stub Sentinel has no opinion
-                )
-                for s in batch
-            ]
+            decisions = [self._decide(s) for s in batch]
             await self._substrate.slices.decide_many(conn, decisions)
 
         # 2) Emit the batch summary on substrate.self_state. This is
         #    its own commit (no shared txn) so the audit landing is
         #    independent of the Sentinel batch transaction.
-        await self._emit_batch_summary(batch)
+        await self._emit_batch_summary(batch, decisions)
 
-    async def _emit_batch_summary(self, batch: list) -> None:
+    async def _emit_batch_summary(self, batch: list, decisions: list) -> None:
         """Emit one structured-event slice summarising the batch.
 
         The audit row keeps the slice IDs as strings (UUIDs are not
         JSON-natively serialisable; the codec round-trips dicts but
-        each leaf has to be JSON-compatible).
+        each leaf has to be JSON-compatible). With defense on, the
+        summary records how many slices were quarantined and why.
         """
         from substrate.l0.api import commit_slice
 
@@ -110,13 +123,18 @@ class StubSentinel(SubAgent):
             )
             return
 
+        quarantined = [d for d in decisions if d[1] is SentinelState.QUARANTINED]
+        passed = len(decisions) - len(quarantined)
+
         await commit_slice(
             self._substrate,
             stream_id=self_state.stream_id,
             payload={
                 "event": "sentinel_batch_decision",
                 "count": len(batch),
-                "decisions": "passed",
+                "passed": passed,
+                "quarantined": len(quarantined),
+                "quarantine_reasons": [d[3] for d in quarantined if d[3]],
                 "slice_ids": [str(s.slice_id) for s in batch],
             },
             event_time_world=datetime.now(timezone.utc),
