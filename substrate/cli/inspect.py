@@ -86,6 +86,15 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "profiles", help="List decay profiles"
     ).set_defaults(func=_cmd_inspect_profiles)
 
+    substrate_sub.add_parser(
+        "agents",
+        help="Sub-agent liveness (heartbeats from the worker subprocess)",
+        description="Show each substrate sub-agent's last heartbeat, "
+        "intensity, tick count, and live/stale/down status. Reads "
+        "substrate_agent_heartbeat, which the worker subprocess upserts "
+        "every ~10s. If every agent shows DOWN, the worker is not running.",
+    ).set_defaults(func=_cmd_inspect_agents)
+
     # ── Phase B: curator subtree ──────────────────────────────────────
     curator_p = substrate_sub.add_parser(
         "curator",
@@ -188,6 +197,10 @@ def _cmd_inspect_pending(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_profiles(args: argparse.Namespace) -> int:
     return _run_inspect(_print_profiles)
+
+
+def _cmd_inspect_agents(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_agents)
 
 
 def _cmd_inspect_curator_summary(args: argparse.Namespace) -> int:
@@ -310,14 +323,25 @@ async def _print_summary(conn: "asyncpg.Connection") -> None:
         print("   oldest pending = (empty)")
 
     print()
-    print("Sub-agents (intensity):")
-    # Sub-agent state lives in-process; the CLI doesn't have a handle to
-    # the booted Substrate. Print the static expected list — operators
-    # wanting live intensity should check the Hermes process logs.
-    print("   sentinel        FULL    (see process logs)")
-    print("   force-reject    LOW     (see process logs)")
-    print("   partition-maintenance FULL (24h tick)")
-    print("   conductor       —       (no policy active)")
+    print("Sub-agents (liveness):")
+    # Liveness is read from substrate_agent_heartbeat — the durable,
+    # cross-process surface the worker subprocess upserts. The CLI runs in
+    # a different process from the worker, so this is the ONLY way it can
+    # tell a live worker from a dead one. (Pre-heartbeat, this section was
+    # a static "all healthy" list — a dead worker was invisible.)
+    rows = await _agent_liveness(conn)
+    for line in _format_agent_lines(rows):
+        print(f"   {line}")
+    if _all_agents_down(rows):
+        print()
+        print(
+            "   ⚠ substrate worker appears DOWN — no sub-agent has "
+            "reported a heartbeat."
+        )
+        print(
+            "     Start it with `hermes substrate worker run` (or the "
+            "hermes-substrate-worker systemd unit)."
+        )
 
 
 async def _print_streams(conn: "asyncpg.Connection") -> None:
@@ -398,6 +422,164 @@ async def _print_profiles(conn: "asyncpg.Connection") -> None:
             f"{r['tombstone_policy']:10s}  "
             f"{r['applies_to_modality'] or '-'}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent liveness — reads substrate_agent_heartbeat (written by the
+# worker subprocess) so the inspect CLI can tell a live worker from a dead
+# one across processes.
+# ---------------------------------------------------------------------------
+
+
+# Staleness thresholds, expressed against the worker's ~10s heartbeat
+# cadence (substrate.agents.base._HEARTBEAT_INTERVAL_S). A beat within 3
+# cadences is "live"; up to ~9 is "stale" (the worker may be briefly
+# blocked or the host paused); beyond that the agent is treated as down.
+_AGENT_LIVE_S = 30.0
+_AGENT_STALE_S = 90.0
+
+
+# The roster the worker subprocess is expected to run (Phase A + B). Listing
+# them explicitly means a *missing* agent (never beat → no row) shows as
+# DOWN rather than silently vanishing from the report. ``is_sentinel`` is
+# shown so an operator can see which agent carries the never-throttled floor.
+_EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
+    ("sentinel", True),
+    ("curator", False),
+    ("force-reject", False),
+    ("partition-maintenance", False),
+)
+
+
+def _classify_agent(age_seconds: Optional[float]) -> str:
+    """Map heartbeat age → ``live`` / ``stale`` / ``down``."""
+    if age_seconds is None:
+        return "down"
+    if age_seconds <= _AGENT_LIVE_S:
+        return "live"
+    if age_seconds <= _AGENT_STALE_S:
+        return "stale"
+    return "down"
+
+
+async def _agent_liveness(conn: "asyncpg.Connection") -> list[dict]:
+    """Merge the heartbeat table against the expected roster.
+
+    Returns one dict per agent (expected roster first, in order, then any
+    unrecognised agents that have beaten — e.g. a future sub-agent). Each
+    dict carries ``name, status, level, is_sentinel, age_seconds,
+    tick_count, pid, host``. An agent that has never beaten gets a
+    synthesised ``down`` entry with ``age_seconds=None``.
+
+    A missing ``substrate_agent_heartbeat`` table (inspecting a DB that
+    predates this migration) is treated as "every agent down" rather than
+    an error — the report degrades gracefully.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT agent_name, pid, host, level, is_sentinel, tick_count,
+                   EXTRACT(EPOCH FROM (now() - last_beat_at))::float AS age_seconds
+              FROM substrate_agent_heartbeat
+            """
+        )
+    except Exception:  # undefined table on a pre-migration DB, etc.
+        rows = []
+
+    by_name = {r["agent_name"]: r for r in rows}
+    out: list[dict] = []
+
+    def _entry_from_row(name: str, is_sentinel_default: bool, r) -> dict:
+        if r is None:
+            return {
+                "name": name,
+                "status": "down",
+                "level": None,
+                "is_sentinel": is_sentinel_default,
+                "age_seconds": None,
+                "tick_count": None,
+                "pid": None,
+                "host": None,
+            }
+        age = float(r["age_seconds"]) if r["age_seconds"] is not None else None
+        return {
+            "name": name,
+            "status": _classify_agent(age),
+            "level": r["level"],
+            "is_sentinel": r["is_sentinel"],
+            "age_seconds": age,
+            "tick_count": r["tick_count"],
+            "pid": r["pid"],
+            "host": r["host"],
+        }
+
+    for name, is_sentinel_default in _EXPECTED_AGENTS:
+        out.append(_entry_from_row(name, is_sentinel_default, by_name.get(name)))
+
+    # Any beating agent not in the expected roster (future sub-agents).
+    expected_names = {n for n, _ in _EXPECTED_AGENTS}
+    for r in rows:
+        if r["agent_name"] not in expected_names:
+            out.append(_entry_from_row(r["agent_name"], bool(r["is_sentinel"]), r))
+
+    return out
+
+
+def _all_agents_down(rows: list[dict]) -> bool:
+    """True when no agent is live or stale — i.e. the worker is down."""
+    return not any(r["status"] in ("live", "stale") for r in rows)
+
+
+def _format_agent_lines(rows: list[dict]) -> list[str]:
+    """One human-readable line per agent for the summary + agents views."""
+    lines: list[str] = []
+    for r in rows:
+        name = r["name"]
+        status = r["status"]
+        if r["age_seconds"] is None:
+            detail = "no heartbeat (worker not running?)"
+            level = "—"
+        else:
+            level = (r["level"] or "—").upper()
+            detail = (
+                f"beat {r['age_seconds']:.1f}s ago   "
+                f"ticks {r['tick_count']}   pid {r['pid']}"
+            )
+        sentinel_tag = " [sentinel floor=FULL]" if r["is_sentinel"] else ""
+        lines.append(
+            f"{name:22s} {status:5s}  {level:8s}  {detail}{sentinel_tag}"
+        )
+    return lines
+
+
+async def _print_agents(conn: "asyncpg.Connection") -> None:
+    """``hermes substrate agents`` — full sub-agent liveness report."""
+    now = datetime.now(timezone.utc)
+    print(f"Sub-agent liveness @ {now.isoformat()}")
+    print(
+        f"(live ≤ {_AGENT_LIVE_S:.0f}s · stale ≤ {_AGENT_STALE_S:.0f}s · "
+        "worker heartbeat cadence ~10s)"
+    )
+    print()
+    rows = await _agent_liveness(conn)
+    for line in _format_agent_lines(rows):
+        print(f"  {line}")
+    print()
+    if _all_agents_down(rows):
+        print(
+            "⚠ substrate worker appears DOWN — no sub-agent has reported a "
+            "heartbeat."
+        )
+        print(
+            "  Without it: slices stay pending forever, decay never runs, "
+            "embeddings never backfill."
+        )
+        print(
+            "  Start it with `hermes substrate worker run` (or the "
+            "hermes-substrate-worker systemd unit)."
+        )
+    else:
+        print("✓ substrate worker is reporting heartbeats.")
 
 
 # ---------------------------------------------------------------------------

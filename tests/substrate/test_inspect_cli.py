@@ -95,8 +95,12 @@ async def test_print_summary_after_boot_contains_expected_sections(
     assert "pending" in out
     assert "passed" in out
     assert "Pending queue:" in out
-    assert "Sub-agents (intensity):" in out
+    # Liveness section: booted with subagents off + no worker running, so
+    # every agent reads as down and the worker-down warning fires. This is
+    # the signal that would have caught the 2026-05-26 outage.
+    assert "Sub-agents (liveness):" in out
     assert "sentinel" in out
+    assert "worker appears DOWN" in out
 
 
 @pytest.mark.asyncio
@@ -202,6 +206,113 @@ async def test_print_profiles_lists_4_seeded(booted_substrate):
     out = buf.getvalue()
     for profile in ("default-text", "default-structured", "default-binary", "default-signal"):
         assert profile in out
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent liveness — substrate_agent_heartbeat.
+# ---------------------------------------------------------------------------
+
+
+def test_register_subparser_agents():
+    """The ``substrate agents`` subcommand parses cleanly."""
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    inspect_mod.register_subparser(sub)
+    ns = parser.parse_args(["substrate", "agents"])
+    assert ns.command == "substrate"
+    assert callable(ns.func)
+
+
+async def _seed_heartbeat(conn, name, *, age_seconds, level="full", is_sentinel=False):
+    await conn.execute(
+        """
+        INSERT INTO substrate_agent_heartbeat
+            (agent_name, pid, host, level, is_sentinel,
+             tick_count, started_at, last_beat_at)
+        VALUES ($1, 4242, 'testhost', $2, $3, 99, now(),
+                now() - ($4 || ' seconds')::interval)
+        ON CONFLICT (agent_name) DO UPDATE SET
+            last_beat_at = EXCLUDED.last_beat_at, level = EXCLUDED.level
+        """,
+        name,
+        level,
+        is_sentinel,
+        str(age_seconds),
+    )
+
+
+@pytest.mark.asyncio
+async def test_print_agents_all_down_when_no_worker(booted_substrate):
+    """With no heartbeats (worker never started), every expected agent
+    reads DOWN and the worker-down warning fires."""
+    import hermes_db
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await inspect_mod._print_agents(conn)
+    out = buf.getvalue()
+    assert "Sub-agent liveness @" in out
+    for name in ("sentinel", "curator", "force-reject", "partition-maintenance"):
+        assert name in out
+    assert "no heartbeat" in out
+    assert "worker appears DOWN" in out
+
+
+@pytest.mark.asyncio
+async def test_agent_liveness_classifies_by_age(booted_substrate):
+    """Fresh beat → live, ~45s → stale, ~120s → down, missing → down."""
+    import hermes_db
+
+    async with hermes_db.connection() as conn:
+        await _seed_heartbeat(conn, "sentinel", age_seconds=1, is_sentinel=True)
+        await _seed_heartbeat(conn, "curator", age_seconds=45, level="low")
+        await _seed_heartbeat(conn, "force-reject", age_seconds=120, level="low")
+        # partition-maintenance left absent on purpose.
+        rows = await inspect_mod._agent_liveness(conn)
+
+    by_name = {r["name"]: r for r in rows}
+    assert by_name["sentinel"]["status"] == "live"
+    assert by_name["sentinel"]["is_sentinel"] is True
+    assert by_name["curator"]["status"] == "stale"
+    assert by_name["force-reject"]["status"] == "down"
+    assert by_name["partition-maintenance"]["status"] == "down"
+    assert by_name["partition-maintenance"]["age_seconds"] is None
+    # Not "all down": sentinel + curator are live/stale.
+    assert inspect_mod._all_agents_down(rows) is False
+
+
+@pytest.mark.asyncio
+async def test_print_agents_reports_live(booted_substrate):
+    """All four agents beating recently → live + the OK line, no warning."""
+    import hermes_db
+
+    async with hermes_db.connection() as conn:
+        await _seed_heartbeat(conn, "sentinel", age_seconds=2, is_sentinel=True)
+        await _seed_heartbeat(conn, "curator", age_seconds=3, level="low")
+        await _seed_heartbeat(conn, "force-reject", age_seconds=4, level="low")
+        await _seed_heartbeat(conn, "partition-maintenance", age_seconds=5)
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await inspect_mod._print_agents(conn)
+    out = buf.getvalue()
+    assert "live" in out
+    assert "reporting heartbeats" in out
+    assert "worker appears DOWN" not in out
+    # The sentinel floor annotation surfaces.
+    assert "sentinel floor=FULL" in out
+
+
+def test_classify_agent_boundaries():
+    """Pure classification helper — no DB."""
+    assert inspect_mod._classify_agent(None) == "down"
+    assert inspect_mod._classify_agent(0.0) == "live"
+    assert inspect_mod._classify_agent(inspect_mod._AGENT_LIVE_S) == "live"
+    assert inspect_mod._classify_agent(inspect_mod._AGENT_LIVE_S + 1) == "stale"
+    assert inspect_mod._classify_agent(inspect_mod._AGENT_STALE_S) == "stale"
+    assert inspect_mod._classify_agent(inspect_mod._AGENT_STALE_S + 1) == "down"
 
 
 # ---------------------------------------------------------------------------

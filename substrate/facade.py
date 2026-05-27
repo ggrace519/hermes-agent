@@ -163,6 +163,10 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 # - ``20260526_0009`` — Phase C configurable embedding dim. Reshapes the
 #   ``embedding`` column to ``vector(HERMES_EMBEDDING_DIM)``; default 1536
 #   makes this a no-op for installs that don't set the env var.
+# - ``20260527_0010`` — substrate_agent_heartbeat (sub-agent liveness
+#   telemetry). Strictly additive — one new table the run loop upserts and
+#   the inspect CLI reads. Sub-agent heartbeat writes swallow a missing
+#   table, so the substrate also boots fine against the prior head.
 _EXPECTED_REVISIONS = frozenset(
     {
         "20260523_0003",
@@ -170,6 +174,7 @@ _EXPECTED_REVISIONS = frozenset(
         "20260525_0005",
         "20260525_0006",
         "20260526_0009",
+        "20260527_0010",
     }
 )
 
