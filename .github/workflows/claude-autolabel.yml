@@ -1,0 +1,17 @@
+# .github/workflows/claude-autolabel.yml
+name: Auto-label PRs for Claude review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+permissions:
+  pull-requests: write
+jobs:
+  label:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh pr edit "$PR" --add-label claude-review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
