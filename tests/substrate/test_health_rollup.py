@@ -1,0 +1,79 @@
+"""Phase G — `hermes substrate health` operator rollup."""
+
+from __future__ import annotations
+
+import argparse
+import io
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+
+import pytest
+import pytest_asyncio
+
+from substrate import Substrate
+from substrate.cli import inspect as inspect_mod
+from substrate.l1 import store as l1
+from substrate.l4 import store as l4
+
+
+@pytest_asyncio.fixture
+async def booted(hermes_db_initialized):
+    sub = await Substrate.boot(start_subagents=False)
+    yield sub
+    await sub.shutdown()
+
+
+def test_register_subparser_health():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    inspect_mod.register_subparser(sub)
+    assert callable(parser.parse_args(["substrate", "health"]).func)
+
+
+@pytest.mark.asyncio
+async def test_health_reports_all_sections(booted):
+    import hermes_db
+
+    # Seed a bit of every layer so the counts are non-trivial.
+    await l1.upsert_entity("Greg", "person")
+    await l4.record_observation("coherence", "substrate", "coherence 0.91", score=0.91)
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await inspect_mod._print_health(conn)
+    out = buf.getvalue()
+
+    assert "Substrate health @" in out
+    assert "Worker:" in out
+    assert "Coherence: 0.91" in out
+    assert "Layers:" in out
+    assert "L0 perception" in out
+    assert "L1 knowledge" in out
+    assert "L4 self-model" in out
+
+
+@pytest.mark.asyncio
+async def test_health_worker_down_when_no_heartbeat(booted):
+    """Booted with sub-agents off + no worker → the rollup flags DOWN."""
+    import hermes_db
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await inspect_mod._print_health(conn)
+    assert "DOWN" in buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_layer_counts_present(booted):
+    import hermes_db
+
+    await l1.upsert_entity("X", "concept")
+    async with hermes_db.connection() as conn:
+        counts = await inspect_mod._layer_counts(conn)
+    assert counts["l1_entities"] >= 1
+    # All layer keys present (tables migrated this far).
+    for k in ("l0_passed", "l1_relationships", "l2_associations",
+              "l3_patterns", "l4_observations"):
+        assert k in counts
