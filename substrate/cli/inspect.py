@@ -170,6 +170,27 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "config", help="Dump RECALL_* config knobs"
     ).set_defaults(func=_cmd_inspect_recall_config)
 
+    recall_validate = recall_sub.add_parser(
+        "validate",
+        help="Run a real recall + print the composed block and a readiness verdict",
+        description="Go/no-go health probe: runs the same recall() the "
+        "foreground would, prints the composed <memory-context> block, "
+        "embedding coverage, and a READY/DEGRADED/NOT READY verdict. Useful "
+        "after a worker outage to confirm recall isn't silently degraded.",
+    )
+    recall_validate.add_argument(
+        "--query",
+        default=None,
+        help="Probe query (default: the most-recent user-message slice's text)",
+    )
+    recall_validate.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        help="Override the composer token budget for this probe",
+    )
+    recall_validate.set_defaults(func=_cmd_inspect_recall_validate)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -263,6 +284,16 @@ def _cmd_inspect_recall_config(args: argparse.Namespace) -> int:
     from substrate.recall.cli_inspect import print_config
 
     return _run_inspect(print_config)
+
+
+def _cmd_inspect_recall_validate(args: argparse.Namespace) -> int:
+    from substrate.recall.cli_inspect import validate
+
+    return _run_inspect(
+        lambda conn: validate(
+            conn, query=args.query, token_budget=args.token_budget
+        )
+    )
 
 
 def _run_inspect(action) -> int:

@@ -167,4 +167,188 @@ async def print_config(conn: "asyncpg.Connection") -> None:
     print(f"  HERMES_SUBSTRATE_RECALL (enable)      = {_cfg.HERMES_SUBSTRATE_RECALL_ENABLED}")
 
 
-__all__ = ["print_summary", "print_recent", "print_sample", "print_config"]
+# ---------------------------------------------------------------------------
+# Recall validation — the operator-facing go/no-go probe.
+#
+# Phase C's ADR deferred acceptance criteria #10/#13/#14 ("coherent memory
+# block", "embedding coverage ≥95%", ">80% semantic path") to a manual
+# smoke test before flipping the default. The default is now ON (PR #61),
+# so this command turns that one-off smoke into a repeatable health check:
+# it runs a REAL recall against the current L0 and prints the composed
+# <memory-context> block plus a readiness verdict. Especially useful after
+# a worker outage (embeddings stop backfilling → recall silently degrades
+# to keyword-only or empty blocks).
+# ---------------------------------------------------------------------------
+
+
+async def _reachable_candidates(conn: "asyncpg.Connection", window_hours: float) -> int:
+    """Count passed slices in the default recall streams within the recall
+    window — i.e. how much perception recall even has to work with."""
+    from substrate import config as _cfg
+
+    return int(
+        await conn.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM substrate_slices sl
+              JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE sl.sentinel_state = 'passed'
+               AND st.name = ANY($1::text[])
+               AND sl.event_time_world > now() - ($2 || ' hours')::interval
+            """,
+            list(_cfg.DEFAULT_RECALL_STREAMS),
+            str(window_hours),
+        )
+        or 0
+    )
+
+
+async def _derive_probe_query(conn: "asyncpg.Connection") -> str:
+    """Use the most-recent user-message slice's text as a realistic probe,
+    so the validation exercises recall against content that actually
+    exists. Falls back to a generic prompt when L0 is empty."""
+    row = await conn.fetchval(
+        """
+        SELECT sl.payload
+          FROM substrate_slices sl
+          JOIN substrate_streams st ON st.stream_id = sl.stream_id
+         WHERE st.name LIKE 'hermes.world.user_message.%'
+           AND sl.sentinel_state = 'passed'
+         ORDER BY sl.event_time_world DESC
+         LIMIT 1
+        """
+    )
+    if row is None:
+        return "recent conversation topics"
+    text = row.get("text") if isinstance(row, dict) else str(row)
+    text = (text or "").strip()
+    return (text[:200] or "recent conversation topics")
+
+
+def _validate_verdict(
+    *, enabled: str, total_slices: int, reachable: int, coverage: float, proj
+) -> tuple[str, list[str]]:
+    """Return ``(verdict, notes)``. Verdict is READY / DEGRADED / NOT READY."""
+    notes: list[str] = []
+    if enabled == "0":
+        notes.append(
+            "HERMES_SUBSTRATE_RECALL=0 — the foreground is NOT using substrate "
+            "recall; set it to 1 (the default) to enable."
+        )
+    if total_slices == 0 or reachable == 0:
+        notes.append(
+            "No perception in the recall window — recall returns empty blocks. "
+            "Check the worker is running (`hermes substrate agents`) and that "
+            "sessions are flowing into L0."
+        )
+        return ("NOT READY", notes)
+    if proj.empty_reason == "no_candidates":
+        notes.append(
+            "recall found no candidates for the probe query despite slices in "
+            "the window — widen the window or check stream filters."
+        )
+    if total_slices and coverage < 50.0:
+        notes.append(
+            f"Embedding coverage is low ({coverage:.0f}%) — recall is leaning "
+            "on keyword ranking. Confirm the worker is backfilling embeddings "
+            "(`hermes substrate curator`) and the embedding provider is reachable."
+        )
+    if proj.text:
+        notes.append(
+            f"recall composed a {proj.tokens_used}-token block from "
+            f"{len(proj.composed)} slice(s)."
+        )
+        # A block composed, but semantic ranking needs embeddings: low
+        # coverage means recall is leaning on keyword Jaccard, which is
+        # functional but lower-quality — surface that as DEGRADED.
+        verdict = "READY" if coverage >= 50.0 else "DEGRADED"
+        return (verdict, notes)
+    notes.append(f"recall returned an empty block (reason={proj.empty_reason}).")
+    return ("DEGRADED", notes)
+
+
+async def validate(
+    conn: "asyncpg.Connection",
+    *,
+    query: "str | None" = None,
+    token_budget: "int | None" = None,
+) -> None:
+    """Run a real recall and print the composed block + a readiness verdict.
+
+    Read-mostly: it performs the same ``recall()`` the foreground would,
+    which includes the normal salience reinforcement of any composed slices
+    (a small, realistic side effect). It changes no configuration.
+    """
+    import os
+
+    import hermes_db
+    from substrate import Substrate, config as _cfg
+    from substrate.recall.api import recall
+    from substrate.storage.slices import SliceRepo
+
+    now = datetime.now(timezone.utc)
+    print(f"Recall validation @ {now.isoformat()}")
+    enabled = os.environ.get("HERMES_SUBSTRATE_RECALL", "1")
+    print(
+        f"  HERMES_SUBSTRATE_RECALL = {enabled}  "
+        f"(default {'ON' if _cfg.HERMES_SUBSTRATE_RECALL_ENABLED else 'OFF'})"
+    )
+    print()
+
+    repo = SliceRepo(pool=None)
+    stats = await repo.recall_stats(conn, window=timedelta(hours=1))
+    total_slices = int(stats.get("total_slices", 0) or 0)
+    embedded = int(stats.get("embedded_slices", 0) or 0)
+    backlog = int(stats.get("unembedded_backlog", 0) or 0)
+    coverage = (100 * embedded / total_slices) if total_slices else 0.0
+    print("Embedding coverage:")
+    print(f"  total passed slices   {total_slices}")
+    print(f"  with embedding        {embedded} ({coverage:.1f}%)")
+    print(f"  unembedded backlog    {backlog}")
+    print()
+
+    window_h = _cfg.RECALL_TIME_WINDOW_HOURS
+    reachable = await _reachable_candidates(conn, window_h)
+    print(f"Candidate slices in recall window (last {window_h}h): {reachable}")
+    print()
+
+    if not query:
+        query = await _derive_probe_query(conn)
+    print(f"Probe query: {query!r}")
+
+    sub = Substrate.from_pool(hermes_db.pool())
+    proj = await recall(
+        sub, query, session_id="recall-validate", token_budget=token_budget
+    )
+    print(f"  candidates_seen = {proj.candidates_seen}")
+    print(f"  composed slices = {len(proj.composed)}")
+    print(f"  tokens_used     = {proj.tokens_used}")
+    print(f"  timed_out       = {proj.timed_out}")
+    if proj.empty_reason:
+        print(f"  empty_reason    = {proj.empty_reason}")
+    print()
+    print("Composed <memory-context> block:")
+    print("-" * 64)
+    print(proj.text if proj.text else "(empty)")
+    print("-" * 64)
+    print()
+
+    verdict, notes = _validate_verdict(
+        enabled=enabled,
+        total_slices=total_slices,
+        reachable=reachable,
+        coverage=coverage,
+        proj=proj,
+    )
+    print(f"Verdict: {verdict}")
+    for note in notes:
+        print(f"  - {note}")
+
+
+__all__ = [
+    "print_summary",
+    "print_recent",
+    "print_sample",
+    "print_config",
+    "validate",
+]
