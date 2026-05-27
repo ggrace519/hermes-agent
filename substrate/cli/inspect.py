@@ -191,6 +191,32 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     )
     recall_validate.set_defaults(func=_cmd_inspect_recall_validate)
 
+    # ── Phase D: L1 + Parser subtrees ─────────────────────────────────
+    l1_p = substrate_sub.add_parser(
+        "l1", help="Inspect L1 (entities + relationships)"
+    )
+    l1_sub = l1_p.add_subparsers(dest="l1_subcommand")
+    l1_p.set_defaults(func=_cmd_inspect_l1_entities)
+    l1_ents = l1_sub.add_parser("entities", help="List L1 entities (default)")
+    l1_ents.add_argument("--type", default=None, help="Filter by entity_type")
+    l1_ents.add_argument("--limit", type=int, default=20)
+    l1_ents.set_defaults(func=_cmd_inspect_l1_entities)
+    l1_rels = l1_sub.add_parser("relationships", help="List L1 relationships")
+    l1_rels.add_argument("--limit", type=int, default=20)
+    l1_rels.set_defaults(func=_cmd_inspect_l1_relationships)
+
+    parser_p = substrate_sub.add_parser(
+        "parser", help="Inspect Parser activity (substrate_parser_log)"
+    )
+    parser_sub = parser_p.add_subparsers(dest="parser_subcommand")
+    parser_p.set_defaults(func=_cmd_inspect_parser_summary)
+    parser_sub.add_parser("summary", help="Parser summary (default)").set_defaults(
+        func=_cmd_inspect_parser_summary
+    )
+    parser_recent = parser_sub.add_parser("recent", help="Recent parser_log rows")
+    parser_recent.add_argument("--limit", type=int, default=20)
+    parser_recent.set_defaults(func=_cmd_inspect_parser_recent)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -294,6 +320,26 @@ def _cmd_inspect_recall_validate(args: argparse.Namespace) -> int:
             conn, query=args.query, token_budget=args.token_budget
         )
     )
+
+
+def _cmd_inspect_l1_entities(args: argparse.Namespace) -> int:
+    kind = getattr(args, "type", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l1_entities(conn, kind=kind, limit=limit))
+
+
+def _cmd_inspect_l1_relationships(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l1_relationships(conn, limit=limit))
+
+
+def _cmd_inspect_parser_summary(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_parser_summary)
+
+
+def _cmd_inspect_parser_recent(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_parser_recent(conn, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -732,6 +778,128 @@ async def _print_boot_status(conn: "asyncpg.Connection") -> None:
     if failed:
         print()
         print(f"⚠ last boot FAILED for: {', '.join(failed)} — see process logs.")
+
+
+# ---------------------------------------------------------------------------
+# Phase D: L1 + Parser printers.
+# ---------------------------------------------------------------------------
+
+
+async def _print_l1_entities(conn, *, kind=None, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT e.name, e.entity_type, e.summary, e.salience_score,
+               e.last_seen_at,
+               (SELECT COUNT(*) FROM l1_relationships r
+                 WHERE r.subject_id = e.id OR r.object_id = e.id) AS rels,
+               (SELECT COUNT(*) FROM l1_citations c WHERE c.entity_id = e.id) AS cites
+          FROM l1_entities e
+         WHERE ($1::text IS NULL OR e.entity_type = $1)
+         ORDER BY e.salience_score DESC, e.last_seen_at DESC
+         LIMIT $2
+        """,
+        kind,
+        limit,
+    )
+    if not rows:
+        print("(no L1 entities — is the Parser running with HERMES_SUBSTRATE_PARSER=1?)")
+        return
+    print(f"{'name':32s}  {'type':10s}  {'sal':>5s}  {'rels':>4s}  {'cites':>5s}  summary")
+    print("-" * 100)
+    for r in rows:
+        summary = (r["summary"] or "")[:40]
+        print(
+            f"{r['name'][:32]:32s}  {r['entity_type']:10s}  "
+            f"{r['salience_score']:>5.2f}  {r['rels']:>4d}  {r['cites']:>5d}  {summary}"
+        )
+
+
+async def _print_l1_relationships(conn, *, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT s.name AS subj, r.predicate, o.name AS obj, r.confidence, r.last_seen_at
+          FROM l1_relationships r
+          JOIN l1_entities s ON s.id = r.subject_id
+          JOIN l1_entities o ON o.id = r.object_id
+         ORDER BY r.last_seen_at DESC
+         LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        print("(no L1 relationships)")
+        return
+    for r in rows:
+        print(f"  {r['subj']} --{r['predicate']}--> {r['obj']}  (conf {r['confidence']:.2f})")
+
+
+async def _print_parser_summary(conn) -> None:
+    now = datetime.now(timezone.utc)
+    print(f"Parser state @ {now.isoformat()}")
+    print()
+    row = await conn.fetchrow(
+        """
+        SELECT COUNT(*)::int AS calls,
+               COALESCE(SUM(entities_emitted),0)::int AS ents,
+               COALESCE(SUM(relationships_emitted),0)::int AS rels,
+               COALESCE(SUM(slices_consolidated),0)::int AS consolidated,
+               COALESCE(AVG(latency_ms),0)::int AS avg_ms
+          FROM substrate_parser_log
+         WHERE t_call > now() - interval '24 hours'
+        """
+    )
+    print("Last 24h:")
+    print(f"  calls                {row['calls']}")
+    print(f"  entities emitted     {row['ents']}")
+    print(f"  relationships emitted {row['rels']}")
+    print(f"  slices consolidated  {row['consolidated']}")
+    print(f"  avg latency          {row['avg_ms']} ms")
+    print()
+    outcomes = await conn.fetch(
+        """
+        SELECT outcome, COUNT(*)::int AS n FROM substrate_parser_log
+         WHERE t_call > now() - interval '24 hours' GROUP BY outcome ORDER BY n DESC
+        """
+    )
+    print("Outcomes (24h):")
+    if not outcomes:
+        print("  (no parser activity — HERMES_SUBSTRATE_PARSER off, or worker down?)")
+    for o in outcomes:
+        print(f"  {o['outcome']:12s} {o['n']}")
+    totals = await conn.fetchrow(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE consolidation_state='consolidated')::int AS consolidated,
+            COUNT(*) FILTER (WHERE consolidation_state='unconsolidated' AND sentinel_state='passed')::int AS pending
+          FROM substrate_slices
+        """
+    )
+    print()
+    print("L0 consolidation:")
+    print(f"  consolidated slices  {totals['consolidated']}")
+    print(f"  awaiting parse       {totals['pending']}")
+
+
+async def _print_parser_recent(conn, *, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT t_call, session_id, batch_size, entities_emitted,
+               relationships_emitted, slices_consolidated, latency_ms, outcome, error
+          FROM substrate_parser_log ORDER BY t_call DESC LIMIT $1
+        """,
+        limit,
+    )
+    if not rows:
+        print("(no parser_log rows yet)")
+        return
+    for r in rows:
+        ts = r["t_call"].isoformat() if r["t_call"] else "-"
+        extra = f" err={r['error']}" if r["error"] else ""
+        print(
+            f"  [{ts}] {r['outcome']:11s} batch={r['batch_size']} "
+            f"ents={r['entities_emitted']} rels={r['relationships_emitted']} "
+            f"consol={r['slices_consolidated']} {r['latency_ms']}ms{extra}"
+        )
 
 
 # ---------------------------------------------------------------------------

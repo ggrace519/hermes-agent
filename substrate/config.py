@@ -89,6 +89,13 @@ RECALL_TIMEOUT_MS = _envint("HERMES_RECALL_TIMEOUT_MS", default=300)
 RECALL_MIN_SALIENCE = _envfloat("HERMES_RECALL_MIN_SALIENCE", default=0.05)
 RECALL_CANDIDATE_LIMIT = _envint("HERMES_RECALL_CANDIDATE_LIMIT", default=50)
 
+# Phase D: L1 entity header in the recall projection (spec §7). When on,
+# the projection prepends a "## Known entities" block (top entities by
+# query-relevance + salience) ahead of the L0 quotes. Independent of
+# HERMES_SUBSTRATE_RECALL — the header only manifests when recall is also on.
+RECALL_INCLUDE_L1 = _envbool("RECALL_INCLUDE_L1", default=True)
+RECALL_L1_LIMIT = _envint("RECALL_L1_LIMIT", default=5)
+
 # Composite-score weights (must keep sum of three active terms in a
 # reasonable range; spec defaults sum to 1.0 for the active path).
 RECALL_SIMILARITY_WEIGHT = _envfloat("HERMES_RECALL_SIMILARITY_WEIGHT", default=0.3)
@@ -177,6 +184,8 @@ __all__ = [
     "RECALL_TIMEOUT_MS",
     "RECALL_MIN_SALIENCE",
     "RECALL_CANDIDATE_LIMIT",
+    "RECALL_INCLUDE_L1",
+    "RECALL_L1_LIMIT",
     "RECALL_SIMILARITY_WEIGHT",
     "RECALL_KEYWORD_WEIGHT",
     "RECALL_SALIENCE_WEIGHT",
