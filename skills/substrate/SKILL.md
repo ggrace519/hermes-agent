@@ -414,6 +414,23 @@ Start here when asking "is the substrate healthy?":
 - **`hermes substrate l3 patterns`** — L3 generalizations (Pattern-finder).
 - **`hermes substrate l4 observations`** — L4 self-model + coherence (Critic).
 
+**Curation** (let users shape what the substrate keeps):
+
+- **`hermes substrate pin <slice_id>`** / **`unpin`** — pin a memory so the
+  Curator never decays or releases it (the "never forget this" override);
+  pinning also lifts its salience so it surfaces in recall.
+- **`hermes substrate forget <slice_id>`** — drop a memory's salience to 0
+  so the Curator releases it on its next cycle.
+- **`hermes substrate l1 dupes`** — review likely-duplicate entities, then
+  **`l1 merge --from X --into Y`** to consolidate fragmented memory.
+- **`hermes substrate l1 forget <name>`** / **`l1 edit <name> --summary …`**
+  — delete or correct an entity.
+
+Recall precision is tunable via `HERMES_RECALL_MIN_RELEVANCE` /
+`_RELATIVE_FLOOR` (drop loosely-related context) + `_DEDUP_THRESHOLD`
+(near-duplicate excerpts) + `RECALL_SHOW_PROVENANCE=1` (inline "why
+injected"); see `hermes substrate recall config` / `recall validate`.
+
 The cognitive sub-agents are **ON by default** — set the env var to `0` to
 disable a given one. Each still registers + heartbeats regardless; the gate
 only controls whether its tick does work. LLM-driven agents no-op silently

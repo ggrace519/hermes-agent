@@ -191,6 +191,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0016",
         # - ``20260527_0017`` — Phase F learned Conductor (substrate_conductor_log).
         "20260527_0017",
+        # - ``20260527_0018`` — slice pinning (decay-immune memories).
+        "20260527_0018",
     }
 )
 

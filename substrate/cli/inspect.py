@@ -63,6 +63,21 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "streams", help="List streams + per-stream slice counts"
     ).set_defaults(func=_cmd_inspect_streams)
 
+    # ── Memory curation: pin / unpin / forget a slice (decay control) ──
+    pin_p = substrate_sub.add_parser(
+        "pin", help="Pin a slice (exempt from decay + release — 'never forget')"
+    )
+    pin_p.add_argument("slice_id")
+    pin_p.set_defaults(func=_cmd_inspect_pin)
+    unpin_p = substrate_sub.add_parser("unpin", help="Unpin a slice (resume normal decay)")
+    unpin_p.add_argument("slice_id")
+    unpin_p.set_defaults(func=_cmd_inspect_unpin)
+    forget_p = substrate_sub.add_parser(
+        "forget", help="Forget a slice (drop salience to 0 → Curator releases it)"
+    )
+    forget_p.add_argument("slice_id")
+    forget_p.set_defaults(func=_cmd_inspect_forget)
+
     slices_p = substrate_sub.add_parser(
         "slices", help="List the most-recent N slices on a given stream"
     )
@@ -330,6 +345,18 @@ def _cmd_inspect_agents(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_health(args: argparse.Namespace) -> int:
     return _run_inspect(_print_health)
+
+
+def _cmd_inspect_pin(args: argparse.Namespace) -> int:
+    return _run_inspect(lambda conn: _do_pin(conn, args.slice_id, True))
+
+
+def _cmd_inspect_unpin(args: argparse.Namespace) -> int:
+    return _run_inspect(lambda conn: _do_pin(conn, args.slice_id, False))
+
+
+def _cmd_inspect_forget(args: argparse.Namespace) -> int:
+    return _run_inspect(lambda conn: _do_forget_slice(conn, args.slice_id))
 
 
 def _cmd_inspect_boot(args: argparse.Namespace) -> int:
@@ -843,6 +870,40 @@ async def _layer_counts(conn: "asyncpg.Connection") -> dict:
         "l3_patterns": await _scalar("SELECT COUNT(*) FROM l3_patterns"),
         "l4_observations": await _scalar("SELECT COUNT(*) FROM l4_observations"),
     }
+
+
+async def _parse_uuid(raw: str):
+    from uuid import UUID
+
+    try:
+        return UUID(raw)
+    except (ValueError, TypeError):
+        print(f"not a valid slice id: {raw!r}")
+        return None
+
+
+async def _do_pin(conn, raw_id: str, pinned: bool) -> None:
+    from substrate.l0.api import set_slice_pinned
+
+    sid = await _parse_uuid(raw_id)
+    if sid is None:
+        return
+    ok = await set_slice_pinned(sid, pinned, conn=conn)
+    verb = "pinned" if pinned else "unpinned"
+    print(f"{verb} slice {raw_id}" if ok else f"no slice {raw_id} (or no change)")
+
+
+async def _do_forget_slice(conn, raw_id: str) -> None:
+    from substrate.l0.api import forget_slice
+
+    sid = await _parse_uuid(raw_id)
+    if sid is None:
+        return
+    ok = await forget_slice(sid, conn=conn)
+    print(
+        f"forgot slice {raw_id} (salience→0; Curator releases it next cycle)"
+        if ok else f"no slice {raw_id} (or already released)"
+    )
 
 
 async def _print_health(conn: "asyncpg.Connection") -> None:
