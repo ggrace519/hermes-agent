@@ -614,6 +614,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("pattern-finder", False),  # Phase E2 — same staged-rollout shape
     ("critic", False),  # Phase F — same staged-rollout shape
     ("conductor", False),  # Phase F — adaptive policy loop (gated)
+    ("reflector", False),  # Phase F — L3/L4 synthesis (gated)
 )
 
 
