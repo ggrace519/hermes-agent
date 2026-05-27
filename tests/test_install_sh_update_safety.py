@@ -209,6 +209,34 @@ def test_substrate_worker_update_path_restarts_if_active() -> None:
     )
 
 
+def test_pg_port_detection_handles_dual_stack_bindings() -> None:
+    """Regression: docker's port-mapping inspect format emits ONE entry
+    per host binding. A container with both IPv4 (0.0.0.0:5433) and
+    IPv6 ([::]:5433) bindings of the same container port produces two
+    ``HostPort`` entries. A naive ``{{range $conf}}{{.HostPort}}{{end}}``
+    concatenates them into ``"54335433"``, which install.sh then tries
+    to bind as a host port (and fails). Inject whitespace + take the
+    first field so single-port and dual-stack containers both yield a
+    valid port number.
+
+    Hit on 2026-05-26 when re-running install.sh against an existing
+    install: ``54335433`` was passed as POSTGRES_PORT and docker
+    compose refused with ``invalid hostPort: 54335433``."""
+    body = _extract_function_body("choose_pg_port")
+    assert "{{.HostPort}} {{end}}" in body, (
+        "PG container port-inspect template must separate multiple "
+        "HostPort values with whitespace; without the space, IPv4+IPv6 "
+        "dual-stack containers produce concatenated bogus ports like "
+        "54335433."
+    )
+    assert "awk '{print $1}'" in body, (
+        "After space-separating HostPort values, the result must be "
+        "narrowed to a single field with ``awk '{print $1}'`` (or "
+        "equivalent), otherwise the trailing space makes "
+        "downstream PG_PORT_DEFAULT comparisons spurious."
+    )
+
+
 def test_substrate_worker_skips_cleanly_without_systemd() -> None:
     """Termux / non-Linux / no-systemctl environments must not error
     out — install.sh should print manual steps and continue."""

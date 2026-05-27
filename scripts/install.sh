@@ -914,9 +914,14 @@ choose_pg_port() {
         # ``docker inspect`` works in any state. Format of the inspect
         # output: ``5432/tcp:0.0.0.0:5432`` (port mapping line).
         local existing_port
+        # Containers with both IPv4 and IPv6 bindings produce TWO
+        # ``HostPort`` entries (e.g. 0.0.0.0:5433 + [::]:5433); the inner
+        # ``{{range $conf}}`` concatenates them into "54335433" if we
+        # don't separate them. Inject whitespace between values + take
+        # the first field via awk so we always get a single port number.
         existing_port=$(docker inspect \
-            --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "5432/tcp"}}{{range $conf}}{{.HostPort}}{{end}}{{end}}{{end}}' \
-            "$existing_container" 2>/dev/null | head -1)
+            --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "5432/tcp"}}{{range $conf}}{{.HostPort}} {{end}}{{end}}{{end}}' \
+            "$existing_container" 2>/dev/null | awk '{print $1}')
 
         if [ -n "$existing_port" ]; then
             log_info "PostgreSQL upgrade: found existing container '$existing_container' on port $existing_port"
