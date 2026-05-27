@@ -255,6 +255,12 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     l4_obs.add_argument("--limit", type=int, default=20)
     l4_obs.set_defaults(func=_cmd_inspect_l4)
 
+    dreamer_p = substrate_sub.add_parser(
+        "dreamer", help="Recent Dreamer explorations (persistent log)"
+    )
+    dreamer_p.add_argument("--limit", type=int, default=10)
+    dreamer_p.set_defaults(func=_cmd_inspect_dreamer)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -400,6 +406,11 @@ def _cmd_inspect_l4(args: argparse.Namespace) -> int:
     subject = getattr(args, "subject", None)
     limit = getattr(args, "limit", 20)
     return _run_inspect(lambda conn: _print_l4(conn, subject=subject, limit=limit))
+
+
+def _cmd_inspect_dreamer(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 10)
+    return _run_inspect(lambda conn: _print_dreamer(conn, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -615,6 +626,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("critic", False),  # Phase F — same staged-rollout shape
     ("conductor", False),  # Phase F — adaptive policy loop (gated)
     ("reflector", False),  # Phase F — L3/L4 synthesis (gated)
+    ("dreamer", False),  # Phase F — counterfactual exploration (gated)
 )
 
 
@@ -1121,6 +1133,26 @@ async def _print_l3_patterns(conn, *, kind=None, limit=20) -> None:
             f"  [{r['kind']:18s}] sal={r['salience_score']:.2f} "
             f"conf={r['confidence']:.2f} cites={r['n_cites']}  {r['statement']}"
         )
+
+
+async def _print_dreamer(conn, *, limit=10) -> None:
+    try:
+        rows = await conn.fetch(
+            "SELECT seed, exploration, created_at FROM substrate_dreamer_log "
+            "ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
+    except Exception:
+        print("(no dreamer log — is the Dreamer running with "
+              "HERMES_SUBSTRATE_DREAMER=1?)")
+        return
+    if not rows:
+        print("(no dreamer explorations yet)")
+        return
+    for r in rows:
+        ts = r["created_at"].isoformat() if r["created_at"] else "-"
+        print(f"  [{ts}] seed: {r['seed'][:70]}")
+        print(f"      {r['exploration'][:200]}")
 
 
 async def _print_l4(conn, *, subject=None, limit=20) -> None:

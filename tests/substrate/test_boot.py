@@ -131,6 +131,7 @@ async def test_subagents_running(booted_with_subagents):
         "critic",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_CRITIC=1)
         "conductor",  # Phase F adaptive policy (tick no-ops unless HERMES_SUBSTRATE_CONDUCTOR=1)
         "reflector",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_REFLECTOR=1)
+        "dreamer",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_DREAMER=1)
     }
     for name, agent in agents.items():
         task = agent.task

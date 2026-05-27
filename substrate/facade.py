@@ -187,6 +187,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0014",
         # - ``20260527_0015`` — Phase F L4 (l4_observations).
         "20260527_0015",
+        # - ``20260527_0016`` — Phase F Dreamer (substrate_dreamer_log).
+        "20260527_0016",
     }
 )
 
@@ -556,6 +558,7 @@ class Substrate:
         from substrate.agents.conductor_policy import AdaptiveConductor
         from substrate.agents.critic import Critic
         from substrate.agents.curator import Curator
+        from substrate.agents.dreamer import Dreamer
         from substrate.agents.force_reject import ForceRejectWorker
         from substrate.agents.parser import Parser
         from substrate.agents.pattern_finder import PatternFinder
@@ -575,13 +578,14 @@ class Substrate:
         pattern_finder = PatternFinder(self)  # Phase E2 — gated HERMES_SUBSTRATE_PATTERNFINDER
         critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
         reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
+        dreamer = Dreamer(self)          # Phase F  — gated HERMES_SUBSTRATE_DREAMER
         # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
         # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
         conductor_policy = AdaptiveConductor(self)
         sentinel = StubSentinel(self)
         for agent in (
             partition, force_reject, curator, parser, associator,
-            pattern_finder, critic, reflector, conductor_policy, sentinel,
+            pattern_finder, critic, reflector, dreamer, conductor_policy, sentinel,
         ):
             agent.start()
             self._subagents[agent.name] = agent
