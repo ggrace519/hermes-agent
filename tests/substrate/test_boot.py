@@ -117,14 +117,15 @@ async def test_streams_autoregister_idempotent(booted_no_subagents):
 
 @pytest.mark.asyncio
 async def test_subagents_running(booted_with_subagents):
-    """Sentinel + force-reject + partition-maintenance tasks exist and
-    are running after boot."""
+    """Sentinel + force-reject + partition-maintenance + curator + parser
+    tasks exist and are running after boot."""
     agents = booted_with_subagents.subagents
     assert set(agents.keys()) == {
         "sentinel",
         "force-reject",
         "partition-maintenance",
         "curator",  # Phase B
+        "parser",   # Phase D (tick no-ops unless HERMES_SUBSTRATE_PARSER=1)
     }
     for name, agent in agents.items():
         task = agent.task

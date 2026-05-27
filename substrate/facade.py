@@ -538,6 +538,8 @@ class Substrate:
           * partition-maintenance first — touches storage DDL, cheap.
           * force-reject second — protects the pending queue.
           * curator third — real decay/release loop (Phase B).
+          * parser fourth — L0→L1 consolidation (Phase D); no-op tick
+            unless HERMES_SUBSTRATE_PARSER=1, so registering it is free.
           * sentinel last — the highest-frequency tick.
         Conductor is instantiated but doesn't tick (still a stub —
         Phase B adds the push-on-set_intensity hook so live agents
@@ -546,6 +548,7 @@ class Substrate:
         from substrate.agents.conductor import StubConductor
         from substrate.agents.curator import Curator
         from substrate.agents.force_reject import ForceRejectWorker
+        from substrate.agents.parser import Parser
         from substrate.agents.partition_maintenance import (
             PartitionMaintenanceWorker,
         )
@@ -556,8 +559,9 @@ class Substrate:
         partition = PartitionMaintenanceWorker(self)
         force_reject = ForceRejectWorker(self)
         curator = Curator(self)
+        parser = Parser(self)
         sentinel = StubSentinel(self)
-        for agent in (partition, force_reject, curator, sentinel):
+        for agent in (partition, force_reject, curator, parser, sentinel):
             agent.start()
             self._subagents[agent.name] = agent
 

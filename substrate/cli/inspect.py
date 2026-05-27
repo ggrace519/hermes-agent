@@ -503,6 +503,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("curator", False),
     ("force-reject", False),
     ("partition-maintenance", False),
+    ("parser", False),  # Phase D — heartbeats even when its tick is env-gated off
 )
 
 
