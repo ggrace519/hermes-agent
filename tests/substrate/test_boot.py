@@ -126,6 +126,7 @@ async def test_subagents_running(booted_with_subagents):
         "partition-maintenance",
         "curator",  # Phase B
         "parser",   # Phase D (tick no-ops unless HERMES_SUBSTRATE_PARSER=1)
+        "associator",  # Phase E1 (tick no-ops unless HERMES_SUBSTRATE_ASSOCIATOR=1)
     }
     for name, agent in agents.items():
         task = agent.task
