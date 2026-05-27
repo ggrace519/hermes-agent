@@ -188,6 +188,7 @@ class Curator(SubAgent):
                  WHERE sl.stream_id           = st.stream_id
                    AND sl.sentinel_state      = 'passed'
                    AND sl.consolidation_state <> 'released'
+                   AND NOT sl.pinned
                    AND now() - sl.salience_updated_at > interval '1 second'
                 """
             )

@@ -298,9 +298,62 @@ def reinforce_slice_sync(
     )
 
 
+async def set_slice_pinned(
+    slice_id: UUID, pinned: bool, *, conn: "Optional[asyncpg.Connection]" = None
+) -> bool:
+    """Pin / unpin a slice. A pinned slice is exempt from Curator decay +
+    release (the "never forget this" control). Pinning also lifts salience
+    to 1.0 so the slice surfaces in recall and won't be sitting near the
+    release threshold if later unpinned. Returns True if a row changed."""
+    import hermes_db
+
+    sql = (
+        "UPDATE substrate_slices "
+        "   SET pinned = $2, "
+        "       salience_score = CASE WHEN $2 THEN 1.0 ELSE salience_score END, "
+        "       salience_updated_at = now() "
+        " WHERE slice_id = $1"
+    )
+
+    async def _go(c):
+        tag = await c.execute(sql, slice_id, pinned)
+        return tag.split()[-1] != "0"
+
+    if conn is not None:
+        return await _go(conn)
+    async with hermes_db.connection() as own:
+        return await _go(own)
+
+
+async def forget_slice(
+    slice_id: UUID, *, conn: "Optional[asyncpg.Connection]" = None
+) -> bool:
+    """Forget a slice: drop its salience to 0 and unpin it, so the
+    Curator releases it (per its decay-profile tombstone policy) on its
+    next cycle. Returns True if a row changed."""
+    import hermes_db
+
+    sql = (
+        "UPDATE substrate_slices "
+        "   SET salience_score = 0, pinned = FALSE, salience_updated_at = now() "
+        " WHERE slice_id = $1 AND consolidation_state <> 'released'"
+    )
+
+    async def _go(c):
+        tag = await c.execute(sql, slice_id)
+        return tag.split()[-1] != "0"
+
+    if conn is not None:
+        return await _go(conn)
+    async with hermes_db.connection() as own:
+        return await _go(own)
+
+
 __all__ = [
     "commit_slice",
     "commit_slice_sync",
     "reinforce_slice",
     "reinforce_slice_sync",
+    "set_slice_pinned",
+    "forget_slice",
 ]

@@ -391,6 +391,7 @@ class SliceRepo:
               JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
              WHERE sl.sentinel_state      = 'passed'
                AND sl.consolidation_state <> 'released'
+               AND NOT sl.pinned
                AND sl.salience_score      < dp.min_salience_to_retain
                AND (NOT dp.release_after_consolidation
                     OR sl.consolidation_state = 'consolidated')
