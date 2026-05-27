@@ -83,3 +83,44 @@ async def test_conductor_intensity_off_is_noop(booted, monkeypatch):
     c.set_intensity(Level.OFF)
     await c.tick()
     assert booted.conductor.snapshot() == {}
+
+
+def test_trend_bias_escalates_sooner():
+    """A rising-backlog trend pushes the effective backlog over the HIGH
+    threshold even when raw backlog is just below it."""
+    # Raw 0.45 is below default HIGH (0.5) → MODERATE without bias.
+    assert AdaptiveConductor._compute_targets({"backlog_ratio": 0.45})["parser"] is Level.MODERATE
+    # +0.1 trend bias → effective 0.55 ≥ HIGH → escalate to HIGH.
+    biased = AdaptiveConductor._compute_targets({"backlog_ratio": 0.45, "trend_bias": 0.1})
+    assert biased["parser"] is Level.HIGH
+
+
+@pytest.mark.asyncio
+async def test_conductor_forecasts_and_logs(booted, monkeypatch):
+    import hermes_db
+
+    monkeypatch.setenv("HERMES_SUBSTRATE_CONDUCTOR", "1")
+    await _seed_pending(booted, 8)
+    c = AdaptiveConductor(booted)
+    await c.tick()
+
+    # Forecast (EMA) is now populated and a decision was logged.
+    assert c.forecast() is not None
+    async with hermes_db.connection() as conn:
+        n = await conn.fetchval("SELECT COUNT(*) FROM substrate_conductor_log")
+    assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_conductor_seeds_forecast_from_log(booted, monkeypatch):
+    import hermes_db
+
+    monkeypatch.setenv("HERMES_SUBSTRATE_CONDUCTOR", "1")
+    # Pre-seed a prior forecast in the persistent log.
+    async with hermes_db.connection() as conn:
+        await conn.execute(
+            "INSERT INTO substrate_conductor_log (backlog_ratio, forecast) VALUES (0.7, 0.65)"
+        )
+    c = AdaptiveConductor(booted)
+    await c._seed_forecast()
+    assert c.forecast() == pytest.approx(0.65)  # resumed the learned rhythm
