@@ -167,6 +167,10 @@ def _autoregister_specs() -> list[tuple[str, Family, Modality, str, str, "object
 #   telemetry). Strictly additive — one new table the run loop upserts and
 #   the inspect CLI reads. Sub-agent heartbeat writes swallow a missing
 #   table, so the substrate also boots fine against the prior head.
+# - ``20260527_0011`` — Phase D L1 (l1_entities/relationships/citations).
+#   Strictly additive — new tables; only the Parser + L1 store touch them.
+# - ``20260527_0012`` — Phase D parser audit (substrate_parser_log).
+#   Strictly additive — Parser observability, parallel to substrate_recall_log.
 _EXPECTED_REVISIONS = frozenset(
     {
         "20260523_0003",
@@ -175,6 +179,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260525_0006",
         "20260526_0009",
         "20260527_0010",
+        "20260527_0011",
+        "20260527_0012",
     }
 )
 
