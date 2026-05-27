@@ -89,7 +89,7 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     # ── Phase B: curator subtree ──────────────────────────────────────
     curator_p = substrate_sub.add_parser(
         "curator",
-        help="Inspect Curator state (Phase B)",
+        help="Inspect Curator state",
         description="Show Curator decay/release activity. Without a sub "
         "subcommand, prints the default summary.",
     )
@@ -120,7 +120,7 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     # ── Phase C: recall subtree ───────────────────────────────────────
     recall_p = substrate_sub.add_parser(
         "recall",
-        help="Inspect recall pipeline state (Phase C)",
+        help="Inspect recall pipeline state",
         description="Show recent recall calls + embedding coverage + config.",
     )
     recall_sub = recall_p.add_subparsers(dest="recall_subcommand")
@@ -313,12 +313,11 @@ async def _print_summary(conn: "asyncpg.Connection") -> None:
     print("Sub-agents (intensity):")
     # Sub-agent state lives in-process; the CLI doesn't have a handle to
     # the booted Substrate. Print the static expected list — operators
-    # wanting live intensity should run `hermes substrate`
-    # against a Hermes process via an admin surface (Phase B+).
-    print("   sentinel        FULL    (Phase A stub — see process logs)")
-    print("   force-reject    LOW     (Phase A — see process logs)")
+    # wanting live intensity should check the Hermes process logs.
+    print("   sentinel        FULL    (see process logs)")
+    print("   force-reject    LOW     (see process logs)")
     print("   partition-maintenance FULL (24h tick)")
-    print("   conductor       —       (Phase A stub: no policy)")
+    print("   conductor       —       (no policy active)")
 
 
 async def _print_streams(conn: "asyncpg.Connection") -> None:

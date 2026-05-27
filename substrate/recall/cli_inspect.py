@@ -144,7 +144,7 @@ async def print_config(conn: "asyncpg.Connection") -> None:
     """Dump the current RECALL_* config knobs."""
     from substrate import config as _cfg
 
-    print("Phase C recall config:")
+    print("Recall config:")
     print(f"  RECALL_TOKEN_BUDGET                   = {_cfg.RECALL_TOKEN_BUDGET}")
     print(f"  RECALL_TIME_WINDOW_HOURS              = {_cfg.RECALL_TIME_WINDOW_HOURS}")
     print(f"  RECALL_TIMEOUT_MS                     = {_cfg.RECALL_TIMEOUT_MS}")
