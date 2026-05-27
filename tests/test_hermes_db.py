@@ -83,6 +83,27 @@ def test_pool_raises_before_init(monkeypatch):
         hermes_db.pool()
 
 
+@pytest.mark.asyncio
+async def test_pool_refuses_lazy_bootstrap_inside_running_loop(monkeypatch):
+    """From inside a running event loop, ``pool()`` must NOT lazy-bind a new
+    pool to the persistent sync loop (the cross-loop footgun). It raises a
+    clear, actionable error instead so an own-loop entry point that forgot
+    to ``await init()`` gets a useful message, not a baffling
+    ``got Future ... attached to a different loop`` later.
+    """
+    saved_pool = hermes_db._pool
+    hermes_db._pool = None
+    # A DSN is present (so the old code would have attempted lazy init);
+    # the guard fires before any connection is opened, so the bogus host
+    # is never contacted.
+    monkeypatch.setenv("HERMES_PG_DSN", "postgresql://u:p@localhost:5432/db")
+    try:
+        with pytest.raises(RuntimeError, match="running event loop"):
+            hermes_db.pool()
+    finally:
+        hermes_db._pool = saved_pool
+
+
 def test_ensure_pool_sync_returns_false_when_no_dsn(monkeypatch):
     """When no DSN is configured, ``ensure_pool_sync`` is a no-op that
     returns False — sync entry points use this to gracefully degrade.

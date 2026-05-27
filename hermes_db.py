@@ -233,20 +233,48 @@ def reset_pool_for_new_loop() -> None:
 
 
 def pool() -> asyncpg.Pool:
+    if _pool is not None:
+        return _pool
+
+    # Lazy bootstrap: if a DSN is in the environment but init() was never
+    # called, initialise the pool on first use. This lets CLI subcommands
+    # that don't touch the DB (e.g. ``hermes --help``, ``hermes version``)
+    # run in environments without a live PG instance, while DB-touching
+    # subcommands still get a working pool without an explicit init step
+    # at the entry point.
+    dsn = os.environ.get("HERMES_PG_DSN")
+    if not dsn:
+        raise RuntimeError("hermes_db.init() not called")
+
+    # Lazy bootstrap is ONLY safe from a pure-sync context (no running event
+    # loop on this thread). asyncpg pools are loop-bound: binding a fresh
+    # pool to the persistent ``_sync_loop`` here while the caller is awaiting
+    # on a *different* loop (an own-loop entry point like ``hermes substrate
+    # worker run``, the gateway's main loop, a pytest-asyncio test) makes the
+    # caller's next ``acquire()`` raise ``got Future ... attached to a
+    # different loop`` — and ``_sync_loop.run_until_complete`` from inside a
+    # running loop raises ``Cannot run the event loop while another loop is
+    # running`` outright. Either way, a confusing crash. Convert it into a
+    # clear, actionable error: async callers must ``await
+    # hermes_db.init(dsn)`` on their own loop first (own-loop entry points
+    # also call ``reset_pool_for_new_loop()`` to drop any inherited pool).
+    try:
+        asyncio.get_running_loop()
+        inside_running_loop = True
+    except RuntimeError:
+        inside_running_loop = False
+    if inside_running_loop:
+        raise RuntimeError(
+            "hermes_db.pool() accessed before init() from inside a running "
+            "event loop. asyncpg pools are loop-bound — call `await "
+            "hermes_db.init(dsn)` on this loop first. Own-loop entry points "
+            "should also call hermes_db.reset_pool_for_new_loop() to drop "
+            "any pool inherited from the sync bridge."
+        )
+
+    # Pure-sync context: safe to drive the init on the persistent sync loop.
+    _get_sync_loop().run_until_complete(init(dsn))
     if _pool is None:
-        # Lazy bootstrap: if a DSN is in the environment but init() was never
-        # called, initialise the pool on first use. This lets CLI subcommands
-        # that don't touch the DB (e.g. ``hermes --help``, ``hermes version``)
-        # run in environments without a live PG instance, while DB-touching
-        # subcommands still get a working pool without an explicit init step
-        # at the entry point.
-        dsn = os.environ.get("HERMES_PG_DSN")
-        if dsn:
-            loop = _get_sync_loop()
-            if not loop.is_running():
-                loop.run_until_complete(init(dsn))
-                if _pool is not None:
-                    return _pool
         raise RuntimeError("hermes_db.init() not called")
     return _pool
 
