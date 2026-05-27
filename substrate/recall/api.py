@@ -33,6 +33,7 @@ from substrate.recall.projection import (
     RecallCandidate,
     RecallProjection,
     rank_candidates,
+    rank_candidates_scored,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -249,8 +250,8 @@ async def recall(
         _log.debug("query embedding failed: %s", exc)
         query_embedding = None
 
-    # 3. Rank.
-    ranked = rank_candidates(
+    # 3. Rank (scored, so we can apply a relevance floor + record why).
+    scored = rank_candidates_scored(
         candidates,
         query,
         query_embedding,
@@ -261,6 +262,21 @@ async def recall(
         recency_weight=_cfg.RECALL_RECENCY_WEIGHT,
         recency_half_life_hours=_cfg.RECALL_RECENCY_HALF_LIFE_HOURS,
     )
+
+    # 3a. Relevance floor — precision over volume. Keep only candidates
+    # clearing BOTH an absolute floor (drop near-zero) and a relative
+    # floor (fraction of the top score — adapts to the semantic/keyword
+    # score regime; the strongest hit always survives). This is what
+    # stops the substrate dumping loosely-related context.
+    if scored:
+        top = scored[0].score
+        rel_floor = _cfg.RECALL_RELATIVE_FLOOR * top
+        floor = max(_cfg.RECALL_MIN_RELEVANCE, rel_floor)
+        kept = [sc for sc in scored if sc.score >= floor] or scored[:1]
+    else:
+        kept = []
+    ranked = [sc.candidate for sc in kept]
+    provenance = {sc.candidate.slice_id: f"{sc.score:.2f} {sc.path}" for sc in kept}
 
     # 3b. Phase D: fetch a bounded L1 entity header (best-effort — a
     # missing L1 layer / DB hiccup degrades to no header, never an error).
@@ -276,8 +292,16 @@ async def recall(
     header_tokens = max(1, len(l1_header) // 4) if l1_header else 0
 
     # 4. Compose (L0 quotes get the budget left after the L1 header).
+    # Dedup near-duplicate excerpts; provenance recorded always, shown
+    # inline only when RECALL_SHOW_PROVENANCE (clean block by default).
     l0_budget = max(0, token_budget - header_tokens)
-    text, composed, tokens = compose_projection(ranked, token_budget=l0_budget)
+    text, composed, tokens = compose_projection(
+        ranked,
+        token_budget=l0_budget,
+        dedup_threshold=_cfg.RECALL_DEDUP_THRESHOLD,
+        provenance=provenance,
+        show_provenance=_cfg.RECALL_SHOW_PROVENANCE,
+    )
     if l1_header:
         text = l1_header + ("\n\n" + text if text else "")
         tokens += header_tokens
@@ -320,6 +344,13 @@ async def recall(
     extra_meta.update(
         empty_reason=empty_reason,
         embedding_path=embedding_path,
+        # "Why injected" — the score + path for each composed slice, so
+        # `recall recent` / `recall validate` can explain the block even
+        # when provenance isn't shown inline.
+        provenance={
+            str(c.slice_id): provenance.get(c.slice_id) for c in composed
+        },
+        candidates_kept=len(ranked),
     )
     _safe_enqueue_log(
         substrate, t_now, session_id, query, proj, extra_meta, error_text=None,
