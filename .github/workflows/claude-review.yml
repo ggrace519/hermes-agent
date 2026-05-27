@@ -1,64 +1,40 @@
 name: Claude Review
 
-# Anthropic's Claude Code Action reviews PRs at open / synchronize. The
-# action posts a Markdown review comment summarising correctness, security,
-# performance, and style concerns, and (when applicable) emits inline
-# review comments tied to the diff.
+# Tag-mode review triggered by the `claude-review` label.
+# The label is applied automatically by claude-autolabel.yml on PR open/sync.
+# Tag mode is required because use_sticky_comment is a no-op in agent mode
+# (anthropics/claude-code-action#1108) — track_progress: true forces tag mode.
 #
-# Required repository secret:
-#   ANTHROPIC_API_KEY — an API key with access to the Claude model named in
-#   ``model:`` below. The action will silently no-op (with a warning in the
-#   workflow log) if the secret is missing, so forks without the key don't
-#   break PRs.
-#
-# Permissions: we grant ``pull-requests: write`` so the action can post the
-# review comment, ``contents: read`` so it can read the diff and adjacent
-# files, and ``issues: write`` so it can comment on the PR thread (PRs are
-# issues in the GitHub API).
+# Required repository secret: ANTHROPIC_API_KEY.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "website/**"
-      - ".github/ISSUE_TEMPLATE/**"
+    types: [labeled]
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
-  # claude-code-action requests an OIDC token to authenticate to GitHub
-  # for the inline-review-comment API. Without ``id-token: write`` the
-  # action fails immediately with "Could not fetch an OIDC token".
   id-token: write
-  # ``actions: read`` lets the action load its ``github_ci`` MCP server,
-  # which gives the model visibility into the PR's CI status (queued /
-  # running / passed / failed per check). Without this the action prints
-  # ``The github_ci MCP server requires 'actions: read' permission.
-  # Skipping CI server installation.`` and the review can't reference
-  # which checks broke.
-  actions: write
+  # actions: read lets the action load its github_ci MCP server so reviews can
+  # reference CI status. Was `write` previously — read is sufficient.
+  actions: read
 
 concurrency:
-  # Only one Claude review per PR ref at a time. A new push cancels the
-  # in-flight review so we always comment on the latest diff.
+  # One review per PR at a time. Re-labeling (or autolabel firing on a new
+  # push) cancels the in-flight review so we always comment on the latest diff.
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   review:
-    # Skip drafts so we don't pay for reviews on work-in-progress PRs.
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event.label.name == 'claude-review' && github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out PR HEAD
         uses: actions/checkout@v4
         with:
-          # Fetch enough history that the action can diff against the base.
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -66,35 +42,30 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # v1 schema: model selection goes into ``claude_args`` (passed
-          # through to the underlying ``claude`` CLI). v0's top-level
-          # ``model:`` input was removed.
           claude_args: --model claude-sonnet-4-5
-          # Post (and update on subsequent pushes) a single sticky review
-          # comment per PR. Without this, v1 runs the model and produces
-          # output but has nowhere to publish it — log shows "No buffered
-          # inline comments" and the run completes silently. v1 defaults
-          # this to ``false`` because its primary mode is @claude-mention
-          # response; for auto-review-on-open we need it on.
+          # track_progress: true forces tag mode. In tag mode the action
+          # creates an initial sticky comment, passes its ID to the MCP
+          # comment server, and Claude updates it as the final step.
+          # Without this, agent mode runs and the sticky comment silently
+          # never publishes — see anthropics/claude-code-action#1108.
+          track_progress: true
           use_sticky_comment: true
-          # v1 schema: ``prompt`` replaces v0's ``direct_prompt``.
-          # Pin the review to actionable items so the comment stays useful
-          # for the human reviewer.
           prompt: |
-            You are reviewing a pull request against ``main``. After
-            reading the diff, **post a single sticky review comment on
-            this PR**.
-            The comment body must be a short Markdown summary (under 400
-            words) covering:
+            You are reviewing a pull request against `main`. Read the diff,
+            then OUTPUT your review as your final Markdown message. The
+            action will publish your final message as a sticky review
+            comment on the PR — you do not need to call any tool.
 
-            1. **Correctness risks** — concrete bugs, off-by-one errors,
-               broken invariants. Cite file:line. Skip stylistic nits.
+            Keep the comment under 400 words. Cover:
+
+            1. **Correctness risks** — bugs, off-by-one errors, broken
+               invariants. Cite file:line. Skip stylistic nits.
             2. **Security / safety** — auth, secrets, untrusted input,
                injection, file/network sandboxing. Cite file:line.
             3. **Tests** — coverage gaps, brittle assertions, flake risks.
             4. **Migration / compatibility** — schema changes, breaking
                API edits, data migration safety.
 
-            If the diff is clean, post a one-line comment saying so. Do
-            NOT restate the PR description. Always post — silence is a
-            failure mode, not "looks fine."
+            Clean diff → one-line "LGTM — no blocking issues."
+            Do NOT restate the PR description. Always produce output —
+            silence is a failure mode.
