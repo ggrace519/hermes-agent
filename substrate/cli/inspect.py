@@ -261,6 +261,12 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     dreamer_p.add_argument("--limit", type=int, default=10)
     dreamer_p.set_defaults(func=_cmd_inspect_dreamer)
 
+    conductor_p = substrate_sub.add_parser(
+        "conductor", help="Conductor decisions + backlog forecast (learned rhythm)"
+    )
+    conductor_p.add_argument("--limit", type=int, default=15)
+    conductor_p.set_defaults(func=_cmd_inspect_conductor)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -411,6 +417,11 @@ def _cmd_inspect_l4(args: argparse.Namespace) -> int:
 def _cmd_inspect_dreamer(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 10)
     return _run_inspect(lambda conn: _print_dreamer(conn, limit=limit))
+
+
+def _cmd_inspect_conductor(args: argparse.Namespace) -> int:
+    limit = getattr(args, "limit", 15)
+    return _run_inspect(lambda conn: _print_conductor(conn, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -1133,6 +1144,36 @@ async def _print_l3_patterns(conn, *, kind=None, limit=20) -> None:
             f"  [{r['kind']:18s}] sal={r['salience_score']:.2f} "
             f"conf={r['confidence']:.2f} cites={r['n_cites']}  {r['statement']}"
         )
+
+
+async def _print_conductor(conn, *, limit=15) -> None:
+    try:
+        latest = await conn.fetchrow(
+            "SELECT backlog_ratio, forecast FROM substrate_conductor_log "
+            "ORDER BY at DESC LIMIT 1"
+        )
+        rows = await conn.fetch(
+            "SELECT at, backlog_ratio, forecast, targets FROM substrate_conductor_log "
+            "ORDER BY at DESC LIMIT $1",
+            limit,
+        )
+    except Exception:
+        print("(no conductor log — is the Conductor running with "
+              "HERMES_SUBSTRATE_CONDUCTOR=1?)")
+        return
+    if latest is not None:
+        print(f"Backlog forecast (EMA): {latest['forecast']:.2%}  "
+              f"(latest observed {latest['backlog_ratio']:.2%})")
+        print()
+    if not rows:
+        print("(no conductor decisions logged yet)")
+        return
+    print("Recent decisions:")
+    for r in rows:
+        ts = r["at"].isoformat() if r["at"] else "-"
+        targets = r["targets"] or {}
+        parser_t = targets.get("parser", "?")
+        print(f"  [{ts}] backlog {r['backlog_ratio']:.0%} → parser={parser_t}")
 
 
 async def _print_dreamer(conn, *, limit=10) -> None:

@@ -189,6 +189,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0015",
         # - ``20260527_0016`` — Phase F Dreamer (substrate_dreamer_log).
         "20260527_0016",
+        # - ``20260527_0017`` — Phase F learned Conductor (substrate_conductor_log).
+        "20260527_0017",
     }
 )
 
