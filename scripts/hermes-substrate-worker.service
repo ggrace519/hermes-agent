@@ -60,10 +60,14 @@ ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main substrate w
 TimeoutStopSec=15
 KillSignal=SIGTERM
 
-# Auto-restart on crash so the sub-agent tick loop keeps the substrate
-# healthy. RestartSec gives PG time to recover from transient blips
-# (e.g. docker compose restart of the postgres container).
-Restart=on-failure
+# Always respawn so the sub-agent tick loop keeps the substrate healthy.
+# NOT ``on-failure``: the graceful SIGTERM path exits 0 (see above), so a
+# stray SIGTERM — user-manager re-exec, logind session churn, an OOM the
+# process survives cleanly — would leave the worker parked ``dead`` and
+# the pending queue would never drain. ``always`` still honours an
+# explicit ``systemctl stop``. RestartSec gives PG time to recover from
+# transient blips (e.g. docker compose restart of the postgres container).
+Restart=always
 RestartSec=10
 
 # Resource guards. Sub-agents are bounded by RECALL_EMBEDDING_BATCH_SIZE
