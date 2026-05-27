@@ -40,7 +40,7 @@ permissions:
   # ``The github_ci MCP server requires 'actions: read' permission.
   # Skipping CI server installation.`` and the review can't reference
   # which checks broke.
-  actions: read
+  actions: write
 
 concurrency:
   # Only one Claude review per PR ref at a time. A new push cancels the
