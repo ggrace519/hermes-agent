@@ -25,6 +25,7 @@ embeddings live under the separate ``hermes embed`` namespace; see
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Optional
@@ -94,6 +95,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         "substrate_agent_heartbeat, which the worker subprocess upserts "
         "every ~10s. If every agent shows DOWN, the worker is not running.",
     ).set_defaults(func=_cmd_inspect_agents)
+
+    substrate_sub.add_parser(
+        "boot",
+        help="Last substrate boot outcome per process role (writer/worker)",
+        description="Show the last recorded boot status for each substrate "
+        "process role. A writer-mode FAILED means the gateway/CLI is "
+        "emitting no perception; a worker-mode FAILED means decay/Sentinel/"
+        "embeddings aren't running. Reads the state_meta KV rows that "
+        "bootstrap_substrate writes on every boot attempt.",
+    ).set_defaults(func=_cmd_inspect_boot)
 
     # ── Phase B: curator subtree ──────────────────────────────────────
     curator_p = substrate_sub.add_parser(
@@ -201,6 +212,10 @@ def _cmd_inspect_profiles(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_agents(args: argparse.Namespace) -> int:
     return _run_inspect(_print_agents)
+
+
+def _cmd_inspect_boot(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_boot_status)
 
 
 def _cmd_inspect_curator_summary(args: argparse.Namespace) -> int:
@@ -342,6 +357,15 @@ async def _print_summary(conn: "asyncpg.Connection") -> None:
             "     Start it with `hermes substrate worker run` (or the "
             "hermes-substrate-worker systemd unit)."
         )
+
+    print()
+    print("Last boot:")
+    boot_status = await _boot_status_rows(conn)
+    if not boot_status:
+        print("   (no boot status recorded)")
+    else:
+        for line in _format_boot_lines(boot_status):
+            print(f"   {line}")
 
 
 async def _print_streams(conn: "asyncpg.Connection") -> None:
@@ -580,6 +604,102 @@ async def _print_agents(conn: "asyncpg.Connection") -> None:
         )
     else:
         print("✓ substrate worker is reporting heartbeats.")
+
+
+# ---------------------------------------------------------------------------
+# Substrate boot status — reads the state_meta KV rows that
+# bootstrap_substrate writes on every boot attempt (success or failure),
+# so an operator can see a *writer*-mode boot failure (which silently stops
+# all perception) without grepping process logs.
+# ---------------------------------------------------------------------------
+
+
+# Key prefix must match hermes_bootstrap._BOOT_STATUS_KEY_PREFIX.
+_BOOT_STATUS_KEY_PREFIX = "substrate.boot_status."
+# Roster shown even when a mode has never booted, so a never-started worker
+# is visible rather than simply absent.
+_BOOT_MODES = ("writer", "worker")
+
+
+def _age_str(iso: Optional[str], now: datetime) -> str:
+    """Format an ISO-8601 timestamp as a coarse '12s ago' / '3.4m ago'."""
+    if not iso:
+        return "?"
+    try:
+        ts = datetime.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return "?"
+    secs = max(0.0, (now - ts).total_seconds())
+    if secs < 90:
+        return f"{secs:.0f}s ago"
+    if secs < 5400:
+        return f"{secs / 60:.1f}m ago"
+    return f"{secs / 3600:.1f}h ago"
+
+
+async def _boot_status_rows(conn: "asyncpg.Connection") -> dict:
+    """Return ``{mode: status_dict_or_None}`` parsed from state_meta. A
+    missing table or unparseable value degrades to an empty/None entry
+    rather than raising."""
+    try:
+        rows = await conn.fetch(
+            "SELECT key, value FROM state_meta WHERE key LIKE $1",
+            _BOOT_STATUS_KEY_PREFIX + "%",
+        )
+    except Exception:
+        return {}
+    out: dict = {}
+    for r in rows:
+        mode = r["key"][len(_BOOT_STATUS_KEY_PREFIX):]
+        try:
+            out[mode] = json.loads(r["value"]) if r["value"] else None
+        except (ValueError, TypeError):
+            out[mode] = None
+    return out
+
+
+def _format_boot_lines(status_by_mode: dict) -> list[str]:
+    """One line per boot mode (expected roster first, then any extras)."""
+    now = datetime.now(timezone.utc)
+    lines: list[str] = []
+
+    def _line(mode: str, st) -> str:
+        if not st:
+            return f"{mode:8s} (no boot recorded)"
+        verdict = "OK" if st.get("ok") else "FAILED"
+        age = _age_str(st.get("booted_at"), now)
+        detail = f"pid {st.get('pid')}"
+        if not st.get("ok") and st.get("error"):
+            detail += f"   {st['error']}"
+        return f"{mode:8s} {verdict:6s} {age:>10s}   {detail}"
+
+    for mode in _BOOT_MODES:
+        lines.append(_line(mode, status_by_mode.get(mode)))
+    for mode, st in status_by_mode.items():
+        if mode not in _BOOT_MODES:
+            lines.append(_line(mode, st))
+    return lines
+
+
+async def _print_boot_status(conn: "asyncpg.Connection") -> None:
+    """``hermes substrate boot`` — last boot outcome per process role."""
+    now = datetime.now(timezone.utc)
+    print(f"Substrate boot status @ {now.isoformat()}")
+    print()
+    status = await _boot_status_rows(conn)
+    if not status:
+        print(
+            "  (no boot status recorded — bootstrap_substrate has not run "
+            "against this database, or this deployment predates boot-status "
+            "recording)"
+        )
+        return
+    for line in _format_boot_lines(status):
+        print(f"  {line}")
+    failed = sorted(m for m, st in status.items() if st and not st.get("ok"))
+    if failed:
+        print()
+        print(f"⚠ last boot FAILED for: {', '.join(failed)} — see process logs.")
 
 
 # ---------------------------------------------------------------------------
