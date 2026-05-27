@@ -83,12 +83,7 @@ jobs:
           prompt: |
             You are reviewing a pull request against ``main``. After
             reading the diff, **post a single sticky review comment on
-            this PR** (use the ``mcp__github_inline_comment__post_pr_comment``
-            tool, or any equivalent GitHub-comment tool available to you —
-            the action wires one of these in for you). Without that tool
-            call the review is invisible to the human reviewer no matter
-            how long you spend analysing.
-
+            this PR**.
             The comment body must be a short Markdown summary (under 400
             words) covering:
 
