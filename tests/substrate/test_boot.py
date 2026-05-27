@@ -128,6 +128,7 @@ async def test_subagents_running(booted_with_subagents):
         "parser",   # Phase D (tick no-ops unless HERMES_SUBSTRATE_PARSER=1)
         "associator",  # Phase E1 (tick no-ops unless HERMES_SUBSTRATE_ASSOCIATOR=1)
         "pattern-finder",  # Phase E2 (tick no-ops unless HERMES_SUBSTRATE_PATTERNFINDER=1)
+        "critic",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_CRITIC=1)
     }
     for name, agent in agents.items():
         task = agent.task

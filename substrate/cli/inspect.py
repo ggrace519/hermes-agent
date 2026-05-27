@@ -235,6 +235,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     l3_pat.add_argument("--limit", type=int, default=20)
     l3_pat.set_defaults(func=_cmd_inspect_l3_patterns)
 
+    l4_p = substrate_sub.add_parser(
+        "l4", help="Inspect L4 (self-model: coherence + calibration)"
+    )
+    l4_sub = l4_p.add_subparsers(dest="l4_subcommand")
+    l4_p.set_defaults(func=_cmd_inspect_l4)
+    l4_obs = l4_sub.add_parser("observations", help="Recent L4 observations (default)")
+    l4_obs.add_argument("--subject", default=None)
+    l4_obs.add_argument("--limit", type=int, default=20)
+    l4_obs.set_defaults(func=_cmd_inspect_l4)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -370,6 +380,12 @@ def _cmd_inspect_l3_patterns(args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None)
     limit = getattr(args, "limit", 20)
     return _run_inspect(lambda conn: _print_l3_patterns(conn, kind=kind, limit=limit))
+
+
+def _cmd_inspect_l4(args: argparse.Namespace) -> int:
+    subject = getattr(args, "subject", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l4(conn, subject=subject, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -582,6 +598,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("parser", False),  # Phase D — heartbeats even when its tick is env-gated off
     ("associator", False),  # Phase E1 — same staged-rollout shape
     ("pattern-finder", False),  # Phase E2 — same staged-rollout shape
+    ("critic", False),  # Phase F — same staged-rollout shape
 )
 
 
@@ -991,6 +1008,36 @@ async def _print_l3_patterns(conn, *, kind=None, limit=20) -> None:
             f"  [{r['kind']:18s}] sal={r['salience_score']:.2f} "
             f"conf={r['confidence']:.2f} cites={r['n_cites']}  {r['statement']}"
         )
+
+
+async def _print_l4(conn, *, subject=None, limit=20) -> None:
+    coherence = await conn.fetchrow(
+        "SELECT score, statement, created_at FROM l4_observations "
+        "WHERE kind='coherence' ORDER BY created_at DESC LIMIT 1"
+    )
+    if coherence and coherence["score"] is not None:
+        print(f"Coherence (latest): {coherence['score']:.2f}  —  {coherence['statement']}")
+    else:
+        print("Coherence (latest): (none — is the Critic running with "
+              "HERMES_SUBSTRATE_CRITIC=1?)")
+    print()
+    rows = await conn.fetch(
+        """
+        SELECT kind, subject, statement, score, created_at
+          FROM l4_observations
+         WHERE ($1::text IS NULL OR subject = $1)
+         ORDER BY created_at DESC LIMIT $2
+        """,
+        subject,
+        limit,
+    )
+    if not rows:
+        print("(no L4 observations)")
+        return
+    print("Recent observations:")
+    for r in rows:
+        score = f" [{r['score']:.2f}]" if r["score"] is not None else ""
+        print(f"  ({r['kind']}/{r['subject']}){score}  {r['statement']}")
 
 
 # ---------------------------------------------------------------------------
