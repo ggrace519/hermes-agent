@@ -395,3 +395,41 @@ restart Hermes.
   going even if every slice write fails. If you see "recall returned empty"
   consistently, check the Hermes log for substrate exceptions before
   concluding the data isn't there.
+
+## Observability & layer commands (Phases D–G)
+
+Start here when asking "is the substrate healthy?":
+
+- **`hermes substrate health`** — one-glance operator rollup: worker
+  liveness, last boot, the Critic's coherence vital sign, per-layer
+  L0–L4 counts, and consolidation backlog. The first thing to run.
+- **`hermes substrate agents`** — per-sub-agent liveness (live/stale/down
+  by heartbeat age). All DOWN ⇒ the worker subprocess isn't running.
+- **`hermes substrate boot`** — last boot outcome per process role.
+- **`hermes substrate recall validate`** — runs a real recall and prints the
+  composed `<memory-context>` block + a READY/DEGRADED/NOT-READY verdict.
+- **`hermes substrate l1 entities|relationships`** — L1 knowledge (Parser).
+- **`hermes substrate parser summary|recent`** — Parser activity + outcomes.
+- **`hermes substrate l2 associations`** — L2 graph (Associator).
+- **`hermes substrate l3 patterns`** — L3 generalizations (Pattern-finder).
+- **`hermes substrate l4 observations`** — L4 self-model + coherence (Critic).
+
+The cognitive sub-agents are staged-rollout, default OFF (register +
+heartbeat, tick no-op until opted in):
+
+| Env var | Sub-agent | Produces |
+|---|---|---|
+| `HERMES_SUBSTRATE_PARSER=1` | Parser (Phase D) | L1 entities/relationships |
+| `HERMES_SUBSTRATE_ASSOCIATOR=1` | Associator (E1) | L2 associations |
+| `HERMES_SUBSTRATE_PATTERNFINDER=1` | Pattern-finder (E2) | L3 patterns |
+| `HERMES_SUBSTRATE_CRITIC=1` | Critic (F) | L4 calibration + coherence |
+| `HERMES_SUBSTRATE_CONDUCTOR=1` | Conductor (F) | adaptive intensity dialing |
+
+Enable bottom-up (Parser first — the others build on its L1 output). All
+require the worker subprocess (`hermes substrate worker run`) to be running.
+
+**Deferred research (not yet built; flagged in the phase specs):** the LLM
+Reflector (L3/L4 synthesis), the Dreamer, the *learned* Conductor policy
+(forecasting/scheduling — only the deterministic adaptive policy ships), the
+real Sentinel defense (still the Phase A pass-through stub), and the
+foreground-attention / re-Sentineling protocols (MVS §8.6).

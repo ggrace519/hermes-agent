@@ -88,6 +88,16 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     ).set_defaults(func=_cmd_inspect_profiles)
 
     substrate_sub.add_parser(
+        "health",
+        help="One-glance operator rollup: worker liveness, boot, coherence, "
+        "L0–L4 counts, consolidation backlog",
+        description="The substrate operator dashboard — aggregates sub-agent "
+        "liveness, last boot, the Critic's coherence vital sign, per-layer "
+        "object counts, and consolidation backlog into a single report. The "
+        "first thing to run when asking 'is the substrate healthy?'.",
+    ).set_defaults(func=_cmd_inspect_health)
+
+    substrate_sub.add_parser(
         "agents",
         help="Sub-agent liveness (heartbeats from the worker subprocess)",
         description="Show each substrate sub-agent's last heartbeat, "
@@ -287,6 +297,10 @@ def _cmd_inspect_profiles(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_agents(args: argparse.Namespace) -> int:
     return _run_inspect(_print_agents)
+
+
+def _cmd_inspect_health(args: argparse.Namespace) -> int:
+    return _run_inspect(_print_health)
 
 
 def _cmd_inspect_boot(args: argparse.Namespace) -> int:
@@ -732,6 +746,103 @@ async def _print_agents(conn: "asyncpg.Connection") -> None:
         )
     else:
         print("✓ substrate worker is reporting heartbeats.")
+
+
+# ---------------------------------------------------------------------------
+# Operator health rollup (Phase G) — one-glance "is the substrate healthy?".
+# ---------------------------------------------------------------------------
+
+
+async def _layer_counts(conn: "asyncpg.Connection") -> dict:
+    """Per-layer object counts. Upper-layer tables (l1_/l2_/l3_/l4_) may not
+    exist on a pre-Phase-D DB; each is guarded so the rollup degrades."""
+    async def _scalar(sql: str, default=0):
+        try:
+            return int(await conn.fetchval(sql) or 0)
+        except Exception:
+            return None  # table absent / not migrated this far
+
+    slice_states = await _slice_state_counts(conn)
+    consolidated = await _scalar(
+        "SELECT COUNT(*) FROM substrate_slices WHERE consolidation_state='consolidated'"
+    )
+    pending_parse = await _scalar(
+        "SELECT COUNT(*) FROM substrate_slices "
+        "WHERE consolidation_state='unconsolidated' AND sentinel_state='passed'"
+    )
+    return {
+        "l0_passed": slice_states.get("passed", 0),
+        "l0_consolidated": consolidated,
+        "l0_pending_parse": pending_parse,
+        "l1_entities": await _scalar("SELECT COUNT(*) FROM l1_entities"),
+        "l1_relationships": await _scalar("SELECT COUNT(*) FROM l1_relationships"),
+        "l2_associations": await _scalar("SELECT COUNT(*) FROM substrate_associations"),
+        "l3_patterns": await _scalar("SELECT COUNT(*) FROM l3_patterns"),
+        "l4_observations": await _scalar("SELECT COUNT(*) FROM l4_observations"),
+    }
+
+
+async def _print_health(conn: "asyncpg.Connection") -> None:
+    now = datetime.now(timezone.utc)
+    print(f"Substrate health @ {now.isoformat()}")
+    print()
+
+    # 1. Worker liveness.
+    agents = await _agent_liveness(conn)
+    live = sum(1 for a in agents if a["status"] == "live")
+    print(f"Worker: ", end="")
+    if _all_agents_down(agents):
+        print("⚠ DOWN — no sub-agent heartbeat (run `hermes substrate worker run`)")
+    else:
+        print(f"✓ up — {live}/{len(agents)} sub-agents live")
+
+    # 2. Boot status.
+    boot = await _boot_status_rows(conn)
+    failed = sorted(m for m, st in boot.items() if st and not st.get("ok"))
+    if failed:
+        print(f"Boot:   ⚠ last boot FAILED for {', '.join(failed)}")
+    elif boot:
+        print(f"Boot:   ✓ {', '.join(sorted(boot))} OK")
+
+    # 3. Coherence vital sign (Critic / L4).
+    try:
+        coh = await conn.fetchrow(
+            "SELECT score, created_at FROM l4_observations WHERE kind='coherence' "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+    except Exception:
+        coh = None
+    if coh and coh["score"] is not None:
+        age = _age_str(coh["created_at"].isoformat(), now)
+        print(f"Coherence: {coh['score']:.2f}  (assessed {age})")
+    else:
+        print("Coherence: (no assessment — Critic off or not yet run)")
+
+    # 4. Layer counts.
+    print()
+    lc = await _layer_counts(conn)
+
+    def _fmt(v):
+        return "—" if v is None else f"{v:,}"
+
+    print("Layers:")
+    print(f"  L0 perception   passed {_fmt(lc['l0_passed'])}  "
+          f"consolidated {_fmt(lc['l0_consolidated'])}  "
+          f"awaiting-parse {_fmt(lc['l0_pending_parse'])}")
+    print(f"  L1 knowledge    entities {_fmt(lc['l1_entities'])}  "
+          f"relationships {_fmt(lc['l1_relationships'])}")
+    print(f"  L2 associations {_fmt(lc['l2_associations'])}")
+    print(f"  L3 patterns     {_fmt(lc['l3_patterns'])}")
+    print(f"  L4 self-model   observations {_fmt(lc['l4_observations'])}")
+
+    # 5. Backlog one-liner.
+    pend = lc["l0_pending_parse"] or 0
+    done = lc["l0_consolidated"] or 0
+    if pend + done:
+        ratio = pend / (pend + done)
+        print()
+        print(f"Consolidation backlog: {ratio:.0%} "
+              f"({pend:,} awaiting parse / {pend + done:,} parseable)")
 
 
 # ---------------------------------------------------------------------------
