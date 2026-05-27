@@ -227,6 +227,14 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     l2_assoc.add_argument("--limit", type=int, default=20)
     l2_assoc.set_defaults(func=_cmd_inspect_l2_associations)
 
+    l3_p = substrate_sub.add_parser("l3", help="Inspect L3 (patterns)")
+    l3_sub = l3_p.add_subparsers(dest="l3_subcommand")
+    l3_p.set_defaults(func=_cmd_inspect_l3_patterns)
+    l3_pat = l3_sub.add_parser("patterns", help="List L3 patterns (default)")
+    l3_pat.add_argument("--kind", default=None, help="Filter by pattern kind")
+    l3_pat.add_argument("--limit", type=int, default=20)
+    l3_pat.set_defaults(func=_cmd_inspect_l3_patterns)
+
     # ── Sub-agent worker subprocess ────────────────────────────────────
     # ``hermes substrate worker run`` blocks while running Sentinel +
     # Curator + ForceRejectWorker + PartitionMaintenanceWorker in a
@@ -356,6 +364,12 @@ def _cmd_inspect_l2_associations(args: argparse.Namespace) -> int:
     entity = getattr(args, "entity", None)
     limit = getattr(args, "limit", 20)
     return _run_inspect(lambda conn: _print_l2_associations(conn, entity=entity, limit=limit))
+
+
+def _cmd_inspect_l3_patterns(args: argparse.Namespace) -> int:
+    kind = getattr(args, "kind", None)
+    limit = getattr(args, "limit", 20)
+    return _run_inspect(lambda conn: _print_l3_patterns(conn, kind=kind, limit=limit))
 
 
 def _run_inspect(action) -> int:
@@ -567,6 +581,7 @@ _EXPECTED_AGENTS: tuple[tuple[str, bool], ...] = (
     ("partition-maintenance", False),
     ("parser", False),  # Phase D — heartbeats even when its tick is env-gated off
     ("associator", False),  # Phase E1 — same staged-rollout shape
+    ("pattern-finder", False),  # Phase E2 — same staged-rollout shape
 )
 
 
@@ -951,6 +966,30 @@ async def _print_l2_associations(conn, *, entity=None, limit=20) -> None:
     for r in rows:
         print(
             f"  {r['src']} <-> {r['dst']}  [{r['edge_type']}]  weight {r['weight']:.1f}"
+        )
+
+
+async def _print_l3_patterns(conn, *, kind=None, limit=20) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT kind, statement, salience_score, confidence,
+               jsonb_array_length(cites) AS n_cites, last_seen_at
+          FROM l3_patterns
+         WHERE ($1::text IS NULL OR kind = $1)
+         ORDER BY salience_score DESC, last_seen_at DESC
+         LIMIT $2
+        """,
+        kind,
+        limit,
+    )
+    if not rows:
+        print("(no L3 patterns — is the Pattern-finder running with "
+              "HERMES_SUBSTRATE_PATTERNFINDER=1?)")
+        return
+    for r in rows:
+        print(
+            f"  [{r['kind']:18s}] sal={r['salience_score']:.2f} "
+            f"conf={r['confidence']:.2f} cites={r['n_cites']}  {r['statement']}"
         )
 
 

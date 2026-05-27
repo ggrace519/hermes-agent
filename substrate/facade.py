@@ -183,6 +183,8 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0012",
         # - ``20260527_0013`` — Phase E1 L2 (substrate_associations + edits).
         "20260527_0013",
+        # - ``20260527_0014`` — Phase E2 L3 (l3_patterns).
+        "20260527_0014",
     }
 )
 
@@ -552,6 +554,7 @@ class Substrate:
         from substrate.agents.curator import Curator
         from substrate.agents.force_reject import ForceRejectWorker
         from substrate.agents.parser import Parser
+        from substrate.agents.pattern_finder import PatternFinder
         from substrate.agents.partition_maintenance import (
             PartitionMaintenanceWorker,
         )
@@ -562,10 +565,14 @@ class Substrate:
         partition = PartitionMaintenanceWorker(self)
         force_reject = ForceRejectWorker(self)
         curator = Curator(self)
-        parser = Parser(self)        # Phase D — no-op unless HERMES_SUBSTRATE_PARSER=1
-        associator = Associator(self)  # Phase E1 — no-op unless HERMES_SUBSTRATE_ASSOCIATOR=1
+        parser = Parser(self)            # Phase D  — gated HERMES_SUBSTRATE_PARSER
+        associator = Associator(self)    # Phase E1 — gated HERMES_SUBSTRATE_ASSOCIATOR
+        pattern_finder = PatternFinder(self)  # Phase E2 — gated HERMES_SUBSTRATE_PATTERNFINDER
         sentinel = StubSentinel(self)
-        for agent in (partition, force_reject, curator, parser, associator, sentinel):
+        for agent in (
+            partition, force_reject, curator, parser, associator,
+            pattern_finder, sentinel,
+        ):
             agent.start()
             self._subagents[agent.name] = agent
 
