@@ -369,6 +369,152 @@ async def list_citations_for_entity(
     return [_row_to_citation(r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Curation / hygiene — merge, forget, edit, duplicate suggestion.
+# Addresses the substrate feedback: dedup/merge fragmented entities (#3/#8)
+# and let users curate what the substrate knows (#4).
+# ---------------------------------------------------------------------------
+
+
+async def merge_entities(from_id: UUID, into_id: UUID, *, conn=None) -> bool:
+    """Merge entity ``from_id`` into ``into_id`` and delete the former.
+
+    Repoints relationships (subject + object) and citations onto ``into``,
+    deleting any that would duplicate an existing ``into`` relationship or
+    become a self-loop; unions aliases (incl. the old name) + cites and
+    bumps ``mention_count``. L2 associations involving ``from`` cascade
+    away on its deletion and are re-derived by the Associator on its next
+    tick (so the graph self-heals around the merged identity).
+
+    Atomic (runs in a transaction). Returns False if either id is unknown
+    or they're identical.
+    """
+    if from_id == into_id:
+        return False
+
+    async def _go(c) -> bool:
+        frm = await c.fetchrow("SELECT * FROM l1_entities WHERE id = $1", from_id)
+        into = await c.fetchrow("SELECT * FROM l1_entities WHERE id = $1", into_id)
+        if frm is None or into is None:
+            return False
+        # Repoint relationship subjects, dropping would-be duplicates.
+        await c.execute(
+            """
+            UPDATE l1_relationships r SET subject_id = $2
+             WHERE r.subject_id = $1
+               AND NOT EXISTS (SELECT 1 FROM l1_relationships x
+                                WHERE x.subject_id = $2 AND x.predicate = r.predicate
+                                  AND x.object_id = r.object_id)
+            """,
+            from_id, into_id,
+        )
+        await c.execute("DELETE FROM l1_relationships WHERE subject_id = $1", from_id)
+        # Repoint relationship objects, dropping would-be duplicates.
+        await c.execute(
+            """
+            UPDATE l1_relationships r SET object_id = $2
+             WHERE r.object_id = $1
+               AND NOT EXISTS (SELECT 1 FROM l1_relationships x
+                                WHERE x.object_id = $2 AND x.predicate = r.predicate
+                                  AND x.subject_id = r.subject_id)
+            """,
+            from_id, into_id,
+        )
+        await c.execute("DELETE FROM l1_relationships WHERE object_id = $1", from_id)
+        # Drop self-loops the merge may have created.
+        await c.execute(
+            "DELETE FROM l1_relationships WHERE subject_id = $1 AND object_id = $1",
+            into_id,
+        )
+        # Citations follow the surviving entity.
+        await c.execute(
+            "UPDATE l1_citations SET entity_id = $2 WHERE entity_id = $1",
+            from_id, into_id,
+        )
+        # Union aliases (+ the absorbed name) onto the survivor.
+        new_aliases = list(
+            {*(into["aliases"] or []), *(frm["aliases"] or []), frm["name"]}
+        )
+        await c.execute(
+            "UPDATE l1_entities SET aliases = $2, last_seen_at = now() WHERE id = $1",
+            into_id, new_aliases,
+        )
+        await c.execute("DELETE FROM l1_entities WHERE id = $1", from_id)
+        return True
+
+    async with _acquire(conn) as c:
+        if conn is not None:
+            return await _go(c)
+        async with c.transaction():
+            return await _go(c)
+
+
+async def forget_entity(entity_id: UUID, *, conn=None) -> bool:
+    """Delete an entity (relationships, citations, associations cascade).
+    Returns True if a row was removed."""
+    async with _acquire(conn) as c:
+        tag = await c.execute("DELETE FROM l1_entities WHERE id = $1", entity_id)
+    return tag.split()[-1] != "0"
+
+
+async def edit_entity(
+    entity_id: UUID,
+    *,
+    summary: Optional[str] = None,
+    canonical_name: Optional[str] = None,
+    conn=None,
+) -> bool:
+    """Update an entity's summary and/or canonical name. Returns True if a
+    row was updated."""
+    sets, args = [], []
+    if summary is not None:
+        args.append(summary)
+        sets.append(f"summary = ${len(args)}")
+    if canonical_name is not None:
+        args.append(canonical_name)
+        sets.append(f"name = ${len(args)}")
+    if not sets:
+        return False
+    args.append(entity_id)
+    async with _acquire(conn) as c:
+        tag = await c.execute(
+            f"UPDATE l1_entities SET {', '.join(sets)}, last_seen_at = now() "
+            f"WHERE id = ${len(args)}",
+            *args,
+        )
+    return tag.split()[-1] != "0"
+
+
+async def duplicate_candidates(
+    *, threshold: float = 0.6, limit: int = 20, conn=None
+) -> list[dict]:
+    """Suggest likely-duplicate entity pairs: same kind + trigram-similar
+    names, above ``threshold``. Powers ``hermes substrate l1 dupes`` so an
+    operator can review + merge fragmented memory."""
+    async with _acquire(conn) as c:
+        rows = await c.fetch(
+            """
+            SELECT a.id AS a_id, a.name AS a_name,
+                   b.id AS b_id, b.name AS b_name,
+                   a.entity_type AS kind,
+                   similarity(a.name, b.name) AS sim,
+                   (SELECT COUNT(*) FROM l1_citations c WHERE c.entity_id = a.id)::int AS a_cites,
+                   (SELECT COUNT(*) FROM l1_citations c WHERE c.entity_id = b.id)::int AS b_cites
+              FROM l1_entities a
+              JOIN l1_entities b
+                ON a.entity_type = b.entity_type
+               AND a.id < b.id
+               AND a.name % b.name
+             WHERE similarity(a.name, b.name) >= $1
+             ORDER BY sim DESC
+             LIMIT $2
+            """,
+            threshold,
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
 __all__ = [
     "upsert_entity",
     "upsert_relationship",
@@ -380,4 +526,8 @@ __all__ = [
     "get_entities_for_query",
     "list_relationships_for_entity",
     "list_citations_for_entity",
+    "merge_entities",
+    "forget_entity",
+    "edit_entity",
+    "duplicate_candidates",
 ]

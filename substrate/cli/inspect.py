@@ -214,6 +214,23 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     l1_rels = l1_sub.add_parser("relationships", help="List L1 relationships")
     l1_rels.add_argument("--limit", type=int, default=20)
     l1_rels.set_defaults(func=_cmd_inspect_l1_relationships)
+    # Curation (mutating) — dedup/merge fragmented memory + edit/forget.
+    l1_dupes = l1_sub.add_parser("dupes", help="Suggest likely-duplicate entity pairs to merge")
+    l1_dupes.add_argument("--threshold", type=float, default=0.6)
+    l1_dupes.add_argument("--limit", type=int, default=20)
+    l1_dupes.set_defaults(func=_cmd_inspect_l1_dupes)
+    l1_merge = l1_sub.add_parser("merge", help="Merge one entity into another (by name)")
+    l1_merge.add_argument("--from", dest="from_name", required=True)
+    l1_merge.add_argument("--into", dest="into_name", required=True)
+    l1_merge.set_defaults(func=_cmd_inspect_l1_merge)
+    l1_forget = l1_sub.add_parser("forget", help="Delete an entity (by name)")
+    l1_forget.add_argument("name")
+    l1_forget.set_defaults(func=_cmd_inspect_l1_forget)
+    l1_edit = l1_sub.add_parser("edit", help="Edit an entity's summary/name (by name)")
+    l1_edit.add_argument("name")
+    l1_edit.add_argument("--summary", default=None)
+    l1_edit.add_argument("--rename", default=None, help="New canonical name")
+    l1_edit.set_defaults(func=_cmd_inspect_l1_edit)
 
     parser_p = substrate_sub.add_parser(
         "parser", help="Inspect Parser activity (substrate_parser_log)"
@@ -385,6 +402,28 @@ def _cmd_inspect_l1_entities(args: argparse.Namespace) -> int:
 def _cmd_inspect_l1_relationships(args: argparse.Namespace) -> int:
     limit = getattr(args, "limit", 20)
     return _run_inspect(lambda conn: _print_l1_relationships(conn, limit=limit))
+
+
+def _cmd_inspect_l1_dupes(args: argparse.Namespace) -> int:
+    return _run_inspect(
+        lambda conn: _print_l1_dupes(conn, threshold=args.threshold, limit=args.limit)
+    )
+
+
+def _cmd_inspect_l1_merge(args: argparse.Namespace) -> int:
+    return _run_inspect(
+        lambda conn: _do_l1_merge(conn, args.from_name, args.into_name)
+    )
+
+
+def _cmd_inspect_l1_forget(args: argparse.Namespace) -> int:
+    return _run_inspect(lambda conn: _do_l1_forget(conn, args.name))
+
+
+def _cmd_inspect_l1_edit(args: argparse.Namespace) -> int:
+    return _run_inspect(
+        lambda conn: _do_l1_edit(conn, args.name, summary=args.summary, rename=args.rename)
+    )
 
 
 def _cmd_inspect_parser_summary(args: argparse.Namespace) -> int:
@@ -1016,6 +1055,79 @@ async def _print_l1_relationships(conn, *, limit=20) -> None:
         return
     for r in rows:
         print(f"  {r['subj']} --{r['predicate']}--> {r['obj']}  (conf {r['confidence']:.2f})")
+
+
+# ── L1 curation (mutating) ────────────────────────────────────────────
+
+
+async def _resolve_entity(conn, name: str):
+    """Resolve a single entity by exact name. Prints an error + returns
+    None on no/ambiguous match."""
+    from substrate.l1 import store
+
+    matches = await store.find_entities_by_name(name, fuzzy=False, limit=5, conn=conn)
+    if not matches:
+        print(f"no entity named {name!r}")
+        return None
+    if len(matches) > 1:
+        kinds = ", ".join(f"{m.name} ({m.entity_type})" for m in matches)
+        print(f"ambiguous — {len(matches)} entities match {name!r}: {kinds}")
+        return None
+    return matches[0]
+
+
+async def _print_l1_dupes(conn, *, threshold=0.6, limit=20) -> None:
+    from substrate.l1 import store
+
+    pairs = await store.duplicate_candidates(threshold=threshold, limit=limit, conn=conn)
+    if not pairs:
+        print(f"(no likely-duplicate entity pairs above similarity {threshold})")
+        return
+    print("Likely duplicates (review, then `l1 merge --from X --into Y`):")
+    for p in pairs:
+        print(
+            f"  [{p['kind']}] {p['a_name']} ({p['a_cites']} cites) ~ "
+            f"{p['b_name']} ({p['b_cites']} cites)  sim {p['sim']:.2f}"
+        )
+
+
+async def _do_l1_merge(conn, from_name: str, into_name: str) -> None:
+    from substrate.l1 import store
+
+    frm = await _resolve_entity(conn, from_name)
+    into = await _resolve_entity(conn, into_name)
+    if frm is None or into is None:
+        return
+    if frm.id == into.id:
+        print("from and into are the same entity; nothing to merge")
+        return
+    ok = await store.merge_entities(frm.id, into.id, conn=conn)
+    print(f"merged {from_name!r} into {into_name!r}" if ok else "merge failed")
+
+
+async def _do_l1_forget(conn, name: str) -> None:
+    from substrate.l1 import store
+
+    ent = await _resolve_entity(conn, name)
+    if ent is None:
+        return
+    ok = await store.forget_entity(ent.id, conn=conn)
+    print(f"forgot {name!r}" if ok else "nothing forgotten")
+
+
+async def _do_l1_edit(conn, name: str, *, summary=None, rename=None) -> None:
+    from substrate.l1 import store
+
+    ent = await _resolve_entity(conn, name)
+    if ent is None:
+        return
+    if summary is None and rename is None:
+        print("nothing to edit — pass --summary and/or --rename")
+        return
+    ok = await store.edit_entity(
+        ent.id, summary=summary, canonical_name=rename, conn=conn
+    )
+    print(f"updated {name!r}" if ok else "no change")
 
 
 async def _print_parser_summary(conn) -> None:
