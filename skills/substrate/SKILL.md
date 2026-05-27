@@ -414,22 +414,32 @@ Start here when asking "is the substrate healthy?":
 - **`hermes substrate l3 patterns`** — L3 generalizations (Pattern-finder).
 - **`hermes substrate l4 observations`** — L4 self-model + coherence (Critic).
 
-The cognitive sub-agents are staged-rollout, default OFF (register +
-heartbeat, tick no-op until opted in):
+The cognitive sub-agents are **ON by default** — set the env var to `0` to
+disable a given one. Each still registers + heartbeats regardless; the gate
+only controls whether its tick does work. LLM-driven agents no-op silently
+when no auxiliary provider is configured.
 
-| Env var | Sub-agent | Produces |
+| Env var (default `1`) | Sub-agent | Produces |
 |---|---|---|
-| `HERMES_SUBSTRATE_PARSER=1` | Parser (Phase D) | L1 entities/relationships |
-| `HERMES_SUBSTRATE_ASSOCIATOR=1` | Associator (E1) | L2 associations |
-| `HERMES_SUBSTRATE_PATTERNFINDER=1` | Pattern-finder (E2) | L3 patterns |
-| `HERMES_SUBSTRATE_CRITIC=1` | Critic (F) | L4 calibration + coherence |
-| `HERMES_SUBSTRATE_CONDUCTOR=1` | Conductor (F) | adaptive intensity dialing |
+| `HERMES_SUBSTRATE_PARSER` | Parser (Phase D) | L1 entities/relationships |
+| `HERMES_SUBSTRATE_ASSOCIATOR` | Associator (E1) | L2 associations |
+| `HERMES_SUBSTRATE_PATTERNFINDER` | Pattern-finder (E2) | L3 patterns |
+| `HERMES_SUBSTRATE_CRITIC` | Critic (F) | L4 calibration + coherence |
+| `HERMES_SUBSTRATE_REFLECTOR` | Reflector (F) | L3/L4 synthesis |
+| `HERMES_SUBSTRATE_DREAMER` | Dreamer (F) | counterfactual exploration log |
+| `HERMES_SUBSTRATE_CONDUCTOR` | Conductor (F) | adaptive intensity dialing |
 
-Enable bottom-up (Parser first — the others build on its L1 output). All
-require the worker subprocess (`hermes substrate worker run`) to be running.
+All require the worker subprocess (`hermes substrate worker run`) to be
+running. They depend bottom-up (Parser feeds the rest), so on a fresh
+install L1+ fills only after the Parser has consolidated some L0.
 
-**Deferred research (not yet built; flagged in the phase specs):** the LLM
-Reflector (L3/L4 synthesis), the Dreamer, the *learned* Conductor policy
-(forecasting/scheduling — only the deterministic adaptive policy ships), the
-real Sentinel defense (still the Phase A pass-through stub), and the
-foreground-attention / re-Sentineling protocols (MVS §8.6).
+`HERMES_SUBSTRATE_SENTINEL_DEFENSE` (Sentinel content defense — quarantine
+of suspected prompt-injection) is the one feature still **default OFF**: a
+false-positive silently drops a slice from recall, so enable + tune it
+against your own traffic during local testing.
+
+**Refinements still deferred (flagged in the phase PRs):** the L2-grounding
+coherence signal (needs L1/L2 decay), per-stream-family Sentinel trust +
+embedding/LLM detection + re-Sentineling, multi-horizon Conductor
+forecasting / policy-learning, foreground-attention definition (MVS §8.6),
+and entity merge/dedup.
