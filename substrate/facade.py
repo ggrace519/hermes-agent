@@ -562,6 +562,7 @@ class Substrate:
         from substrate.agents.partition_maintenance import (
             PartitionMaintenanceWorker,
         )
+        from substrate.agents.reflector import Reflector
         from substrate.agents.sentinel import StubSentinel
 
         self._conductor = StubConductor(self)
@@ -573,13 +574,14 @@ class Substrate:
         associator = Associator(self)    # Phase E1 — gated HERMES_SUBSTRATE_ASSOCIATOR
         pattern_finder = PatternFinder(self)  # Phase E2 — gated HERMES_SUBSTRATE_PATTERNFINDER
         critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
+        reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
         # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
         # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
         conductor_policy = AdaptiveConductor(self)
         sentinel = StubSentinel(self)
         for agent in (
             partition, force_reject, curator, parser, associator,
-            pattern_finder, critic, conductor_policy, sentinel,
+            pattern_finder, critic, reflector, conductor_policy, sentinel,
         ):
             agent.start()
             self._subagents[agent.name] = agent
