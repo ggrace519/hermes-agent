@@ -553,6 +553,7 @@ class Substrate:
         """
         from substrate.agents.associator import Associator
         from substrate.agents.conductor import StubConductor
+        from substrate.agents.conductor_policy import AdaptiveConductor
         from substrate.agents.critic import Critic
         from substrate.agents.curator import Curator
         from substrate.agents.force_reject import ForceRejectWorker
@@ -572,10 +573,13 @@ class Substrate:
         associator = Associator(self)    # Phase E1 — gated HERMES_SUBSTRATE_ASSOCIATOR
         pattern_finder = PatternFinder(self)  # Phase E2 — gated HERMES_SUBSTRATE_PATTERNFINDER
         critic = Critic(self)            # Phase F  — gated HERMES_SUBSTRATE_CRITIC
+        # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
+        # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
+        conductor_policy = AdaptiveConductor(self)
         sentinel = StubSentinel(self)
         for agent in (
             partition, force_reject, curator, parser, associator,
-            pattern_finder, critic, sentinel,
+            pattern_finder, critic, conductor_policy, sentinel,
         ):
             agent.start()
             self._subagents[agent.name] = agent
