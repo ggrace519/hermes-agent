@@ -101,12 +101,18 @@ def _payload_text(payload) -> str:
     return str(payload)
 
 
-def _format_block(candidate: "RecallCandidate") -> str:
-    """Render one candidate as a recall-block string."""
+def _format_block(candidate: "RecallCandidate", *, provenance: "Optional[str]" = None) -> str:
+    """Render one candidate as a recall-block string.
+
+    ``provenance`` (e.g. ``"0.42 semantic"``) is appended as a ``· why:``
+    tag when supplied — opt-in via ``RECALL_SHOW_PROVENANCE`` so the
+    default block stays clean."""
     header = (
         f"[from {candidate.stream_name} at "
         f"{candidate.event_time_world.isoformat()}]"
     )
+    if provenance:
+        header += f"  · why: {provenance}"
     body = _payload_text(candidate.payload)
     return f"{header}\n{body}"
 
@@ -138,6 +144,9 @@ def compose_projection(
     *,
     token_budget: int,
     encoder_name: str = "cl100k_base",
+    dedup_threshold: float = 0.0,
+    provenance: "Optional[dict]" = None,
+    show_provenance: bool = False,
 ) -> tuple[str, "list[RecallCandidate]", int]:
     """Greedy fill ranked candidates into a token-budget-bounded text.
 
@@ -161,18 +170,33 @@ def compose_projection(
     """
     # Late imports keep this module light at import time.
     from agent.memory_manager import sanitize_context
+    from substrate.recall.projection import _jaccard, _tokenise
 
     if token_budget <= 0 or not ranked:
         return "", [], 0
 
     encoder = _get_encoder(encoder_name)
+    provenance = provenance or {}
     composed: list = []
     composed_blocks: list[str] = []
+    composed_token_sets: list[set] = []  # for MMR-style dedup
     tokens_used = 0
     separator_tokens_per_block = len(encoder.encode("\n\n"))
 
     for idx, candidate in enumerate(ranked):
-        block_raw = _format_block(candidate)
+        # MMR-style diversity: skip a near-duplicate of something already
+        # composed (kills repeated excerpts). The first candidate never
+        # dedups against an empty set.
+        if dedup_threshold > 0.0 and composed_token_sets:
+            cand_tokens = _tokenise(_payload_text(candidate.payload))
+            if cand_tokens and any(
+                _jaccard(cand_tokens, prev) >= dedup_threshold
+                for prev in composed_token_sets
+            ):
+                continue
+
+        prov = provenance.get(getattr(candidate, "slice_id", None)) if show_provenance else None
+        block_raw = _format_block(candidate, provenance=prov)
         # Sanitise BEFORE counting tokens so the strip count matches
         # the on-wire content. sanitize_context removes already-wrapped
         # <memory-context> spans + the system-note line.
@@ -185,6 +209,8 @@ def compose_projection(
         if tokens_used + prefix_cost + block_tokens <= token_budget:
             composed_blocks.append(block)
             composed.append(candidate)
+            if dedup_threshold > 0.0:
+                composed_token_sets.append(_tokenise(_payload_text(candidate.payload)))
             tokens_used += prefix_cost + block_tokens
             continue
 

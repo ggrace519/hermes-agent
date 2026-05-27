@@ -160,6 +160,72 @@ def _payload_text(payload) -> str:
     return str(payload)
 
 
+@dataclass(frozen=True)
+class ScoredCandidate:
+    """A ranked candidate with its composite score and ranking path.
+
+    ``path`` is ``"semantic"`` (cosine over embeddings) or ``"keyword"``
+    (Jaccard fallback) — surfaced for the "why was this injected?"
+    provenance the recall log records and the optional inline annotation.
+    """
+
+    candidate: RecallCandidate
+    score: float
+    path: str
+
+
+def rank_candidates_scored(
+    candidates: list[RecallCandidate],
+    query: str,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    t_now: datetime,
+    similarity_weight: Optional[float] = None,
+    keyword_overlap_weight: Optional[float] = None,
+    salience_weight: Optional[float] = None,
+    recency_weight: Optional[float] = None,
+    recency_half_life_hours: Optional[float] = None,
+) -> list["ScoredCandidate"]:
+    """Like :func:`rank_candidates` but returns each candidate with its
+    composite score + ranking path, highest first. The recall API uses
+    this to apply a relevance floor and record per-slice provenance;
+    :func:`rank_candidates` is the score-stripped convenience wrapper."""
+    sim_w = similarity_weight if similarity_weight is not None else DEFAULT_SIMILARITY_WEIGHT
+    kw_w = (
+        keyword_overlap_weight if keyword_overlap_weight is not None
+        else DEFAULT_KEYWORD_WEIGHT
+    )
+    sal_w = salience_weight if salience_weight is not None else DEFAULT_SALIENCE_WEIGHT
+    rec_w = recency_weight if recency_weight is not None else DEFAULT_RECENCY_WEIGHT
+    half_life = (
+        recency_half_life_hours if recency_half_life_hours is not None
+        else DEFAULT_RECENCY_HALF_LIFE_HOURS
+    )
+    if half_life <= 0:
+        half_life = 1e-9
+
+    query_tokens = _tokenise(query)
+    scored: list[tuple[float, float, ScoredCandidate]] = []
+    for c in candidates:
+        delta = t_now - c.event_time_world
+        age_hours = max(0.0, delta.total_seconds() / 3600.0)
+        recency = math.exp(-age_hours / half_life)
+        if query_embedding is not None and c.embedding is not None:
+            cos = _cosine(query_embedding, c.embedding)
+            sim_term = sim_w * ((cos + 1.0) / 2.0)
+            path = "semantic"
+        else:
+            payload_tokens = _tokenise(_payload_text(c.payload))
+            sim_term = kw_w * _jaccard(query_tokens, payload_tokens)
+            path = "keyword"
+        score = sal_w * float(c.salience_score) + rec_w * recency + sim_term
+        scored.append(
+            (-score, -c.event_time_world.timestamp(), ScoredCandidate(c, score, path))
+        )
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return [sc for _, _, sc in scored]
+
+
 def rank_candidates(
     candidates: list[RecallCandidate],
     query: str,
@@ -188,56 +254,29 @@ def rank_candidates(
 
     Tiebreak: more recent ``event_time_world`` wins.
 
-    Pure function: no SQL, no I/O. Per-candidate work is a single
-    1536-element dot product plus ~10 small string operations.
+    Pure function: no SQL, no I/O. Delegates to
+    :func:`rank_candidates_scored` and strips the scores.
     """
-    sim_w = similarity_weight if similarity_weight is not None else DEFAULT_SIMILARITY_WEIGHT
-    kw_w = (
-        keyword_overlap_weight if keyword_overlap_weight is not None
-        else DEFAULT_KEYWORD_WEIGHT
-    )
-    sal_w = salience_weight if salience_weight is not None else DEFAULT_SALIENCE_WEIGHT
-    rec_w = recency_weight if recency_weight is not None else DEFAULT_RECENCY_WEIGHT
-    half_life = (
-        recency_half_life_hours if recency_half_life_hours is not None
-        else DEFAULT_RECENCY_HALF_LIFE_HOURS
-    )
-    if half_life <= 0:
-        # Defensive: half_life of 0 would div-by-zero; treat as
-        # "recency doesn't matter" (decay term = 1 everywhere).
-        half_life = 1e-9
-
-    query_tokens = _tokenise(query)
-
-    scored: list[tuple[float, float, RecallCandidate]] = []
-    for c in candidates:
-        # Recency: exp decay on event-time age (hours).
-        delta = t_now - c.event_time_world
-        age_hours = max(0.0, delta.total_seconds() / 3600.0)
-        recency = math.exp(-age_hours / half_life)
-
-        # Similarity term — semantic if both sides have embeddings,
-        # keyword otherwise. Mixed batches are handled per-candidate.
-        if query_embedding is not None and c.embedding is not None:
-            cos = _cosine(query_embedding, c.embedding)
-            sim_term = sim_w * ((cos + 1.0) / 2.0)
-        else:
-            payload_tokens = _tokenise(_payload_text(c.payload))
-            sim_term = kw_w * _jaccard(query_tokens, payload_tokens)
-
-        score = sal_w * float(c.salience_score) + rec_w * recency + sim_term
-        # Sort key tuple — primary by -score (DESC), tiebreak by
-        # -event_time (more recent wins on equal score).
-        scored.append((-score, -c.event_time_world.timestamp(), c))
-
-    scored.sort(key=lambda t: (t[0], t[1]))
-    return [c for _, _, c in scored]
+    return [
+        sc.candidate
+        for sc in rank_candidates_scored(
+            candidates, query, query_embedding,
+            t_now=t_now,
+            similarity_weight=similarity_weight,
+            keyword_overlap_weight=keyword_overlap_weight,
+            salience_weight=salience_weight,
+            recency_weight=recency_weight,
+            recency_half_life_hours=recency_half_life_hours,
+        )
+    ]
 
 
 __all__ = [
     "RecallCandidate",
     "RecallProjection",
+    "ScoredCandidate",
     "rank_candidates",
+    "rank_candidates_scored",
     "DEFAULT_SIMILARITY_WEIGHT",
     "DEFAULT_KEYWORD_WEIGHT",
     "DEFAULT_SALIENCE_WEIGHT",

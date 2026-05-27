@@ -89,6 +89,22 @@ RECALL_TIMEOUT_MS = _envint("HERMES_RECALL_TIMEOUT_MS", default=300)
 RECALL_MIN_SALIENCE = _envfloat("HERMES_RECALL_MIN_SALIENCE", default=0.05)
 RECALL_CANDIDATE_LIMIT = _envint("HERMES_RECALL_CANDIDATE_LIMIT", default=50)
 
+# Precision controls (volume-vs-precision polish). After ranking, a
+# candidate is injected only if its composite score clears BOTH floors:
+#   * an absolute floor (drops near-zero, loosely-related slices), and
+#   * a relative floor = fraction of the top candidate's score (adapts
+#     across the semantic vs keyword score regimes — the strongest hit
+#     always survives, the long weak tail is dropped).
+RECALL_MIN_RELEVANCE = _envfloat("HERMES_RECALL_MIN_RELEVANCE", default=0.05)
+RECALL_RELATIVE_FLOOR = _envfloat("HERMES_RECALL_RELATIVE_FLOOR", default=0.4)
+# MMR-style diversity: skip a candidate whose payload token-overlap
+# (Jaccard) with an already-selected block exceeds this — kills
+# near-duplicate excerpts. 0 disables dedup.
+RECALL_DEDUP_THRESHOLD = _envfloat("HERMES_RECALL_DEDUP_THRESHOLD", default=0.8)
+# Inline a "· why: <score> <path>" provenance tag on each composed block.
+# Default off → clean block; the recall log records provenance regardless.
+RECALL_SHOW_PROVENANCE = _envbool("HERMES_RECALL_SHOW_PROVENANCE", default=False)
+
 # Phase D: L1 entity header in the recall projection (spec §7). When on,
 # the projection prepends a "## Known entities" block (top entities by
 # query-relevance + salience) ahead of the L0 quotes. Independent of
@@ -184,6 +200,10 @@ __all__ = [
     "RECALL_TIMEOUT_MS",
     "RECALL_MIN_SALIENCE",
     "RECALL_CANDIDATE_LIMIT",
+    "RECALL_MIN_RELEVANCE",
+    "RECALL_RELATIVE_FLOOR",
+    "RECALL_DEDUP_THRESHOLD",
+    "RECALL_SHOW_PROVENANCE",
     "RECALL_INCLUDE_L1",
     "RECALL_L1_LIMIT",
     "RECALL_SIMILARITY_WEIGHT",
