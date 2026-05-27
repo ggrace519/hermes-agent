@@ -306,6 +306,23 @@ async def recall(
         text = l1_header + ("\n\n" + text if text else "")
         tokens += header_tokens
 
+    # 4b. Opt-in skill suggestion (feedback #6) — append a compact
+    # "## Relevant skills" footer when the query maps to bundled skills.
+    # Default OFF so it never adds noise unless wanted; best-effort.
+    if _cfg.RECALL_SUGGEST_SKILLS and (query or "").strip():
+        try:
+            from substrate.skills_match import suggest_skills
+
+            hits = suggest_skills(query, limit=_cfg.RECALL_SKILL_LIMIT)
+            if hits:
+                footer = "## Relevant skills\n" + "\n".join(
+                    f"- {h['name']}" for h in hits
+                )
+                text = (text + "\n\n" + footer) if text else footer
+                tokens += max(1, len(footer) // 4)
+        except Exception as exc:  # pragma: no cover — best-effort
+            _log.debug("recall skill-suggestion failed: %s", exc)
+
     # 5. Reinforce hits (no await on failure — fire-and-forget).
     # Note: we await here for testability; the actual work is per-slice
     # rate-limited so this is short. A future async-only refactor can

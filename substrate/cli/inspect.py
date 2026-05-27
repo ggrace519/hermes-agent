@@ -78,6 +78,13 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
     forget_p.add_argument("slice_id")
     forget_p.set_defaults(func=_cmd_inspect_forget)
 
+    skills_p = substrate_sub.add_parser(
+        "skills", help="Suggest bundled skills relevant to a query/topic"
+    )
+    skills_p.add_argument("query", nargs="+", help="Topic words to match against skills")
+    skills_p.add_argument("--limit", type=int, default=5)
+    skills_p.set_defaults(func=_cmd_inspect_skills)
+
     slices_p = substrate_sub.add_parser(
         "slices", help="List the most-recent N slices on a given stream"
     )
@@ -357,6 +364,22 @@ def _cmd_inspect_unpin(args: argparse.Namespace) -> int:
 
 def _cmd_inspect_forget(args: argparse.Namespace) -> int:
     return _run_inspect(lambda conn: _do_forget_slice(conn, args.slice_id))
+
+
+def _cmd_inspect_skills(args: argparse.Namespace) -> int:
+    """Suggest bundled skills for a topic — filesystem-only, no DB needed."""
+    from substrate.skills_match import suggest_skills
+
+    query = " ".join(args.query)
+    results = suggest_skills(query, limit=args.limit, min_overlap=1)
+    if not results:
+        print(f"(no bundled skill matches {query!r})")
+        return 0
+    print(f"Skills relevant to {query!r}:")
+    for s in results:
+        desc = (s["description"] or "")[:90]
+        print(f"  • {s['name']}  (match {s['overlap']})  — {desc}")
+    return 0
 
 
 def _cmd_inspect_boot(args: argparse.Namespace) -> int:
