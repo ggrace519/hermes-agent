@@ -112,6 +112,12 @@ RECALL_SHOW_PROVENANCE = _envbool("HERMES_RECALL_SHOW_PROVENANCE", default=False
 RECALL_INCLUDE_L1 = _envbool("RECALL_INCLUDE_L1", default=True)
 RECALL_L1_LIMIT = _envint("RECALL_L1_LIMIT", default=5)
 
+# Skill suggestion in the recall projection (feedback #6). Opt-in (default
+# OFF) so it never adds noise to the per-turn block unless wanted; the
+# `hermes substrate skills <query>` CLI works regardless.
+RECALL_SUGGEST_SKILLS = _envbool("RECALL_SUGGEST_SKILLS", default=False)
+RECALL_SKILL_LIMIT = _envint("RECALL_SKILL_LIMIT", default=3)
+
 # Composite-score weights (must keep sum of three active terms in a
 # reasonable range; spec defaults sum to 1.0 for the active path).
 RECALL_SIMILARITY_WEIGHT = _envfloat("HERMES_RECALL_SIMILARITY_WEIGHT", default=0.3)
@@ -209,6 +215,8 @@ __all__ = [
     "RECALL_SHOW_PROVENANCE",
     "RECALL_INCLUDE_L1",
     "RECALL_L1_LIMIT",
+    "RECALL_SUGGEST_SKILLS",
+    "RECALL_SKILL_LIMIT",
     "RECALL_SIMILARITY_WEIGHT",
     "RECALL_KEYWORD_WEIGHT",
     "RECALL_SALIENCE_WEIGHT",
