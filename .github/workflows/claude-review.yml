@@ -65,7 +65,7 @@ jobs:
       - name: Run Claude code review
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # v1 schema: model selection goes into ``claude_args`` (passed
           # through to the underlying ``claude`` CLI). v0's top-level
           # ``model:`` input was removed.
