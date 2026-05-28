@@ -134,28 +134,17 @@ class Critic(SubAgent):
         return max(0.0, min(1.0, score))
 
     async def _record(self, signals: dict) -> None:
-        # Parser calibration (only when there's data).
-        if signals["parser_reliability"] is not None:
-            await l4.record_observation(
-                "calibration", "parser",
-                f"Parser ok-rate {signals['parser_reliability']:.0%} over "
-                f"{signals['parser_calls']} calls (24h)",
-                score=signals["parser_reliability"],
-                metadata={"calls": signals["parser_calls"]},
-            )
-        # Consolidation calibration.
-        await l4.record_observation(
-            "calibration", "consolidation",
-            f"{signals['pending']} slices awaiting parse, "
-            f"{signals['consolidated']} consolidated "
-            f"(backlog {signals['backlog_ratio']:.0%})",
-            score=1.0 - signals["backlog_ratio"],
-            metadata={"pending": signals["pending"], "consolidated": signals["consolidated"]},
-        )
-        # Cross-layer coherence vital sign.
+        # Parser + consolidation calibration are point-in-time operational
+        # status — time-series telemetry, NOT durable self-model. They go to
+        # ``substrate_telemetry`` via _emit_self_state. Writing them to L4 every
+        # assessment is what flooded it ("Parser ok-rate 97%" x68, etc.).
+        #
+        # L4 keeps only the coherence vital sign, and as a SINGLE maintained
+        # row (upsert) rather than one appended per assessment. The coherence
+        # *trend* lives in telemetry; L4 holds the current value so
+        # ``latest_coherence`` + the health rollup keep working.
         coherence = self._coherence(signals)
-        await l4.record_observation(
-            "coherence", "substrate",
+        await l4.upsert_coherence(
             f"coherence {coherence:.2f} "
             f"(backlog {signals['backlog_ratio']:.0%}, "
             f"alarms/1h {signals['alarms_1h']})",
@@ -174,6 +163,11 @@ class Critic(SubAgent):
                 payload={
                     "coherence": self._coherence(signals),
                     "backlog_ratio": signals["backlog_ratio"],
+                    "parser_reliability": signals["parser_reliability"],
+                    "parser_calls": signals["parser_calls"],
+                    "pending": signals["pending"],
+                    "consolidated": signals["consolidated"],
+                    "alarms_1h": signals["alarms_1h"],
                 },
             )
         except Exception:

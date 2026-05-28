@@ -157,11 +157,18 @@ class Reflector(SubAgent):
     def __init__(self, substrate: "Substrate") -> None:
         super().__init__(substrate)
         self._level = Level.LOW
+        # Change-gating (see PatternFinder). Gate on L1 — reflection follows
+        # new *knowledge*. Gating on L3 would be circular: the Reflector writes
+        # L3, which would re-trigger it off its own output.
+        self._last_run_mono: float = 0.0
+        self._last_l1_max_seen = None
 
     async def tick(self) -> None:
         if not _env_bool("HERMES_SUBSTRATE_REFLECTOR", default=True):
             return
         if self._level is Level.OFF:
+            return
+        if not await self._should_run():
             return
 
         context, have_material = await self._build_context()
@@ -194,6 +201,32 @@ class Reflector(SubAgent):
                 )
                 n_l4 += 1
         await self._emit_self_state(n_l3, n_l4, model)
+
+    async def _should_run(self) -> bool:
+        """Throttle + only reflect when L1 gained/updated entities since the
+        last run. Without this the Reflector re-synthesizes a static L3 every
+        tick, flooding L3/L4 with reworded near-duplicates (and partly feeding
+        on its own L3 output)."""
+        import asyncio
+
+        import hermes_db
+
+        interval = _env_int("REFLECTOR_INTERVAL_S", 600)
+        now_mono = asyncio.get_event_loop().time()
+        if self._last_run_mono and (now_mono - self._last_run_mono) < interval:
+            return False
+        async with hermes_db.connection() as conn:
+            l1_max = await conn.fetchval("SELECT max(last_seen_at) FROM l1_entities")
+        if (
+            l1_max is not None
+            and self._last_l1_max_seen is not None
+            and l1_max <= self._last_l1_max_seen
+        ):
+            self._last_run_mono = now_mono
+            return False
+        self._last_run_mono = now_mono
+        self._last_l1_max_seen = l1_max
+        return True
 
     async def _build_context(self) -> tuple[str, bool]:
         import hermes_db
