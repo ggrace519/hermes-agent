@@ -974,16 +974,19 @@ async def _print_health(conn: "asyncpg.Connection") -> None:
     elif boot:
         print(f"Boot:   ✓ {', '.join(sorted(boot))} OK")
 
-    # 3. Coherence vital sign (Critic / L4).
+    # 3. Coherence vital sign (Critic / L4). The Critic maintains a single
+    # coherence row via upsert, so freshness is ``last_seen_at`` (bumped each
+    # assessment) — NOT ``created_at`` (frozen at the row's first creation,
+    # which would make "assessed Xm ago" grow forever even while healthy).
     try:
         coh = await conn.fetchrow(
-            "SELECT score, created_at FROM l4_observations WHERE kind='coherence' "
-            "ORDER BY created_at DESC LIMIT 1"
+            "SELECT score, last_seen_at FROM l4_observations WHERE kind='coherence' "
+            "ORDER BY last_seen_at DESC LIMIT 1"
         )
     except Exception:
         coh = None
     if coh and coh["score"] is not None:
-        age = _age_str(coh["created_at"].isoformat(), now)
+        age = _age_str(coh["last_seen_at"].isoformat(), now)
         print(f"Coherence: {coh['score']:.2f}  (assessed {age})")
     else:
         print("Coherence: (no assessment — Critic off or not yet run)")

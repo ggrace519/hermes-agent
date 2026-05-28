@@ -80,6 +80,33 @@ async def test_layer_counts_present(booted):
 
 
 @pytest.mark.asyncio
+async def test_health_coherence_age_uses_last_seen_not_created(booted):
+    """The Critic upserts a single coherence row, so 'assessed Xago' must read
+    last_seen_at (bumped each assessment), not created_at (frozen at first
+    creation — which would grow forever even while the Critic is healthy)."""
+    import hermes_db
+
+    await l4.upsert_coherence("coherence 0.90", score=0.90)
+    # Backdate created_at far into the past; a fresh upsert bumps last_seen now.
+    async with hermes_db.connection() as conn:
+        await conn.execute(
+            "UPDATE l4_observations SET created_at = now() - interval '3 hours' "
+            "WHERE kind='coherence'"
+        )
+    await l4.upsert_coherence("coherence 0.91", score=0.91)
+
+    buf = io.StringIO()
+    async with hermes_db.connection() as conn:
+        with redirect_stdout(buf):
+            await inspect_mod._print_health(conn)
+    coh_line = next(
+        line for line in buf.getvalue().splitlines() if line.startswith("Coherence:")
+    )
+    assert "0.91" in coh_line
+    assert "h ago" not in coh_line, f"age used created_at, not last_seen: {coh_line!r}"
+
+
+@pytest.mark.asyncio
 async def test_layer_counts_exclude_substrate_streams(booted):
     """`health` L0 counts are perceptual-only. The historical
     substrate.self_state ghost rows must not inflate awaiting-parse /
