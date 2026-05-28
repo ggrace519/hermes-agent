@@ -219,6 +219,28 @@ def _resolve_default_model() -> str:
     return "text-embedding-3-small"
 
 
+def _resolve_dimensions() -> Optional[int]:
+    """Read ``auxiliary.embedding.dimensions`` from config — the output dim to
+    request from the provider (Matryoshka truncation for models that support
+    it, e.g. Qwen3-Embedding). ``None`` → let the model return its native dim.
+
+    Useful when a model's native dim exceeds pgvector's 2000-d index cap
+    (Qwen3-Embedding-4B is 2560): set ``dimensions: 1024`` to keep the column
+    indexable. The provider must honor the OpenAI ``dimensions`` param."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        block = (cfg.get("auxiliary") or {}).get("embedding") or {}
+        raw = block.get("dimensions")
+        if raw is not None:
+            d = int(raw)
+            if d > 0:
+                return d
+    except Exception:
+        pass
+    return None
+
+
 def _ensure_client():
     """Create the OpenAI-compatible AsyncClient on first use. Raises
     ``RuntimeError`` if no embedding provider is configured (the caller
@@ -266,8 +288,10 @@ async def embed(
     *,
     model: Optional[str] = None,
     timeout_ms: int = 800,
+    dimensions: Optional[int] = None,
 ) -> list[Optional[list[float]]]:
-    """Return one 1536-d unit vector per input. None per-item on failure.
+    """Return one embedding vector per input (model's dim, or the configured
+    ``dimensions``). None per-item on failure.
 
     Mock path: uses ``_mock_embed_one`` for each input. No network.
     Real path: single batch ``client.embeddings.create(...)`` call against
@@ -296,10 +320,18 @@ async def embed(
 
     if model is None:
         model = _resolve_default_model()
+    if dimensions is None:
+        dimensions = _resolve_dimensions()
+
+    # Only pass ``dimensions`` when set — providers/models that don't support
+    # MRL truncation reject the param, so omitting it keeps the default path.
+    create_kwargs: dict = {"model": model, "input": texts}
+    if dimensions is not None:
+        create_kwargs["dimensions"] = dimensions
 
     try:
         resp = await asyncio.wait_for(
-            client.embeddings.create(model=model, input=texts),
+            client.embeddings.create(**create_kwargs),
             timeout=timeout_ms / 1000.0,
         )
     except (asyncio.TimeoutError, Exception):
