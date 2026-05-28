@@ -84,7 +84,11 @@ async def test_critic_disabled_is_noop(booted, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_critic_records_coherence_and_calibration(booted, monkeypatch):
+async def test_critic_calibration_goes_to_telemetry_not_l4(booted, monkeypatch):
+    """Parser/consolidation calibration is point-in-time operational status →
+    substrate_telemetry, NOT durable self-model. L4 keeps only the coherence
+    vital sign (a single maintained row). Repeated status writes to L4 were
+    what flooded it."""
     import hermes_db
 
     monkeypatch.setenv("HERMES_SUBSTRATE_CRITIC", "1")
@@ -96,11 +100,32 @@ async def test_critic_records_coherence_and_calibration(booted, monkeypatch):
         )
     await Critic(booted).tick()
 
+    # Coherence vital sign is in L4.
     coh = await l4.latest_coherence()
     assert coh is not None and 0.0 <= coh.score <= 1.0
-    cal = await l4.list_observations(kind="calibration")
-    subjects = {o.subject for o in cal}
-    assert "parser" in subjects and "consolidation" in subjects
+    # Calibration is NO LONGER written to L4.
+    assert await l4.list_observations(kind="calibration") == []
+    # …it went to telemetry, with the status fields in the payload.
+    async with hermes_db.connection() as conn:
+        row = await conn.fetchrow(
+            "SELECT payload FROM substrate_telemetry "
+            "WHERE event='critic.assessed' ORDER BY at DESC LIMIT 1"
+        )
+    assert row is not None
+    assert "parser_reliability" in row["payload"]
+    assert "consolidated" in row["payload"]
+
+
+@pytest.mark.asyncio
+async def test_critic_coherence_is_single_maintained_row(booted, monkeypatch):
+    """Two assessments update ONE coherence row (upsert), not append two."""
+    monkeypatch.setenv("HERMES_SUBSTRATE_CRITIC", "1")
+    monkeypatch.setenv("CRITIC_INTERVAL_S", "0")  # allow back-to-back ticks
+    c = Critic(booted)
+    await c.tick()
+    await c.tick()
+    coh_rows = await l4.list_observations(kind="coherence", limit=100)
+    assert len(coh_rows) == 1
 
 
 @pytest.mark.asyncio

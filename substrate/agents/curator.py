@@ -38,6 +38,8 @@ from substrate.agents.base import Level, SubAgent
 # Module-level import so tests can monkeypatch
 # substrate.agents.curator.embed for the embedding-emit failure cases.
 from substrate.recall.embeddings import embed
+from substrate.l3 import store as l3
+from substrate.l4 import store as l4
 
 if TYPE_CHECKING:  # pragma: no cover
     from substrate.facade import Substrate
@@ -62,6 +64,19 @@ _ALARM_BATCH_LIMIT = 100
 # waiting an hour for the cooldown to expire.
 _ALARM_COOLDOWN_SECONDS = 3600
 
+# --- Upper-layer (L3/L4) curation — the Curator now curates patterns +
+# observations too, not just L0 slices. These were unbounded append-only
+# with exact-text-only dedup; the Curator semantically merges near-dupes
+# and decays→releases stale ones. Run on a slow interval (deep-cycle work).
+_CURATE_UPPER_INTERVAL_S = 3600.0       # hourly; far slower than the main tick
+_UPPER_MERGE_MAX_DISTANCE = 0.12        # cosine distance — merge at sim >= 0.88
+_UPPER_MERGE_SEEDS_PER_PASS = 50        # bounded work per pass (converges over passes)
+_UPPER_MERGE_NEIGHBORS = 25             # near-dups examined per seed
+_L3_HALF_LIFE_SECONDS = 7 * 86400.0     # patterns fade over ~a week unless reinforced
+_L4_HALF_LIFE_SECONDS = 3 * 86400.0     # self-notes fade faster
+_UPPER_RELEASE_FLOOR = 0.15             # release below this salience…
+_UPPER_STALE_SECONDS = 7 * 86400.0      # …if also not re-found within a week
+
 
 class Curator(SubAgent):
     """Real Phase B Curator. Tick body runs decay → release → alarm.
@@ -79,6 +94,15 @@ class Curator(SubAgent):
     RELEASE_BATCH_LIMIT = _RELEASE_BATCH_LIMIT
     ALARM_COOLDOWN_SECONDS = _ALARM_COOLDOWN_SECONDS
     ALARM_BATCH_LIMIT = _ALARM_BATCH_LIMIT
+    # Upper-layer curation knobs (class attrs so tests can override).
+    CURATE_UPPER_INTERVAL_S = _CURATE_UPPER_INTERVAL_S
+    UPPER_MERGE_MAX_DISTANCE = _UPPER_MERGE_MAX_DISTANCE
+    UPPER_MERGE_SEEDS_PER_PASS = _UPPER_MERGE_SEEDS_PER_PASS
+    UPPER_MERGE_NEIGHBORS = _UPPER_MERGE_NEIGHBORS
+    L3_HALF_LIFE_SECONDS = _L3_HALF_LIFE_SECONDS
+    L4_HALF_LIFE_SECONDS = _L4_HALF_LIFE_SECONDS
+    UPPER_RELEASE_FLOOR = _UPPER_RELEASE_FLOOR
+    UPPER_STALE_SECONDS = _UPPER_STALE_SECONDS
 
     def __init__(self, substrate: "Substrate") -> None:
         super().__init__(substrate)
@@ -96,6 +120,8 @@ class Curator(SubAgent):
         # respect RECALL_EMBEDDING_BACKFILL_INTERVAL_S regardless of
         # how fast the Curator's main tick cadence is.
         self._last_embed_backfill_at: float = 0.0
+        # Last L3/L4 curation pass (its own slow interval).
+        self._last_curate_upper_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Intensity floor — Phase B spec §8.3.
@@ -152,6 +178,10 @@ class Curator(SubAgent):
         # the Curator's main tick can run faster without hammering the
         # embedding API.
         await self._maybe_emit_embeddings()
+        # Upper-layer (L3/L4) curation — its own slow interval. Embed →
+        # semantic-merge near-dupes → decay → release. The Curator curates
+        # all memory layers, not just L0.
+        await self._maybe_curate_upper_layers()
 
     # ------------------------------------------------------------------
     # Decay — Phase B spec §4 + archived plan Task 5.2.
@@ -413,6 +443,123 @@ class Curator(SubAgent):
             # Persist failures outside the embedding transaction so a
             # bad slice can't block the rest of the batch from landing.
             await self._persist_failures_if_maxed(rows)
+
+    # ------------------------------------------------------------------
+    # Upper-layer (L3/L4) curation — embed → merge near-dupes → decay →
+    # release. The same decay/release lifecycle the Curator runs for L0,
+    # extended to patterns + self-model observations, plus semantic merge
+    # to collapse the LLM's reworded near-duplicates that exact-text dedup
+    # can't catch.
+    # ------------------------------------------------------------------
+
+    async def _maybe_curate_upper_layers(self) -> None:
+        now = time.monotonic()
+        if (now - self._last_curate_upper_at) < self.CURATE_UPPER_INTERVAL_S:
+            return
+        self._last_curate_upper_at = now
+        try:
+            await self._embed_backfill_upper(l3, "l3")
+            await self._embed_backfill_upper(l4, "l4")
+            await self._merge_l3()
+            await self._merge_l4()
+            await l3.decay(half_life_seconds=self.L3_HALF_LIFE_SECONDS)
+            await l4.decay(half_life_seconds=self.L4_HALF_LIFE_SECONDS)
+            await l3.release_stale(
+                floor=self.UPPER_RELEASE_FLOOR, stale_seconds=self.UPPER_STALE_SECONDS
+            )
+            await l4.release_stale(
+                floor=self.UPPER_RELEASE_FLOOR, stale_seconds=self.UPPER_STALE_SECONDS
+            )
+        except Exception:
+            # Best-effort enrichment — never crash the Curator tick.
+            self._log.debug("curator.curate_upper.degraded", exc_info=True)
+
+    async def _embed_backfill_upper(self, store, label: str) -> None:
+        """Embed unembedded L3/L4 statements so the merge pass can compare
+        them. Mirrors the L0 slice backfill; failures just retry next pass."""
+        from substrate import config as _cfg
+
+        rows = await store.list_unembedded(limit=_cfg.RECALL_EMBEDDING_BATCH_SIZE)
+        if not rows:
+            return
+        texts = [(r["statement"] or "") for r in rows]
+        embed_kwargs = {"timeout_ms": _cfg.RECALL_EMBEDDING_TIMEOUT_MS}
+        if _cfg.RECALL_EMBEDDING_MODEL is not None:
+            embed_kwargs["model"] = _cfg.RECALL_EMBEDDING_MODEL
+        try:
+            vectors = await embed(texts, **embed_kwargs)
+        except Exception as exc:
+            self._log.warning("curator %s embed batch raised: %s", label, exc)
+            return
+        for r, vec in zip(rows, vectors):
+            if vec is None:
+                continue
+            try:
+                await store.set_embedding(r["id"], vec)
+            except Exception:
+                self._log.debug(
+                    "curator %s set_embedding failed", label, exc_info=True
+                )
+
+    @staticmethod
+    def _pick_canonical(cluster: list[dict]) -> dict:
+        """Recency-weighted canonical: the most recently re-found entry wins
+        (so an updated value supersedes a stale near-duplicate), tie-broken by
+        salience."""
+        return max(cluster, key=lambda r: (r["last_seen_at"], r["salience_score"]))
+
+    async def _merge_l3(self) -> None:
+        seeds = await l3.list_merge_seeds(limit=self.UPPER_MERGE_SEEDS_PER_PASS)
+        absorbed: set = set()
+        for seed in seeds:
+            if seed["id"] in absorbed:
+                continue
+            dups = await l3.find_near_duplicates(
+                seed["id"],
+                max_distance=self.UPPER_MERGE_MAX_DISTANCE,
+                limit=self.UPPER_MERGE_NEIGHBORS,
+            )
+            dups = [d for d in dups if d["id"] not in absorbed]
+            if not dups:
+                continue
+            cluster = [seed] + dups
+            canonical = self._pick_canonical(cluster)
+            victims = [r for r in cluster if r["id"] != canonical["id"]]
+            cites = {str(c) for r in cluster for c in (r.get("cites") or [])}
+            salience = min(1.0, max(r["salience_score"] for r in cluster) + 0.05)
+            confidence = max(float(r.get("confidence") or 0.5) for r in cluster)
+            await l3.apply_merge(
+                canonical["id"], cites=sorted(cites),
+                salience=salience, confidence=confidence,
+            )
+            await l3.delete_patterns([v["id"] for v in victims])
+            absorbed.update(v["id"] for v in victims)
+            absorbed.add(canonical["id"])
+
+    async def _merge_l4(self) -> None:
+        seeds = await l4.list_merge_seeds(limit=self.UPPER_MERGE_SEEDS_PER_PASS)
+        absorbed: set = set()
+        for seed in seeds:
+            if seed["id"] in absorbed:
+                continue
+            dups = await l4.find_near_duplicates(
+                seed["id"],
+                max_distance=self.UPPER_MERGE_MAX_DISTANCE,
+                limit=self.UPPER_MERGE_NEIGHBORS,
+            )
+            dups = [d for d in dups if d["id"] not in absorbed]
+            if not dups:
+                continue
+            cluster = [seed] + dups
+            canonical = self._pick_canonical(cluster)
+            victims = [r for r in cluster if r["id"] != canonical["id"]]
+            salience = min(1.0, max(r["salience_score"] for r in cluster) + 0.05)
+            await l4.apply_merge(
+                canonical["id"], salience=salience, score=canonical.get("score"),
+            )
+            await l4.delete_observations([v["id"] for v in victims])
+            absorbed.update(v["id"] for v in victims)
+            absorbed.add(canonical["id"])
 
     def _record_embed_failure(self, slice_id: UUID) -> None:
         self._embed_failure_counts[slice_id] = (

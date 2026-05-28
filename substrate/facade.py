@@ -197,6 +197,10 @@ _EXPECTED_REVISIONS = frozenset(
         #   the substrate's own operational events; replaces the audit-slice
         #   writes to substrate.self_state that drove the L0 feedback loop).
         "20260527_0019",
+        # - ``20260527_0020`` — L3/L4 curation columns (embeddings for semantic
+        #   dedup; L4 salience_score + last_seen_at for decay). The Curator now
+        #   merges near-duplicate patterns/observations and decays→releases them.
+        "20260527_0020",
     }
 )
 
