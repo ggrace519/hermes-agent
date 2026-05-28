@@ -77,3 +77,25 @@ async def test_layer_counts_present(booted):
     for k in ("l0_passed", "l1_relationships", "l2_associations",
               "l3_patterns", "l4_observations"):
         assert k in counts
+
+
+@pytest.mark.asyncio
+async def test_layer_counts_exclude_substrate_streams(booted):
+    """`health` L0 counts are perceptual-only. The historical
+    substrate.self_state ghost rows must not inflate awaiting-parse /
+    backlog — that was the misleading 100% the operator saw post-fix."""
+    import hermes_db
+    from substrate.l0 import commit_slice
+
+    self_state = await booted.streams.get_by_name("substrate.self_state")
+    for i in range(4):
+        await commit_slice(
+            booted, self_state.stream_id, {"event": f"noise{i}"},
+            event_time_world=datetime.now(timezone.utc), born_passed=True,
+        )
+
+    async with hermes_db.connection() as conn:
+        counts = await inspect_mod._layer_counts(conn)
+    # Non-perceptual substrate.* slices count toward neither passed nor backlog.
+    assert counts["l0_passed"] == 0
+    assert counts["l0_pending_parse"] == 0
