@@ -46,13 +46,15 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
 
     reshape_p = embed_sub.add_parser(
         "reshape",
-        help="Reshape pgvector column to a new dimension + re-embed all slices",
+        help="Reshape ALL embedding columns to a new dimension + re-embed",
         description=(
-            "Change the substrate_slices.embedding column from its current "
-            "vector(N) shape to vector(<DIM>). Existing embeddings are NOT "
-            "convertible across dims and are cleared; the slices are then "
-            "re-embedded inline using the configured provider (see "
-            "auxiliary.embedding.* in config.yaml). Interactive y/N prompt "
+            "Change every substrate embedding column (substrate_slices and the "
+            "L3/L4 curation columns) from its current vector(N) shape to "
+            "vector(<DIM>) — they're kept in lockstep since the Curator embeds "
+            "all layers with one model. Existing embeddings are NOT convertible "
+            "across dims and are cleared; slices are re-embedded inline using "
+            "the configured provider (see auxiliary.embedding.* in config.yaml), "
+            "and L3/L4 by the Curator's curation pass. Interactive y/N prompt "
             "before any destructive work — pass --yes to skip."
         ),
     )
@@ -150,10 +152,18 @@ async def _reshape_async(
     reembed: bool,
     batch_size: int,
 ) -> int:
-    """Reshape the embedding column, optionally re-embed inline."""
+    """Reshape ALL substrate embedding columns to ``target``, optionally
+    re-embed slices inline.
+
+    Every layer that carries an embedding (``substrate_slices`` + the L3/L4
+    curation columns) is moved together — the Curator embeds them all with one
+    model, so a split dim would stall the L3/L4 backfill. Slices are re-embedded
+    inline here; L3/L4 are re-embedded by the Curator's curation pass (or
+    ``scripts/curate_upper_now.py``)."""
     import hermes_db
 
-    # 1. Read current schema dim.
+    # 1. Read current per-table dims (slices is required; L3/L4 may be absent
+    #    on a pre-0020 DB → skipped).
     current = await _current_schema_dim()
     if current is None:
         print(
@@ -163,8 +173,8 @@ async def _reshape_async(
         )
         return 1
 
-    # Count embedded + unembedded so the confirmation shows real numbers.
     async with hermes_db.connection() as conn:
+        dims = {t: await _table_vector_dim(conn, t) for t in _EMBEDDING_TABLES}
         embedded = await conn.fetchval(
             "SELECT count(*) FROM substrate_slices WHERE embedding IS NOT NULL"
         ) or 0
@@ -172,38 +182,31 @@ async def _reshape_async(
             "SELECT count(*) FROM substrate_slices WHERE embedding IS NULL"
         ) or 0
 
-    if current == target:
-        print(f"Embedding column is already vector({target}); nothing to do.")
+    to_reshape = [t for t, d in dims.items() if d is not None and d != target]
+    if not to_reshape:
+        print(f"All embedding columns are already vector({target}); nothing to do.")
         if unembedded > 0 and reembed:
             print(
-                f"Note: {unembedded} slice(s) still have NULL embeddings. "
-                "Run ``hermes embed reshape {target} --no-reembed=false`` "
-                "to force the backfill, or wait for the Curator's "
-                "background loop."
+                f"Note: {unembedded} slice(s) still have NULL embeddings — "
+                "wait for the Curator's backfill or re-run with re-embed on."
             )
         return 0
 
     # 2. Confirm.
     total = embedded + unembedded
-    print(
-        f"About to reshape substrate_slices.embedding: "
-        f"vector({current}) -> vector({target})"
-    )
-    print(f"  Existing embeddings: {embedded:,} (will be CLEARED)")
-    print(f"  Total slices:        {total:,}")
-    if reembed:
+    print(f"About to reshape embedding columns to vector({target}):")
+    for t in to_reshape:
+        print(f"  {t}: vector({dims[t]}) -> vector({target})  (embeddings CLEARED)")
+    print(f"  substrate_slices to re-embed: {total:,} "
+          f"({'inline' if reembed else 'Curator backfill'})")
+    if any(t != "substrate_slices" for t in to_reshape):
         print(
-            f"  Re-embed inline:    yes (batch size {batch_size}, using the "
-            "configured embedding provider — see substrate/recall/embeddings.py)"
-        )
-    else:
-        print(
-            "  Re-embed inline:    no (--no-reembed); Curator will backfill "
-            "on its normal cadence"
+            "  L3/L4 embeddings re-populate via the Curator's curation pass "
+            "(or scripts/curate_upper_now.py --execute)."
         )
     print(
-        "  Cost:               re-embed cost depends on your configured "
-        "provider (free for local Ollama; metered for cloud providers)"
+        "  Cost: re-embed cost depends on your provider (free for local; "
+        "metered for cloud)."
     )
 
     if interactive:
@@ -215,23 +218,12 @@ async def _reshape_async(
             print("Aborted.")
             return 1
 
-    # 3. Reshape (drop index, NULL embeddings, ALTER, recreate index).
-    print(f"Reshaping column to vector({target}) ...")
+    # 3. Reshape each table (drop index, NULL embeddings, ALTER, recreate index).
+    print(f"Reshaping {len(to_reshape)} column(s) to vector({target}) ...")
     async with hermes_db.transaction() as conn:
-        await conn.execute(
-            "DROP INDEX IF EXISTS substrate_slices_embedding_cosine_idx"
-        )
-        await conn.execute("UPDATE substrate_slices SET embedding = NULL")
-        await conn.execute(
-            f"ALTER TABLE substrate_slices "
-            f"ALTER COLUMN embedding TYPE vector({target})"
-        )
-        await conn.execute(
-            "CREATE INDEX substrate_slices_embedding_cosine_idx "
-            "ON substrate_slices USING ivfflat (embedding vector_cosine_ops) "
-            "WITH (lists = 100)"
-        )
-    print(f"  Done: vector({current}) -> vector({target}), index rebuilt.")
+        for t in to_reshape:
+            await _reshape_table(conn, t, target)
+            print(f"  {t}: vector({dims[t]}) -> vector({target}), index rebuilt.")
 
     # Drop the embeddings module's cached dim so the next embed() call
     # picks up the new shape.
@@ -244,13 +236,53 @@ async def _reshape_async(
     if not reembed:
         print(
             f"Reshape complete. {total:,} slice(s) marked for backfill — the "
-            "Curator will re-embed them on its next tick (typically every "
-            "30s during normal Hermes operation)."
+            "Curator re-embeds them on its next tick. L3/L4 re-embed via the "
+            "Curator's curation pass."
         )
         return 0
 
-    # 4. Inline re-embed pass with progress.
+    # 4. Inline re-embed pass over slices (L3/L4 left to the Curator).
     return await _backfill_inline(total=total, batch_size=batch_size)
+
+
+# All substrate tables carrying an embedding column. Kept in lockstep — the
+# Curator embeds every layer with one model, so their dims must match.
+_EMBEDDING_TABLES = ("substrate_slices", "l3_patterns", "l4_observations")
+
+
+async def _table_vector_dim(conn, table: str) -> "int | None":
+    """Live vector(N) dim of ``<table>.embedding``, or None if the column is
+    absent / not a vector. ``table`` is an internal constant (no injection)."""
+    assert table in _EMBEDDING_TABLES, f"unexpected table {table!r}"
+    row = await conn.fetchrow(
+        "SELECT format_type(atttypid, atttypmod) AS coltype FROM pg_attribute "
+        f"WHERE attrelid = '{table}'::regclass AND attname = 'embedding' "
+        "AND NOT attisdropped"
+    )
+    if row is None:
+        return None
+    coltype = row["coltype"] or ""
+    if not coltype.startswith("vector("):
+        return None
+    try:
+        return int(coltype[len("vector("):-1])
+    except (ValueError, IndexError):
+        return None
+
+
+async def _reshape_table(conn, table: str, target: int) -> None:
+    """Drop the cosine index, clear embeddings, alter the column dim, recreate
+    the index. ``table`` is an internal constant."""
+    assert table in _EMBEDDING_TABLES, f"unexpected table {table!r}"
+    await conn.execute(f"DROP INDEX IF EXISTS {table}_embedding_cosine_idx")
+    await conn.execute(f"UPDATE {table} SET embedding = NULL")
+    await conn.execute(
+        f"ALTER TABLE {table} ALTER COLUMN embedding TYPE vector({target})"
+    )
+    await conn.execute(
+        f"CREATE INDEX {table}_embedding_cosine_idx "
+        f"ON {table} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
+    )
 
 
 async def _current_schema_dim() -> int | None:

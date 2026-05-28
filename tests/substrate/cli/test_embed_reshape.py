@@ -151,6 +151,23 @@ async def test_reshape_no_reembed_leaves_nulls(seeded_substrate):
     assert all(r["embedding"] is None for r in rows)
 
 
+@pytest.mark.asyncio
+async def test_reshape_includes_upper_layers(seeded_substrate):
+    """reshape moves l3_patterns/l4_observations embedding too, not just
+    substrate_slices. Regression: leaving them at the old dim stalls the
+    Curator's L3/L4 backfill (1536-vs-768 mismatch incident)."""
+    import hermes_db
+
+    rc = await embed_cli._reshape_async(
+        target=1024, interactive=False, reembed=False, batch_size=10
+    )
+    assert rc == 0
+    async with hermes_db.connection() as conn:
+        for tbl in ("substrate_slices", "l3_patterns", "l4_observations"):
+            dim = await embed_cli._table_vector_dim(conn, tbl)
+            assert dim == 1024, f"{tbl} not reshaped to 1024 (got {dim})"
+
+
 # ---------------------------------------------------------------------------
 # Arg parser sanity — verify required+optional flags surface.
 # ---------------------------------------------------------------------------

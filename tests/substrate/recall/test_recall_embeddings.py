@@ -203,6 +203,70 @@ def test_schema_dim_cache_resets():
     assert embeddings._schema_dim_cache is None
 
 
+def test_resolve_dimensions_reads_config(monkeypatch):
+    """auxiliary.embedding.dimensions → MRL truncation request; absent → None."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"auxiliary": {"embedding": {"dimensions": 1024}}},
+    )
+    assert embeddings._resolve_dimensions() == 1024
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    assert embeddings._resolve_dimensions() is None
+
+
+@pytest.mark.asyncio
+async def test_embed_forwards_dimensions(monkeypatch):
+    """embed(dimensions=N) passes dimensions=N to the provider and returns
+    N-d vectors (MRL truncation for models like Qwen3-Embedding)."""
+    monkeypatch.delenv(embeddings.MOCK_ENV_VAR, raising=False)
+    captured: dict = {}
+
+    class _Emb:
+        async def create(self, **kw):
+            captured.update(kw)
+            n = kw.get("dimensions", 1536)
+            return type("R", (), {
+                "data": [type("D", (), {"embedding": [0.0] * n})() for _ in kw["input"]]
+            })()
+
+    monkeypatch.setattr(embeddings, "_ensure_client",
+                        lambda: type("C", (), {"embeddings": _Emb()})())
+
+    async def _dim():
+        return 1024
+    monkeypatch.setattr(embeddings, "_get_schema_dim", _dim)
+
+    out = await embeddings.embed(["a", "b"], model="m", dimensions=1024)
+    assert captured.get("dimensions") == 1024
+    assert len(out) == 2 and all(v is not None and len(v) == 1024 for v in out)
+
+
+@pytest.mark.asyncio
+async def test_embed_omits_dimensions_when_unconfigured(monkeypatch):
+    """No configured/passed dimensions → the param is not sent (so providers
+    that don't support MRL truncation aren't broken)."""
+    monkeypatch.delenv(embeddings.MOCK_ENV_VAR, raising=False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    captured: dict = {}
+
+    class _Emb:
+        async def create(self, **kw):
+            captured.update(kw)
+            return type("R", (), {
+                "data": [type("D", (), {"embedding": [0.0] * 1536})() for _ in kw["input"]]
+            })()
+
+    monkeypatch.setattr(embeddings, "_ensure_client",
+                        lambda: type("C", (), {"embeddings": _Emb()})())
+
+    async def _dim():
+        return 1536
+    monkeypatch.setattr(embeddings, "_get_schema_dim", _dim)
+
+    await embeddings.embed(["x"], model="m")
+    assert "dimensions" not in captured
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not os.environ.get(embeddings.API_KEY_ENV_VAR),
