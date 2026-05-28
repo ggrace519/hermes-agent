@@ -153,21 +153,24 @@ async def list_merge_seeds(*, limit: int, conn=None) -> list[dict]:
 
 
 async def find_near_duplicates(
-    seed_id: UUID, *, max_distance: float, limit: int, conn=None
+    seed_id: UUID, *, max_distance: float, limit: int, same_kind: bool = True, conn=None
 ) -> list[dict]:
-    """Patterns within cosine ``max_distance`` of ``seed_id`` and the SAME kind
-    (excluding the seed). Distance is computed server-side against the seed row,
-    so no embedding round-trips through Python."""
+    """Patterns within cosine ``max_distance`` of ``seed_id`` (excluding the
+    seed). With ``same_kind=True`` (default) restricts to the seed's kind; with
+    ``same_kind=False`` matches across kinds — used at a tighter distance to
+    fold the same fact stored under different kinds. Distance is computed
+    server-side against the seed row, so no embedding round-trips."""
+    kind_clause = "AND d.kind = s.kind" if same_kind else ""
     async with _acquire(conn) as c:
         rows = await c.fetch(
-            """
+            f"""
             SELECT d.id, d.statement, d.salience_score, d.confidence,
                    d.cites, d.last_seen_at,
                    (d.embedding <=> s.embedding) AS distance
               FROM l3_patterns d
               JOIN l3_patterns s ON s.id = $1
-             WHERE d.kind = s.kind
-               AND d.id <> s.id
+             WHERE d.id <> s.id
+               {kind_clause}
                AND d.embedding IS NOT NULL
                AND (d.embedding <=> s.embedding) <= $2
              ORDER BY d.embedding <=> s.embedding

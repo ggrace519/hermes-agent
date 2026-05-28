@@ -29,6 +29,7 @@ See [Phase B spec](https://github.com/ggrace519/llm-cognitive-thought/blob/main/
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -69,13 +70,29 @@ _ALARM_COOLDOWN_SECONDS = 3600
 # with exact-text-only dedup; the Curator semantically merges near-dupes
 # and decays→releases stale ones. Run on a slow interval (deep-cycle work).
 _CURATE_UPPER_INTERVAL_S = 3600.0       # hourly; far slower than the main tick
-_UPPER_MERGE_MAX_DISTANCE = 0.12        # cosine distance — merge at sim >= 0.88
+# within-kind merge distance. 0.18 (sim >= 0.82) — looser than the original
+# 0.12 because a stronger embedder (e.g. Qwen3-Embedding) separates distinct
+# facts well, so it's safe to fold more paraphrases. Env-tunable.
+_UPPER_MERGE_MAX_DISTANCE = 0.18
+# cross-kind merge distance — TIGHTER (near-identical only): the same fact
+# stored as generalization + theme + recurring_structure won't collapse
+# within-kind, so fold it across kinds when the text is nearly identical.
+# 0 disables cross-kind merging. Env-tunable.
+_UPPER_MERGE_CROSS_KIND_MAX_DISTANCE = 0.06
 _UPPER_MERGE_SEEDS_PER_PASS = 50        # bounded work per pass (converges over passes)
 _UPPER_MERGE_NEIGHBORS = 25             # near-dups examined per seed
 _L3_HALF_LIFE_SECONDS = 7 * 86400.0     # patterns fade over ~a week unless reinforced
 _L4_HALF_LIFE_SECONDS = 3 * 86400.0     # self-notes fade faster
 _UPPER_RELEASE_FLOOR = 0.15             # release below this salience…
 _UPPER_STALE_SECONDS = 7 * 86400.0      # …if also not re-found within a week
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
 
 
 class Curator(SubAgent):
@@ -97,6 +114,7 @@ class Curator(SubAgent):
     # Upper-layer curation knobs (class attrs so tests can override).
     CURATE_UPPER_INTERVAL_S = _CURATE_UPPER_INTERVAL_S
     UPPER_MERGE_MAX_DISTANCE = _UPPER_MERGE_MAX_DISTANCE
+    UPPER_MERGE_CROSS_KIND_MAX_DISTANCE = _UPPER_MERGE_CROSS_KIND_MAX_DISTANCE
     UPPER_MERGE_SEEDS_PER_PASS = _UPPER_MERGE_SEEDS_PER_PASS
     UPPER_MERGE_NEIGHBORS = _UPPER_MERGE_NEIGHBORS
     L3_HALF_LIFE_SECONDS = _L3_HALF_LIFE_SECONDS
@@ -122,6 +140,16 @@ class Curator(SubAgent):
         self._last_embed_backfill_at: float = 0.0
         # Last L3/L4 curation pass (its own slow interval).
         self._last_curate_upper_at: float = 0.0
+        # Merge thresholds are env-tunable (operators dial the merge
+        # aggressiveness without a redeploy; the accelerator script picks the
+        # same env up). Instance attrs so tests can still override directly.
+        self.UPPER_MERGE_MAX_DISTANCE = _env_float(
+            "HERMES_SUBSTRATE_MERGE_MAX_DISTANCE", _UPPER_MERGE_MAX_DISTANCE
+        )
+        self.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE = _env_float(
+            "HERMES_SUBSTRATE_MERGE_CROSS_KIND_DISTANCE",
+            _UPPER_MERGE_CROSS_KIND_MAX_DISTANCE,
+        )
 
     # ------------------------------------------------------------------
     # Intensity floor — Phase B spec §8.3.
@@ -514,11 +542,24 @@ class Curator(SubAgent):
         for seed in seeds:
             if seed["id"] in absorbed:
                 continue
+            # Within-kind at the (looser) main threshold…
             dups = await l3.find_near_duplicates(
                 seed["id"],
                 max_distance=self.UPPER_MERGE_MAX_DISTANCE,
                 limit=self.UPPER_MERGE_NEIGHBORS,
             )
+            # …plus near-identical matches ACROSS kinds (the same fact stored
+            # as generalization + theme + recurring_structure), at a tighter
+            # distance. 0 disables cross-kind merging.
+            if self.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE > 0:
+                seen = {d["id"] for d in dups}
+                cross = await l3.find_near_duplicates(
+                    seed["id"],
+                    max_distance=self.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE,
+                    limit=self.UPPER_MERGE_NEIGHBORS,
+                    same_kind=False,
+                )
+                dups += [d for d in cross if d["id"] not in seen]
             dups = [d for d in dups if d["id"] not in absorbed]
             if not dups:
                 continue
