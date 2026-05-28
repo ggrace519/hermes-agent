@@ -876,18 +876,40 @@ async def _layer_counts(conn: "asyncpg.Connection") -> dict:
         except Exception:
             return None  # table absent / not migrated this far
 
-    slice_states = await _slice_state_counts(conn)
-    consolidated = await _scalar(
-        "SELECT COUNT(*) FROM substrate_slices WHERE consolidation_state='consolidated'"
-    )
-    pending_parse = await _scalar(
-        "SELECT COUNT(*) FROM substrate_slices "
-        "WHERE consolidation_state='unconsolidated' AND sentinel_state='passed'"
-    )
+    # L0 counts are perceptual-only. ``substrate.*`` is the substrate's own
+    # operational telemetry (now in ``substrate_telemetry``), not memory
+    # awaiting consolidation — counting the historical ``substrate.self_state``
+    # ghost rows here is what made `health` report a permanent 100% backlog.
+    # See ``substrate.storage.streams.is_perceptual``. (The raw physical table
+    # state stays visible via the default ``hermes substrate`` summary and
+    # ``hermes substrate streams``.)
+    try:
+        l0 = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE sl.sentinel_state = 'passed')::int AS passed,
+                COUNT(*) FILTER (
+                    WHERE sl.consolidation_state = 'consolidated'
+                )::int AS consolidated,
+                COUNT(*) FILTER (
+                    WHERE sl.consolidation_state = 'unconsolidated'
+                      AND sl.sentinel_state = 'passed'
+                )::int AS pending_parse
+              FROM substrate_slices sl
+              JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE st.name NOT LIKE 'substrate.%'
+            """
+        )
+        l0_passed, l0_consolidated, l0_pending = (
+            l0["passed"], l0["consolidated"], l0["pending_parse"],
+        )
+    except Exception:
+        l0_passed = l0_consolidated = l0_pending = None
+
     return {
-        "l0_passed": slice_states.get("passed", 0),
-        "l0_consolidated": consolidated,
-        "l0_pending_parse": pending_parse,
+        "l0_passed": l0_passed,
+        "l0_consolidated": l0_consolidated,
+        "l0_pending_parse": l0_pending,
         "l1_entities": await _scalar("SELECT COUNT(*) FROM l1_entities"),
         "l1_relationships": await _scalar("SELECT COUNT(*) FROM l1_relationships"),
         "l2_associations": await _scalar("SELECT COUNT(*) FROM substrate_associations"),
