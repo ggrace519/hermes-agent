@@ -105,8 +105,6 @@ def _cmd_embed_help(args: argparse.Namespace) -> int:
 
 def _cmd_embed_reshape(args: argparse.Namespace) -> int:
     """Validate args, prompt for confirmation, then drive the reshape."""
-    import asyncio
-
     import hermes_db
 
     target = args.dim
@@ -124,25 +122,19 @@ def _cmd_embed_reshape(args: argparse.Namespace) -> int:
         )
         return 1
 
-    try:
-        return asyncio.get_event_loop().run_until_complete(
-            _reshape_async(
-                target=target,
-                interactive=not args.yes,
-                reembed=not args.no_reembed,
-                batch_size=args.batch_size,
-            )
+    # MUST drive via hermes_db.run_sync, not asyncio.get_event_loop() / asyncio.run:
+    # ensure_pool_sync() bound the asyncpg pool to hermes_db's persistent
+    # ``_sync_loop``. Running the coro on any other loop hits asyncpg's
+    # "another operation is in progress" / "attached to a different loop"
+    # cross-loop error (same failure class as the 2026-05-26 incident).
+    return hermes_db.run_sync(
+        _reshape_async(
+            target=target,
+            interactive=not args.yes,
+            reembed=not args.no_reembed,
+            batch_size=args.batch_size,
         )
-    except RuntimeError:
-        # No running loop — make one.
-        return asyncio.run(
-            _reshape_async(
-                target=target,
-                interactive=not args.yes,
-                reembed=not args.no_reembed,
-                batch_size=args.batch_size,
-            )
-        )
+    )
 
 
 async def _reshape_async(

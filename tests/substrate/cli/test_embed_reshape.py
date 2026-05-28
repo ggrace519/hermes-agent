@@ -173,6 +173,17 @@ async def test_reshape_includes_upper_layers(seeded_substrate):
 # ---------------------------------------------------------------------------
 
 
+def test_cmd_embed_reshape_drives_sync_loop(hermes_db_initialized_sync):
+    """Regression: the sync entrypoint must drive the coro via
+    hermes_db.run_sync (the loop the asyncpg pool is bound to), not a fresh
+    event loop — otherwise asyncpg raises 'another operation is in progress'
+    / 'attached to a different loop'. Exercise with a no-op (target == current
+    dim) so it runs the connection path without mutating the schema."""
+    args = argparse.Namespace(dim=1536, yes=True, no_reembed=True, batch_size=10)
+    rc = embed_cli._cmd_embed_reshape(args)
+    assert rc == 0  # would raise a cross-loop RuntimeError before the fix
+
+
 def test_reshape_parser_requires_dim():
     """``hermes embed reshape`` without DIM should fail with non-zero exit."""
     p = argparse.ArgumentParser()
