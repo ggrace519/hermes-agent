@@ -198,14 +198,22 @@ class SliceRepo:
         to other workers rather than blocking — exactly the semantics a
         batch-tick worker wants.
         """
+        # Perceptual streams only. substrate.* is the substrate's own
+        # operational telemetry (it lives in substrate_telemetry, not as
+        # slices) — but this JOIN is the airtight guard: even if a future
+        # component commits a born-pending slice on a substrate.* stream, the
+        # Sentinel never decides it 'passed' and so it can never enter the
+        # consolidation backlog. See substrate.storage.streams.is_perceptual.
         sql = """
-            SELECT * FROM substrate_slices
-             WHERE sentinel_state = 'pending'
-             ORDER BY pending_committed_at ASC NULLS LAST
+            SELECT sl.* FROM substrate_slices sl
+              JOIN substrate_streams st ON st.stream_id = sl.stream_id
+             WHERE sl.sentinel_state = 'pending'
+               AND st.name NOT LIKE 'substrate.%'
+             ORDER BY sl.pending_committed_at ASC NULLS LAST
              LIMIT $1
         """
         if lock:
-            sql += " FOR UPDATE SKIP LOCKED"
+            sql += " FOR UPDATE OF sl SKIP LOCKED"
         rows = await conn.fetch(sql, limit)
         return [_slice_from_row(r) for r in rows]
 

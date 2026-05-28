@@ -24,7 +24,6 @@ wake anticipation — MVS §3.6) remains deferred research, flagged for review.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from substrate.agents.base import Level, SubAgent
@@ -135,10 +134,17 @@ class AdaptiveConductor(SubAgent):
             row = await conn.fetchrow(
                 """
                 SELECT COUNT(*) FILTER (
-                          WHERE consolidation_state='unconsolidated'
-                            AND sentinel_state='passed')::int AS pending,
-                       COUNT(*) FILTER (WHERE consolidation_state='consolidated')::int AS done
-                  FROM substrate_slices
+                          WHERE sl.consolidation_state='unconsolidated'
+                            AND sl.sentinel_state='passed')::int AS pending,
+                       COUNT(*) FILTER (WHERE sl.consolidation_state='consolidated')::int AS done
+                  FROM substrate_slices sl
+                  JOIN substrate_streams st ON st.stream_id = sl.stream_id
+                 -- Only perceptual streams count as consolidation backlog.
+                 -- substrate.* is the substrate's own operational telemetry
+                 -- (now in substrate_telemetry); counting it here is what
+                 -- pinned the Parser HIGH against an undrainable 414k-slice
+                 -- backlog. See substrate.storage.streams.is_perceptual.
+                   AND st.name NOT LIKE 'substrate.%'
                 """
             )
         denom = row["pending"] + row["done"]
@@ -184,27 +190,20 @@ class AdaptiveConductor(SubAgent):
         }
 
     async def _emit_self_state(self, signals: dict, targets: dict) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="conductor",
+                event="conductor.dialed",
                 payload={
-                    "event": "conductor.dialed",
                     "backlog_ratio": signals["backlog_ratio"],
                     "targets": {k: v.value for k, v in targets.items()},
-                    "at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "conductor"},
             )
         except Exception:
-            self._log.debug("conductor.self_state.emit_failed", exc_info=True)
+            self._log.debug("conductor.telemetry.emit_failed", exc_info=True)
 
 
 __all__ = ["AdaptiveConductor"]

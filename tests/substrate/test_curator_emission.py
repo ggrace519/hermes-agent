@@ -1,8 +1,9 @@
-"""Tests for Curator self-state emission — spec §10.4.
+"""Tests for Curator telemetry emission.
 
-Every release and every alarm produces one ``substrate.self_state``
-slice with the schemas in spec §7.2. Audit emissions run AFTER the
-relevant transaction commits.
+Every release and every alarm produces one ``substrate_telemetry`` row
+(operational telemetry, non-perceptual — they used to be slices on
+``substrate.self_state``, which fed the L0 feedback loop). Emissions run
+AFTER the relevant transaction commits.
 """
 
 from __future__ import annotations
@@ -58,9 +59,8 @@ async def _register_profile(
 
 
 @pytest.mark.asyncio
-async def test_release_emits_self_state_slice(substrate):
-    """One release → one ``curator.release`` slice on
-    ``substrate.self_state`` with all the spec §7.2 keys."""
+async def test_release_emits_telemetry(substrate):
+    """One release → one ``curator.release`` row in ``substrate_telemetry``."""
     import hermes_db
 
     profile_id = await _register_profile(substrate.pool, "test-emit-rel")
@@ -100,27 +100,24 @@ async def test_release_emits_self_state_slice(substrate):
     async with hermes_db.connection() as conn:
         rows = await conn.fetch(
             """
-            SELECT sl.payload
-              FROM substrate_slices sl
-              JOIN substrate_streams st ON st.stream_id = sl.stream_id
-             WHERE st.name = 'substrate.self_state'
-               AND sl.payload->>'event' = 'curator.release'
-               AND sl.payload->>'slice_id' = $1
+            SELECT event, payload
+              FROM substrate_telemetry
+             WHERE event = 'curator.release'
+               AND payload->>'slice_id' = $1
             """,
             str(slice_id),
         )
     assert len(rows) == 1
+    assert rows[0]["event"] == "curator.release"
     payload = rows[0]["payload"]
-    assert payload["event"] == "curator.release"
     assert payload["slice_id"] == str(slice_id)
     assert payload["stream_id"] == str(stream.stream_id)
     assert payload["tombstone_policy"] == "thin"
     assert payload["salience_at_release"] == pytest.approx(0.01, abs=0.001)
-    assert "released_at" in payload
 
 
 @pytest.mark.asyncio
-async def test_alarm_emits_self_state_slice(substrate):
+async def test_alarm_emits_telemetry(substrate):
     import hermes_db
 
     profile_id = await _register_profile(
@@ -171,18 +168,16 @@ async def test_alarm_emits_self_state_slice(substrate):
     async with hermes_db.connection() as conn:
         rows = await conn.fetch(
             """
-            SELECT sl.payload
-              FROM substrate_slices sl
-              JOIN substrate_streams st ON st.stream_id = sl.stream_id
-             WHERE st.name = 'substrate.self_state'
-               AND sl.payload->>'event' = 'curator.pathological_forgetting_alarm'
-               AND sl.payload->>'slice_id' = $1
+            SELECT event, payload
+              FROM substrate_telemetry
+             WHERE event = 'curator.pathological_forgetting_alarm'
+               AND payload->>'slice_id' = $1
             """,
             str(slice_id),
         )
     assert len(rows) == 1
+    assert rows[0]["event"] == "curator.pathological_forgetting_alarm"
     payload = rows[0]["payload"]
-    assert payload["event"] == "curator.pathological_forgetting_alarm"
     assert payload["slice_id"] == str(slice_id)
     assert payload["age_seconds"] >= 60
     assert payload["consolidation_window_seconds"] == 60
@@ -190,13 +185,12 @@ async def test_alarm_emits_self_state_slice(substrate):
     # the alarm-amplification fix, alarm no longer modifies salience —
     # the field now records the current (unchanged) salience for audit.
     assert payload["bumped_to"] == pytest.approx(0.4, abs=0.001)
-    assert "alarmed_at" in payload
 
 
 @pytest.mark.asyncio
 async def test_no_emit_when_nothing_to_audit(substrate):
     """Quiet tick (nothing to release, nothing to alarm) produces zero
-    ``substrate.self_state`` slices from the curator path."""
+    ``curator.*`` telemetry rows."""
     import hermes_db
 
     curator = Curator(substrate)
@@ -205,12 +199,7 @@ async def test_no_emit_when_nothing_to_audit(substrate):
 
     async with hermes_db.connection() as conn:
         n = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM substrate_slices sl
-              JOIN substrate_streams st ON st.stream_id = sl.stream_id
-             WHERE st.name = 'substrate.self_state'
-               AND sl.payload->>'event' LIKE 'curator.%'
-            """
+            "SELECT COUNT(*) FROM substrate_telemetry WHERE event LIKE 'curator.%'"
         )
     assert n == 0
 

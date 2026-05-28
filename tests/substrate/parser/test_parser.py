@@ -139,14 +139,12 @@ async def test_parser_extracts_persists_consolidates(booted, monkeypatch):
         )
     assert unconsolidated == 0 and consolidated == 6
 
-    # Audit log + self-state slice.
+    # Audit log + parser.extracted telemetry row.
     ok = await _parser_log_rows("ok")
     assert len(ok) == 1 and ok[0]["entities_emitted"] == 2 and ok[0]["slices_consolidated"] == 6
     async with hermes_db.connection() as conn:
         selfstate = await conn.fetchval(
-            "SELECT COUNT(*) FROM substrate_slices sl JOIN substrate_streams st "
-            "ON st.stream_id=sl.stream_id WHERE st.name='substrate.self_state' "
-            "AND sl.payload->>'event'='parser.extracted'"
+            "SELECT COUNT(*) FROM substrate_telemetry WHERE event='parser.extracted'"
         )
     assert selfstate == 1
 

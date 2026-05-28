@@ -15,7 +15,6 @@ partition per matched row.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from substrate.agents.base import Level, SubAgent
@@ -31,10 +30,10 @@ class ForceRejectWorker(SubAgent):
     frequently enough to bound it, but we're not burning CPU on what
     is hopefully a rarely-fired path.
 
-    Audit: one slice on ``substrate.self_state`` per dropped slice.
-    Each audit lists the dropped slice's id, stream, and the reason
-    code ``force_reject_ttl`` so a human investigator can correlate
-    with the producing path.
+    Audit: one row in ``substrate_telemetry`` per dropped slice (operational
+    telemetry, not a perceptual slice). Each row lists the dropped slice's
+    id, stream, and the reason code ``force_reject_ttl`` so a human
+    investigator can correlate with the producing path.
     """
 
     name = "force-reject"
@@ -70,38 +69,24 @@ class ForceRejectWorker(SubAgent):
             await self._emit_audit(s)
 
     async def _emit_audit(self, slice_obj) -> None:
-        """Emit one audit slice per force-rejection. ``slice_obj`` is
-        already-deleted; the audit row references it by id only."""
-        from substrate.l0.api import commit_slice
-
-        self_state = await self._substrate.streams.get_by_name(
-            "substrate.self_state"
-        )
-        if self_state is None:
-            self._log.warning(
-                "substrate.self_state stream missing; can't emit audit"
-            )
-            return
+        """Emit one telemetry row per force-rejection. ``slice_obj`` is
+        already-deleted; the row references it by id only."""
+        from substrate.telemetry import write as telemetry_write
 
         # The deleted slice's metadata contains caller context the
         # auditor likely wants — copy it through so an investigator
-        # can correlate via metadata.session_id etc.
-        await commit_slice(
+        # can correlate via original_metadata.session_id etc.
+        await telemetry_write(
             self._substrate,
-            stream_id=self_state.stream_id,
+            agent="force-reject",
+            event="force_reject_ttl",
             payload={
-                "event": "force_reject_ttl",
                 "slice_id": str(slice_obj.slice_id),
                 "stream_id": str(slice_obj.stream_id),
                 "payload_modality": slice_obj.payload_modality.value,
                 "pending_since": slice_obj.pending_committed_at.isoformat()
                 if slice_obj.pending_committed_at
                 else None,
-            },
-            event_time_world=datetime.now(timezone.utc),
-            metadata={
-                "agent": "force-reject",
-                "reason": "force_reject_ttl",
                 "original_metadata": slice_obj.metadata,
             },
         )
