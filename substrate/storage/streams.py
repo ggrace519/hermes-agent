@@ -29,6 +29,44 @@ if TYPE_CHECKING:  # pragma: no cover
 _MAX_CACHE_ENTRIES = 256
 
 
+# ---------------------------------------------------------------------------
+# Perceptual / non-perceptual boundary.
+#
+# The awareness loop (Sentinel → Parser → Curator → recall, and the
+# Conductor's backlog forecast that drives them) must only ever see
+# *perception*: exteroceptive input (``hermes.world.*``) and first-class
+# self-actions/-state (``hermes.self_action.*`` / ``hermes.self_state.*``).
+#
+# The substrate also records its own *operational* decisions — Conductor
+# dials, Sentinel batch summaries, Curator releases/alarms, and the L1–L4
+# cognitive agents' activity. Those are telemetry, not perception. They are
+# namespaced ``substrate.*`` (today only ``substrate.self_state``) and now
+# live in ``substrate_telemetry`` (see :mod:`substrate.telemetry`).
+#
+# Treating operational telemetry as perception closed a self-sustaining
+# feedback loop (2026-05-26→27 prod incident, 414k ghost slices): each
+# emission counted as consolidation backlog, the Conductor pinned the
+# Parser HIGH and emitted another event, and the events could never drain.
+# This predicate is the schema-level guard so a *future* component writing
+# to any ``substrate.*`` stream can't re-open the loop.
+def is_perceptual(stream_name: str) -> bool:
+    """True if ``stream_name`` feeds the awareness loop.
+
+    ``substrate.*`` streams are the substrate's own operational telemetry
+    and must be excluded from every awareness-loop query (backlog forecast,
+    consolidation/pending counts, the Sentinel pending selector, recall).
+    Everything else — ``hermes.*`` — is genuine perception.
+    """
+    return not stream_name.startswith("substrate.")
+
+
+# SQL form of :func:`is_perceptual` for awareness-loop queries that JOIN
+# ``substrate_streams st``. Inline it as ``AND st.name NOT LIKE 'substrate.%'``
+# (with a comment pointing here). Kept literal rather than templated because
+# the predicate is trivial and the surrounding queries inline stream-name
+# filters the same way.
+
+
 class StreamRepo:
     """Registration + lookup for substrate streams.
 

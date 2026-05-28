@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
@@ -152,26 +151,17 @@ class Dreamer(SubAgent):
         return None
 
     async def _emit_self_state(self, seed: str) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
-                payload={
-                    "event": "dreamer.explored",
-                    "seed": seed[:120],
-                    "at": now.isoformat(),
-                },
-                event_time_world=now,
-                metadata={"agent": "dreamer"},
+                agent="dreamer",
+                event="dreamer.explored",
+                payload={"seed": seed[:120]},
             )
         except Exception:
-            self._log.debug("dreamer.self_state.emit_failed", exc_info=True)
+            self._log.debug("dreamer.telemetry.emit_failed", exc_info=True)
 
 
 __all__ = ["Dreamer", "append_dream", "list_dreams", "_dream"]

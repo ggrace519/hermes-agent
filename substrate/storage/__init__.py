@@ -14,7 +14,7 @@ from substrate.storage.decay_profiles import (
     DecayProfileRepo,
 )
 from substrate.storage.slices import ReleaseRecord, SliceRepo
-from substrate.storage.streams import StreamRepo
+from substrate.storage.streams import StreamRepo, is_perceptual
 from substrate.storage.types import (
     Address,
     ConsolidationState,
@@ -47,4 +47,5 @@ __all__ = [
     "Stream",
     "StreamRepo",
     "TombstonePolicy",
+    "is_perceptual",
 ]

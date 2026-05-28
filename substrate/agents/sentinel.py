@@ -17,7 +17,6 @@ contract are unchanged.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from substrate.agents import sentinel_defense
@@ -99,53 +98,41 @@ class StubSentinel(SubAgent):
             decisions = [self._decide(s) for s in batch]
             await self._substrate.slices.decide_many(conn, decisions)
 
-        # 2) Emit the batch summary on substrate.self_state. This is
-        #    its own commit (no shared txn) so the audit landing is
-        #    independent of the Sentinel batch transaction.
+        # 2) Record the batch summary as operational telemetry (NOT a
+        #    perceptual slice). Outside the batch txn so a slow write
+        #    doesn't extend the lock window.
         await self._emit_batch_summary(batch, decisions)
 
     async def _emit_batch_summary(self, batch: list, decisions: list) -> None:
-        """Emit one structured-event slice summarising the batch.
+        """Record one telemetry row summarising the batch.
 
-        The audit row keeps the slice IDs as strings (UUIDs are not
-        JSON-natively serialisable; the codec round-trips dicts but
-        each leaf has to be JSON-compatible). With defense on, the
-        summary records how many slices were quarantined and why.
+        Slice IDs are kept as strings (UUIDs aren't JSON-native). With
+        defense on, the summary records how many slices were quarantined
+        and why.
+
+        Writes to ``substrate_telemetry`` (non-perceptual), not as a slice
+        on ``substrate.self_state``. This is what closes the historical
+        self-audit recursion: a telemetry row never enters the pending
+        queue, so the Sentinel's next tick can't pick it up and emit an
+        audit-about-the-audit. (2026-05-26 incident: 398k self-audit
+        slices in ~12 hours, when these were born-pending L0 slices.)
         """
-        from substrate.l0.api import commit_slice
-
-        self_state = await self._substrate.streams.get_by_name(
-            "substrate.self_state"
-        )
-        if self_state is None:
-            self._log.warning(
-                "substrate.self_state stream missing; can't emit audit"
-            )
-            return
+        from substrate.telemetry import write as telemetry_write
 
         quarantined = [d for d in decisions if d[1] is SentinelState.QUARANTINED]
         passed = len(decisions) - len(quarantined)
 
-        await commit_slice(
+        await telemetry_write(
             self._substrate,
-            stream_id=self_state.stream_id,
+            agent="sentinel",
+            event="sentinel_batch_decision",
             payload={
-                "event": "sentinel_batch_decision",
                 "count": len(batch),
                 "passed": passed,
                 "quarantined": len(quarantined),
                 "quarantine_reasons": [d[3] for d in quarantined if d[3]],
                 "slice_ids": [str(s.slice_id) for s in batch],
             },
-            event_time_world=datetime.now(timezone.utc),
-            metadata={"agent": "sentinel"},
-            # MANDATORY: without born_passed=True this audit slice
-            # lands in 'pending' state and the Sentinel's next tick
-            # picks it up, decides it 'passed', emits ANOTHER audit
-            # about that audit — recursing forever. 2026-05-26 prod
-            # incident: 398k self-audit slices in ~12 hours. See the
-            # ``commit_slice`` docstring for the full rationale.
-            born_passed=True,
         )
 
 

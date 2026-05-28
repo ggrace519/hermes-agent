@@ -1,9 +1,9 @@
 """Tests for the four Phase A sub-agent stubs:
 
 * StubSentinel — passes every pending slice with a modality-derived
-  trust score; emits batch-summary audit on substrate.self_state.
+  trust score; records a batch-summary audit in substrate_telemetry.
 * ForceRejectWorker — deletes slices past their stream's pending_ttl;
-  emits force_reject_ttl audit per dropped slice.
+  records a force_reject_ttl audit (telemetry) per dropped slice.
 * PartitionMaintenanceWorker — ensures rolling-window monthly
   partitions; fixed-cadence 24h tick regardless of intensity.
 * StubConductor — pure data holder, per-agent intensity levels.
@@ -99,8 +99,8 @@ async def test_sentinel_transitions_pending_to_passed(substrate):
 
 @pytest.mark.asyncio
 async def test_sentinel_emits_batch_summary(substrate):
-    """After the batch tick, the substrate.self_state stream gets a
-    summary slice listing the decided slice IDs."""
+    """After the batch tick, a ``sentinel_batch_decision`` telemetry row
+    records the decided slice IDs (operational telemetry, not a slice)."""
     import hermes_db
 
     stream = await substrate.streams.register(
@@ -118,45 +118,35 @@ async def test_sentinel_emits_batch_summary(substrate):
     sentinel = StubSentinel(substrate)
     await sentinel.tick()
 
-    self_state = await substrate.streams.get_by_name("substrate.self_state")
-    # No ``::jsonb`` cast — pass the filter dict as a bind parameter so
-    # the pool's JSONB codec handles encode. The Phase 0 ADR explicitly
-    # bans ``::jsonb`` casts because they corrupt asyncpg's statement
-    # type cache.
     async with hermes_db.connection() as conn:
         audit = await conn.fetchrow(
             """
-            SELECT payload, metadata
-              FROM substrate_slices
-             WHERE stream_id = $1
-               AND payload @> $2
-             ORDER BY ingest_time_world DESC
+            SELECT agent, event, payload
+              FROM substrate_telemetry
+             WHERE event = 'sentinel_batch_decision'
+             ORDER BY at DESC
              LIMIT 1
-            """,
-            self_state.stream_id,
-            {"event": "sentinel_batch_decision"},
+            """
         )
     assert audit is not None
+    assert audit["agent"] == "sentinel"
     payload = audit["payload"]
-    assert payload["event"] == "sentinel_batch_decision"
     assert payload["count"] >= 1
     assert isinstance(payload["slice_ids"], list)
-    assert audit["metadata"]["agent"] == "sentinel"
 
 
 @pytest.mark.asyncio
-async def test_sentinel_audit_does_not_reenter_pending_queue(substrate):
-    """Regression: the Sentinel's own ``sentinel_batch_decision`` audit
-    slices must NOT re-enter the pending queue. Without the
-    ``born_passed=True`` fix on ``commit_slice``, every audit commits
-    as pending → the next ``tick()`` picks them up → emits MORE
-    audits-of-audits → unbounded recursion. The 2026-05-26 production
-    incident accumulated 398,014 self-audit slices in ~12 hours.
+async def test_sentinel_audit_is_telemetry_not_a_slice(substrate):
+    """Regression (2026-05-26→27 incident): the Sentinel's
+    ``sentinel_batch_decision`` audit must NOT be a slice on
+    ``substrate.self_state``. It used to be a born-pending L0 slice the
+    next tick re-decided → audits-of-audits → 414k-slice runaway. It is now
+    a ``substrate_telemetry`` row, so it can never re-enter the pending
+    queue.
 
-    This test commits one ordinary pending slice, runs the Sentinel
-    twice, and asserts that the second tick is a no-op (no new audit
-    emitted) because the first tick's audit is born-passed and never
-    matches ``list_pending``.
+    Commit one ordinary pending slice, tick the Sentinel twice, and assert
+    the audit is a telemetry row (not a self_state slice) and the second
+    tick adds no new audit (nothing pending left to re-decide).
     """
     import hermes_db
 
@@ -175,62 +165,52 @@ async def test_sentinel_audit_does_not_reenter_pending_queue(substrate):
     self_state = await substrate.streams.get_by_name("substrate.self_state")
 
     sentinel = StubSentinel(substrate)
-    # First tick decides the seeded slice + emits one audit.
+    # First tick decides the seeded slice + records one telemetry audit.
     await sentinel.tick()
     async with hermes_db.connection() as conn:
-        after_first = await conn.fetchval(
-            """
-            SELECT count(*) FROM substrate_slices
-             WHERE stream_id = $1 AND payload @> $2
-            """,
-            self_state.stream_id,
-            {"event": "sentinel_batch_decision"},
+        telem_after_first = await conn.fetchval(
+            "SELECT count(*) FROM substrate_telemetry "
+            "WHERE event = 'sentinel_batch_decision'"
         )
-        # And: zero pending rows anywhere (the audit must NOT be pending).
-        pending_audits = await conn.fetchval(
-            """
-            SELECT count(*) FROM substrate_slices
-             WHERE stream_id = $1
-               AND sentinel_state = 'pending'
-            """,
+        # The audit is NOT a slice: nothing on substrate.self_state, and no
+        # pending slices anywhere (so list_pending can't pick an audit up).
+        self_state_slices = await conn.fetchval(
+            "SELECT count(*) FROM substrate_slices WHERE stream_id = $1",
             self_state.stream_id,
         )
-    assert after_first == 1, "First tick emitted exactly one audit slice"
-    assert pending_audits == 0, (
-        f"Sentinel's own audit slice landed in pending state "
-        f"({pending_audits} pending audits) — would feed back into "
-        f"list_pending and cause unbounded recursion."
+        pending_any = await conn.fetchval(
+            "SELECT count(*) FROM substrate_slices WHERE sentinel_state = 'pending'"
+        )
+    assert telem_after_first == 1, "First tick recorded exactly one telemetry audit"
+    assert self_state_slices == 0, (
+        "audit must be a telemetry row, not a substrate.self_state slice"
+    )
+    assert pending_any == 0, (
+        "no slice left pending → no audit-of-audit re-entry is possible"
     )
 
-    # Second tick. With the fix, there's nothing pending → no audit.
-    # Without the fix, the audit from tick #1 is pending → Sentinel
-    # would emit a second audit referencing it.
+    # Second tick: nothing pending to decide → returns before emitting.
     await sentinel.tick()
     async with hermes_db.connection() as conn:
-        after_second = await conn.fetchval(
-            """
-            SELECT count(*) FROM substrate_slices
-             WHERE stream_id = $1 AND payload @> $2
-            """,
-            self_state.stream_id,
-            {"event": "sentinel_batch_decision"},
+        telem_after_second = await conn.fetchval(
+            "SELECT count(*) FROM substrate_telemetry "
+            "WHERE event = 'sentinel_batch_decision'"
         )
-    assert after_second == 1, (
-        f"Second Sentinel tick emitted another audit (total now "
-        f"{after_second}) — the audit-of-audit loop is back."
+    assert telem_after_second == 1, (
+        f"Second Sentinel tick recorded another audit (total now "
+        f"{telem_after_second}) — the audit-of-audit loop is back."
     )
 
 
 @pytest.mark.asyncio
 async def test_sentinel_empty_pending_queue_is_noop(substrate):
-    """A tick with no pending slices does not emit an audit slice."""
+    """A tick with no pending slices does not record an audit."""
     import hermes_db
 
-    self_state = await substrate.streams.get_by_name("substrate.self_state")
     async with hermes_db.connection() as conn:
         before = await conn.fetchval(
-            "SELECT count(*) FROM substrate_slices WHERE stream_id = $1",
-            self_state.stream_id,
+            "SELECT count(*) FROM substrate_telemetry "
+            "WHERE event = 'sentinel_batch_decision'"
         )
 
     sentinel = StubSentinel(substrate)
@@ -238,8 +218,8 @@ async def test_sentinel_empty_pending_queue_is_noop(substrate):
 
     async with hermes_db.connection() as conn:
         after = await conn.fetchval(
-            "SELECT count(*) FROM substrate_slices WHERE stream_id = $1",
-            self_state.stream_id,
+            "SELECT count(*) FROM substrate_telemetry "
+            "WHERE event = 'sentinel_batch_decision'"
         )
     assert after == before
 
@@ -339,25 +319,20 @@ async def test_force_reject_deletes_expired_pending(substrate):
         )
     assert gone == 0  # row deleted
 
-    # Audit emitted on substrate.self_state. JSONB filter via param,
-    # not ``::jsonb`` cast (Phase 0 ADR).
-    self_state = await substrate.streams.get_by_name("substrate.self_state")
+    # Audit recorded as a force_reject_ttl telemetry row (non-perceptual).
     async with hermes_db.connection() as conn:
         audit = await conn.fetchrow(
             """
-            SELECT payload, metadata
-              FROM substrate_slices
-             WHERE stream_id = $1
-               AND payload @> $2
-             ORDER BY ingest_time_world DESC
+            SELECT agent, event, payload
+              FROM substrate_telemetry
+             WHERE event = 'force_reject_ttl'
+             ORDER BY at DESC
              LIMIT 1
-            """,
-            self_state.stream_id,
-            {"event": "force_reject_ttl"},
+            """
         )
     assert audit is not None
+    assert audit["agent"] == "force-reject"
     assert audit["payload"]["slice_id"] == str(slice_id)
-    assert audit["metadata"]["reason"] == "force_reject_ttl"
 
 
 @pytest.mark.asyncio
@@ -392,21 +367,18 @@ async def test_force_reject_leaves_unexpired_pending(substrate):
 
 @pytest.mark.asyncio
 async def test_force_reject_empty_queue_no_audit(substrate):
-    """No expired rows → no audit slices emitted."""
+    """No expired rows → no force_reject_ttl telemetry recorded."""
     import hermes_db
 
-    self_state = await substrate.streams.get_by_name("substrate.self_state")
     async with hermes_db.connection() as conn:
         before = await conn.fetchval(
-            "SELECT count(*) FROM substrate_slices WHERE stream_id = $1",
-            self_state.stream_id,
+            "SELECT count(*) FROM substrate_telemetry WHERE event = 'force_reject_ttl'"
         )
     worker = ForceRejectWorker(substrate)
     await worker.tick()
     async with hermes_db.connection() as conn:
         after = await conn.fetchval(
-            "SELECT count(*) FROM substrate_slices WHERE stream_id = $1",
-            self_state.stream_id,
+            "SELECT count(*) FROM substrate_telemetry WHERE event = 'force_reject_ttl'"
         )
     assert after == before
 

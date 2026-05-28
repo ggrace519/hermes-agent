@@ -23,7 +23,6 @@ later build on.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from substrate.agents.base import Level, SubAgent
@@ -91,20 +90,24 @@ class Critic(SubAgent):
             backlog = await conn.fetchrow(
                 """
                 SELECT COUNT(*) FILTER (
-                          WHERE consolidation_state='unconsolidated'
-                            AND sentinel_state='passed')::int AS pending,
-                       COUNT(*) FILTER (WHERE consolidation_state='consolidated')::int AS done
-                  FROM substrate_slices
+                          WHERE sl.consolidation_state='unconsolidated'
+                            AND sl.sentinel_state='passed')::int AS pending,
+                       COUNT(*) FILTER (WHERE sl.consolidation_state='consolidated')::int AS done
+                  FROM substrate_slices sl
+                  JOIN substrate_streams st ON st.stream_id = sl.stream_id
+                 -- perceptual streams only; substrate.* is operational
+                 -- telemetry (see substrate.storage.streams.is_perceptual).
+                   AND st.name NOT LIKE 'substrate.%'
                 """
             )
+            # Curator alarms now live in substrate_telemetry (non-perceptual),
+            # not as slices on substrate.self_state.
             alarms = await conn.fetchval(
                 """
                 SELECT COUNT(*)::int
-                  FROM substrate_slices sl
-                  JOIN substrate_streams st ON st.stream_id = sl.stream_id
-                 WHERE st.name = 'substrate.self_state'
-                   AND sl.payload->>'event' = 'curator.pathological_forgetting_alarm'
-                   AND sl.ingest_time_world > now() - interval '1 hour'
+                  FROM substrate_telemetry
+                 WHERE event = 'curator.pathological_forgetting_alarm'
+                   AND at > now() - interval '1 hour'
                 """
             )
         reliability = (pr["ok"] / pr["total"]) if pr["total"] else None
@@ -161,27 +164,20 @@ class Critic(SubAgent):
         )
 
     async def _emit_self_state(self, signals: dict) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="critic",
+                event="critic.assessed",
                 payload={
-                    "event": "critic.assessed",
                     "coherence": self._coherence(signals),
                     "backlog_ratio": signals["backlog_ratio"],
-                    "at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "critic"},
             )
         except Exception:
-            self._log.debug("critic.self_state.emit_failed", exc_info=True)
+            self._log.debug("critic.telemetry.emit_failed", exc_info=True)
 
 
 __all__ = ["Critic"]

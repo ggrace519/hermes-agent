@@ -193,6 +193,10 @@ _EXPECTED_REVISIONS = frozenset(
         "20260527_0017",
         # - ``20260527_0018`` — slice pinning (decay-immune memories).
         "20260527_0018",
+        # - ``20260527_0019`` — substrate_telemetry (non-perceptual sink for
+        #   the substrate's own operational events; replaces the audit-slice
+        #   writes to substrate.self_state that drove the L0 feedback loop).
+        "20260527_0019",
     }
 )
 

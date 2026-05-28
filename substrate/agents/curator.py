@@ -213,42 +213,30 @@ class Curator(SubAgent):
             )
 
     async def _emit_release_audit(self, released: list["ReleaseRecord"]) -> None:
-        """Emit one ``curator.release`` slice on ``substrate.self_state``
-        per released slice. Bounded by the LIMIT in evaluate_releases.
+        """Record one ``curator.release`` telemetry row per released slice.
+        Bounded by the LIMIT in evaluate_releases. Runs after the release
+        UPDATE has already committed.
 
-        Lookup-then-loop pattern matches Phase A's Sentinel batch
-        summary. The audit commits in its own connection — the release
-        UPDATE has already committed before we get here.
+        Operational telemetry (``substrate_telemetry``), not a perceptual
+        slice — emitting these to ``substrate.self_state`` is what fed the
+        L0 feedback loop.
         """
         if not released:
             return
 
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name(
-            "substrate.self_state"
-        )
-        if self_state is None:
-            self._log.warning(
-                "substrate.self_state stream missing; can't emit release audit"
-            )
-            return
-
-        now = datetime.now(timezone.utc)
         for r in released:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="curator",
+                event="curator.release",
                 payload={
-                    "event": "curator.release",
                     "slice_id": str(r.slice_id),
                     "stream_id": str(r.stream_id),
                     "tombstone_policy": r.tombstone_policy,
                     "salience_at_release": float(r.salience_at_release),
-                    "released_at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "curator"},
             )
 
     # ------------------------------------------------------------------
@@ -283,11 +271,16 @@ class Curator(SubAgent):
            a slice the foreground keeps re-contacting doesn't need
            pathological-forgetting alarms either.
 
-        3. Exclude alarms on the ``substrate.self_state`` stream
-           itself — alarm audit slices live there, and without this
-           exclusion they age past their own consolidation_window and
-           become alarm-eligible, producing a feedback loop that
-           saturated the curator at 900+ alarms/hour in production.
+        3. Exclude every ``substrate.*`` stream — these carry the
+           substrate's own operational telemetry (and historically the
+           alarm/release audit slices themselves), which is non-perceptual
+           and must never be alarm-eligible. Without the exclusion those
+           slices age past their own consolidation_window and become
+           alarm-eligible, a feedback loop that saturated the curator at
+           900+ alarms/hour in production. (Operational events now go to
+           ``substrate_telemetry``; this guard remains for the historical
+           ``substrate.self_state`` rows and any future ``substrate.*``
+           stream — see ``substrate.storage.streams.is_perceptual``.)
         """
         import hermes_db
 
@@ -306,7 +299,7 @@ class Curator(SubAgent):
                    AND sl.consolidation_state = 'unconsolidated'
                    AND sl.ingest_time_world + dp.consolidation_window < now()
                    AND sl.salience_updated_at < now() - make_interval(secs => $2)
-                   AND st.name != 'substrate.self_state'
+                   AND st.name NOT LIKE 'substrate.%'
                  ORDER BY sl.ingest_time_world ASC
                  LIMIT $1
                  FOR UPDATE OF sl SKIP LOCKED
@@ -459,38 +452,26 @@ class Curator(SubAgent):
                 self._embed_failure_counts.pop(sid, None)
 
     async def _emit_alarm_audit(self, alarmed: list[dict]) -> None:
-        """Emit one ``curator.pathological_forgetting_alarm`` slice on
-        ``substrate.self_state`` per alarmed slice."""
+        """Record one ``curator.pathological_forgetting_alarm`` telemetry
+        row per alarmed slice. Operational telemetry (``substrate_telemetry``),
+        not a perceptual slice."""
         if not alarmed:
             return
 
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name(
-            "substrate.self_state"
-        )
-        if self_state is None:
-            self._log.warning(
-                "substrate.self_state stream missing; can't emit alarm audit"
-            )
-            return
-
-        now = datetime.now(timezone.utc)
         for a in alarmed:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="curator",
+                event="curator.pathological_forgetting_alarm",
                 payload={
-                    "event": "curator.pathological_forgetting_alarm",
                     "slice_id": str(a["slice_id"]),
                     "stream_id": str(a["stream_id"]),
                     "age_seconds": a["age_seconds"],
                     "consolidation_window_seconds": a["window_seconds"],
                     "bumped_to": a["bumped_to"],
-                    "alarmed_at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "curator"},
             )
 
 

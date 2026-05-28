@@ -161,27 +161,20 @@ class Associator(SubAgent):
         return n
 
     async def _emit_self_state(self, n_entities: int, n_edges: int) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="associator",
+                event="associator.linked",
                 payload={
-                    "event": "associator.linked",
                     "entities_processed": n_entities,
                     "edges_touched": n_edges,
-                    "at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "associator"},
             )
         except Exception:
-            self._log.debug("associator.self_state.emit_failed", exc_info=True)
+            self._log.debug("associator.telemetry.emit_failed", exc_info=True)
 
 
 __all__ = ["Associator"]

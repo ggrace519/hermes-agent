@@ -217,11 +217,13 @@ async def test_alarm_cooldown_suppresses_repeat_alarms(substrate):
 
 @pytest.mark.asyncio
 async def test_alarm_excludes_substrate_self_state_stream(substrate):
-    """Alarm audit slices live on ``substrate.self_state``. Without
-    excluding that stream from the alarm-eligible set, alarm slices
-    age past their own consolidation_window and become alarm-eligible
-    themselves — producing a feedback loop that saturated production
-    at 900+ alarms/hour."""
+    """Every ``substrate.*`` stream is excluded from the alarm-eligible
+    set. Operational telemetry now lives in ``substrate_telemetry``, but
+    the historical ``substrate.self_state`` slices (and any future
+    ``substrate.*`` stream) must still never be alarm-eligible: without
+    the exclusion they age past their own consolidation_window and become
+    alarm-eligible themselves — the feedback loop that saturated
+    production at 900+ alarms/hour."""
     # The ``substrate.self_state`` stream is seeded by Alembic. Look it
     # up rather than registering a duplicate.
     self_state = await substrate.streams.get_by_name("substrate.self_state")

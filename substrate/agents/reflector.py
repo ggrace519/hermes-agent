@@ -19,7 +19,6 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from substrate.agents.base import Level, SubAgent
@@ -226,28 +225,21 @@ class Reflector(SubAgent):
         return "\n".join(lines), True
 
     async def _emit_self_state(self, n_l3, n_l4, model) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="reflector",
+                event="reflector.synthesized",
                 payload={
-                    "event": "reflector.synthesized",
                     "l3_reflections": n_l3,
                     "l4_notes": n_l4,
                     "model": model,
-                    "at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "reflector"},
             )
         except Exception:
-            self._log.debug("reflector.self_state.emit_failed", exc_info=True)
+            self._log.debug("reflector.telemetry.emit_failed", exc_info=True)
 
 
 __all__ = ["Reflector", "Reflection", "ReflectorResult", "_coerce", "_synthesize"]

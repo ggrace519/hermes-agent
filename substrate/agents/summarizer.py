@@ -234,23 +234,17 @@ class Summarizer(SubAgent):
         return get_async_text_auxiliary_client("summarizer")
 
     async def _emit_self_state(self, session_id, n) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
-                payload={"event": "summarizer.compressed", "session_id": session_id,
-                         "slices_summarized": n, "at": now.isoformat()},
-                event_time_world=now,
-                metadata={"agent": "summarizer"},
+                agent="summarizer",
+                event="summarizer.compressed",
+                payload={"session_id": session_id, "slices_summarized": n},
             )
         except Exception:
-            self._log.debug("summarizer.self_state.emit_failed", exc_info=True)
+            self._log.debug("summarizer.telemetry.emit_failed", exc_info=True)
 
 
 def _text(payload) -> str:

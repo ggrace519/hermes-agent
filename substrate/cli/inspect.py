@@ -1540,6 +1540,9 @@ async def _print_curator_summary(conn: "asyncpg.Connection") -> None:
           FROM substrate_slices sl
           JOIN substrate_streams st ON st.stream_id = sl.stream_id
           JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
+         -- perceptual streams only; substrate.* is operational telemetry
+         -- (substrate_telemetry), not memory pending consolidation.
+         WHERE st.name NOT LIKE 'substrate.%'
         """
     )
     print(f"Pending consolidation:        {pending['total']:,} slices")
@@ -1552,15 +1555,15 @@ async def _print_curator_summary(conn: "asyncpg.Connection") -> None:
     print()
 
     # Recent curator emissions over last hour. Counts per event kind.
+    # Curator emissions are operational telemetry (substrate_telemetry),
+    # not perceptual slices.
     recent = await conn.fetch(
         """
-        SELECT sl.payload->>'event' AS event, COUNT(*)::int AS n
-          FROM substrate_slices sl
-          JOIN substrate_streams st ON st.stream_id = sl.stream_id
-         WHERE st.name = 'substrate.self_state'
-           AND sl.ingest_time_world > now() - interval '1 hour'
-           AND sl.payload->>'event' LIKE 'curator.%'
-         GROUP BY sl.payload->>'event'
+        SELECT event, COUNT(*)::int AS n
+          FROM substrate_telemetry
+         WHERE at > now() - interval '1 hour'
+           AND event LIKE 'curator.%'
+         GROUP BY event
         """
     )
     recent_by_event = {r["event"]: r["n"] for r in recent}
@@ -1589,6 +1592,8 @@ async def _print_curator_histogram(conn: "asyncpg.Connection") -> None:
               JOIN substrate_decay_profiles dp ON dp.profile_id = st.decay_profile_id
              WHERE sl.consolidation_state <> 'released'
                AND sl.sentinel_state = 'passed'
+               -- perceptual streams only (substrate.* is operational telemetry).
+               AND st.name NOT LIKE 'substrate.%'
         )
         SELECT profile, bucket, COUNT(*)::int AS n
           FROM bucketed
@@ -1621,15 +1626,13 @@ async def _print_curator_histogram(conn: "asyncpg.Connection") -> None:
 async def _print_curator_recent(
     conn: "asyncpg.Connection", *, limit: int
 ) -> None:
-    """Most-recent N curator.* emissions on substrate.self_state."""
+    """Most-recent N curator.* emissions from substrate_telemetry."""
     rows = await conn.fetch(
         """
-        SELECT sl.ingest_time_world, sl.payload
-          FROM substrate_slices sl
-          JOIN substrate_streams st ON st.stream_id = sl.stream_id
-         WHERE st.name = 'substrate.self_state'
-           AND sl.payload->>'event' LIKE 'curator.%'
-         ORDER BY sl.ingest_time_world DESC
+        SELECT at, event, payload
+          FROM substrate_telemetry
+         WHERE event LIKE 'curator.%'
+         ORDER BY at DESC
          LIMIT $1
         """,
         limit,
@@ -1639,8 +1642,8 @@ async def _print_curator_recent(
         return
     print(f"Most-recent {len(rows)} curator emissions:")
     for r in rows:
-        ev = r["payload"].get("event", "?")
-        ts = r["ingest_time_world"].isoformat() if r["ingest_time_world"] else "-"
+        ev = r["event"]
+        ts = r["at"].isoformat() if r["at"] else "-"
         if ev == "curator.release":
             extra = (
                 f"slice={r['payload'].get('slice_id', '?')[:8]} "

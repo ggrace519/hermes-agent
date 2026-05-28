@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from substrate.agents.base import Level, SubAgent
@@ -217,30 +216,23 @@ class Parser(SubAgent):
     # ------------------------------------------------------------------
 
     async def _emit_self_state(self, session_id, result, batch_size, model) -> None:
-        from substrate.l0.api import commit_slice
+        from substrate.telemetry import write as telemetry_write
 
-        self_state = await self._substrate.streams.get_by_name("substrate.self_state")
-        if self_state is None:
-            return
-        now = datetime.now(timezone.utc)
         try:
-            await commit_slice(
+            await telemetry_write(
                 self._substrate,
-                stream_id=self_state.stream_id,
+                agent="parser",
+                event="parser.extracted",
                 payload={
-                    "event": "parser.extracted",
                     "session_id": session_id,
                     "batch_size": batch_size,
                     "entities_emitted": len(result.entities),
                     "relationships_emitted": len(result.relationships),
                     "model": model,
-                    "at": now.isoformat(),
                 },
-                event_time_world=now,
-                metadata={"agent": "parser"},
             )
         except Exception:
-            self._log.debug("parser.self_state.emit_failed", exc_info=True)
+            self._log.debug("parser.telemetry.emit_failed", exc_info=True)
 
     async def _audit_log(
         self, outcome, session_id, batch_size, elapsed_s, *,
