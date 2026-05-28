@@ -201,6 +201,10 @@ _EXPECTED_REVISIONS = frozenset(
         #   dedup; L4 salience_score + last_seen_at for decay). The Curator now
         #   merges near-duplicate patterns/observations and decays→releases them.
         "20260527_0020",
+        # - ``20260527_0021`` — align l3/l4 embedding dim to substrate_slices
+        #   (fixes the 1536-vs-768 mismatch when HERMES_EMBEDDING_DIM was unset
+        #   at 0020 apply time, which stalled the upper-layer embed backfill).
+        "20260527_0021",
     }
 )
 
