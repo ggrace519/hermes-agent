@@ -115,3 +115,48 @@ async def test_patternfinder_change_gating(substrate, monkeypatch):
     assert await pf._should_run() is False  # no new L1 since → skip
     await l1.upsert_entity("Thing2", "concept")
     assert await pf._should_run() is True   # new L1 → run again
+
+
+@pytest.mark.asyncio
+async def test_cross_kind_merge_collapses_same_fact(substrate):
+    """The same fact stored under different kinds (theme vs generalization) is
+    NOT caught by within-kind merge, but the tight cross-kind pass folds it."""
+    a, _ = await l3.upsert_pattern(
+        "UniFi uses modern and legacy endpoints", "theme", cites=["e1"]
+    )
+    b, _ = await l3.upsert_pattern(
+        "UniFi relies on modern and legacy endpoints", "generalization", cites=["e2"]
+    )
+    await l3.set_embedding(a, _vec(1, 0))
+    await l3.set_embedding(b, _vec(1, 0))   # identical → cross-kind near-dup
+
+    c = Curator(substrate)
+    c.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE = 0.1   # enable cross-kind
+    await c._merge_l3()
+
+    remaining = await l3.list_patterns(limit=100)
+    assert len(remaining) == 1, "cross-kind near-dupes should collapse to one"
+    assert set(remaining[0].cites) == {"e1", "e2"}
+
+
+@pytest.mark.asyncio
+async def test_cross_kind_disabled_keeps_separate(substrate):
+    """Cross-kind merging off (distance 0) → the same fact in two kinds stays."""
+    a, _ = await l3.upsert_pattern("X via A and B", "theme")
+    b, _ = await l3.upsert_pattern("X relies on A and B", "generalization")
+    await l3.set_embedding(a, _vec(1, 0))
+    await l3.set_embedding(b, _vec(1, 0))
+
+    c = Curator(substrate)
+    c.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE = 0.0   # disabled
+    await c._merge_l3()
+    assert len(await l3.list_patterns(limit=100)) == 2
+
+
+def test_merge_thresholds_env_tunable(monkeypatch):
+    """The merge distances are operator-tunable via env (no redeploy)."""
+    monkeypatch.setenv("HERMES_SUBSTRATE_MERGE_MAX_DISTANCE", "0.25")
+    monkeypatch.setenv("HERMES_SUBSTRATE_MERGE_CROSS_KIND_DISTANCE", "0.09")
+    c = Curator(None)  # these attrs don't touch the DB
+    assert c.UPPER_MERGE_MAX_DISTANCE == 0.25
+    assert c.UPPER_MERGE_CROSS_KIND_MAX_DISTANCE == 0.09
