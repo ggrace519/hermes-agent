@@ -237,6 +237,162 @@ def test_pg_port_detection_handles_dual_stack_bindings() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Installer robustness: (1) never silently reuse a stale postgres data volume,
+# and (2) fail loudly when the dependency sync left a half-built venv. See
+# scripts/install.sh::_warn_or_reset_pg_volume / choose_pg_port / verify_core_deps.
+#
+# Background: a "fresh" install on a new machine inherited a leftover postgres
+# named volume (hermes_pg_data). choose_pg_port removed the OLD container to
+# reclaim its port, but the named VOLUME persisted and the new compose-up
+# re-attached it — so the install inherited a stale alembic_version whose
+# schema didn't match this checkout, exploding mid-migration with a cryptic
+# UndefinedTableError. Separately, an interrupted `uv sync` left a venv missing
+# core deps (alembic/sqlalchemy/asyncpg are BASE deps, not extras) yet the
+# install proceeded to the migration step and failed obscurely.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_db_flag_is_parsed() -> None:
+    """``--reset-db`` must be wired into the arg-parsing switch and set a
+    dedicated flag variable; otherwise the operator has no way to opt into
+    a clean database."""
+    text = _read_install_sh()
+    assert "--reset-db)" in text, (
+        "--reset-db must appear as a case in the argument-parsing switch."
+    )
+    assert "RESET_DB=true" in text, (
+        "--reset-db must set RESET_DB=true so downstream volume handling "
+        "can branch on it."
+    )
+    # The flag must default to false — we must NEVER drop data unless asked.
+    assert re.search(r"^RESET_DB=false", text, re.MULTILINE), (
+        "RESET_DB must default to false so the installer never destroys a "
+        "data volume unless --reset-db is explicitly passed."
+    )
+
+
+def test_reset_db_flag_documented_in_help() -> None:
+    """``--reset-db`` must be discoverable from ``install.sh --help`` and the
+    help text must flag it as destructive."""
+    text = _read_install_sh()
+    help_match = re.search(r"HELP_EOF(?P<help>.*?)HELP_EOF", text, re.DOTALL)
+    assert help_match is not None, "install.sh --help block not found"
+    help_text = help_match["help"]
+    assert "--reset-db" in help_text, (
+        "--reset-db must appear in the --help block so it is discoverable."
+    )
+    assert "DESTRUCTIVE" in help_text or "destroy" in help_text.lower(), (
+        "--reset-db help text must warn that it is destructive (it wipes "
+        "the postgres data volume)."
+    )
+
+
+def test_volume_reuse_warns_loudly() -> None:
+    """When an existing postgres container/volume is reused, the installer
+    must LOG A WARNING that existing DATA is being reused. Without this, a
+    'fresh' install silently inherits a stale schema."""
+    body = _extract_function_body("_warn_or_reset_pg_volume")
+    assert "log_warn" in body, (
+        "_warn_or_reset_pg_volume must call log_warn on the reuse path so "
+        "operators see that existing PostgreSQL data is being inherited."
+    )
+    # The warning must specifically mention reusing data / the volume so the
+    # message is actionable, not a generic info line.
+    assert "REUSING" in body or "reus" in body.lower(), (
+        "The reuse warning must explicitly say existing data is being reused."
+    )
+    # Best-effort surfacing of the inherited alembic_version helps the
+    # operator diagnose schema-mismatch failures.
+    assert "alembic_version" in body, (
+        "_warn_or_reset_pg_volume should surface the inherited "
+        "alembic_version (best-effort) so schema drift is visible."
+    )
+
+
+def test_choose_pg_port_invokes_volume_handler_on_reuse() -> None:
+    """choose_pg_port must route the existing-container reuse path through
+    _warn_or_reset_pg_volume so the warn/reset logic actually runs."""
+    body = _extract_function_body("choose_pg_port")
+    assert "_warn_or_reset_pg_volume" in body, (
+        "choose_pg_port must call _warn_or_reset_pg_volume on the reuse "
+        "path; otherwise the loud warning / --reset-db drop never fires."
+    )
+
+
+def test_volume_drop_only_under_reset_db() -> None:
+    """The volume must be destroyed ONLY when --reset-db is set. The
+    `down -v` / `docker volume rm` calls must be guarded by RESET_DB so a
+    plain re-install never wipes the operator's database."""
+    body = _extract_function_body("_warn_or_reset_pg_volume")
+    # Both destructive primitives must live inside a RESET_DB=true guard.
+    reset_guard = re.search(
+        r'if \[ "\$RESET_DB" = true \];.*?\n(?P<guarded>.*?)\n\s*return 0',
+        body,
+        re.DOTALL,
+    )
+    assert reset_guard is not None, (
+        "_warn_or_reset_pg_volume must have an `if [ \"$RESET_DB\" = true ]` "
+        "branch that performs the destructive drop and returns early."
+    )
+    guarded = reset_guard["guarded"]
+    assert "down -v" in guarded or "volume rm" in guarded, (
+        "The destructive volume drop (down -v / docker volume rm) must live "
+        "inside the RESET_DB guard."
+    )
+    # Outside the guard there must be NO unconditional destructive call.
+    outside = body[: reset_guard.start()] + body[reset_guard.end():]
+    assert "down -v" not in outside and "volume rm" not in outside, (
+        "No destructive volume operation may exist outside the RESET_DB "
+        "guard — a plain re-install must never wipe data."
+    )
+
+
+def test_verify_core_deps_function_exists_and_checks_base_deps() -> None:
+    """install.sh must verify the venv can import the BASE deps the very next
+    step (alembic upgrade) needs, and abort loudly if not."""
+    text = _read_install_sh()
+    assert "verify_core_deps()" in text, (
+        "verify_core_deps must be defined to validate the venv before "
+        "migrations run."
+    )
+    body = _extract_function_body("verify_core_deps")
+    # Import check via the venv python (uv-managed: no pip available).
+    assert "import alembic, sqlalchemy, asyncpg" in body, (
+        "verify_core_deps must import alembic, sqlalchemy AND asyncpg via the "
+        "venv python — all three are base deps the migration step needs."
+    )
+    assert "venv/bin/python" in body, (
+        "verify_core_deps must use the venv's python (./venv/bin/python) for "
+        "the import check, not pip (the venv is uv-managed)."
+    )
+    # Must abort, not warn-and-continue, on failure.
+    assert "exit 1" in body, (
+        "verify_core_deps must `exit 1` when imports fail — continuing to "
+        "the migration step with a half-built venv is exactly the bug."
+    )
+    assert "log_error" in body, (
+        "verify_core_deps must log_error explaining the venv is incomplete."
+    )
+
+
+def test_verify_core_deps_runs_before_migrations() -> None:
+    """verify_core_deps must run after install_deps and before
+    setup_postgres/run_migrations in main(), so a half-built venv aborts the
+    install before the cryptic migration failure."""
+    body = _extract_function_body("main")
+    assert "verify_core_deps" in body, (
+        "verify_core_deps must be wired into main()."
+    )
+    install_pos = body.index("install_deps")
+    verify_pos = body.index("verify_core_deps")
+    migrate_pos = body.index("run_migrations")
+    assert install_pos < verify_pos < migrate_pos, (
+        "verify_core_deps must run after install_deps and before "
+        "run_migrations so the dep check gates the migration step."
+    )
+
+
 def test_substrate_worker_skips_cleanly_without_systemd() -> None:
     """Termux / non-Linux / no-systemctl environments must not error
     out — install.sh should print manual steps and continue."""
