@@ -146,14 +146,13 @@ def init_db_sync() -> None:
 
     Raises RuntimeError if HERMES_PG_DSN is not set in the environment.
 
-    Drives the init on ``hermes_db._get_sync_loop()`` rather than a
-    transient ``asyncio.run`` loop. asyncpg pools are loop-bound; an
-    ``asyncio.run(hermes_db.init(dsn))`` call would create a fresh loop,
-    bind the pool to it, then close that loop on return — leaving every
-    subsequent ``run_sync`` call holding a pool against a dead loop.
-    Routing through ``_get_sync_loop`` (the same persistent loop
-    ``ensure_pool_sync`` uses) keeps the pool alive for the lifetime of
-    the process.
+    Drives the init via ``hermes_db.run_sync`` so the pool binds to the
+    always-running DB loop rather than a transient ``asyncio.run`` loop.
+    asyncpg pools are loop-bound; an ``asyncio.run(hermes_db.init(dsn))``
+    call would create a fresh loop, bind the pool to it, then close that
+    loop on return — leaving every subsequent ``run_sync`` call holding a
+    pool against a dead loop. The DB loop runs for the lifetime of the
+    process, so the pool stays valid across all ``run_sync`` calls.
     """
     global _db_initialized
     import atexit
@@ -174,14 +173,18 @@ def init_db_sync() -> None:
             "HERMES_PG_DSN must be set; export from .env or configure in environment"
         )
     if hermes_db._pool is None:
-        loop = hermes_db._get_sync_loop()
-        loop.run_until_complete(hermes_db.init(dsn))
-    atexit.register(
-        lambda: (
-            hermes_db._get_sync_loop().run_until_complete(hermes_db.close())
-            if hermes_db._pool is not None else None
-        )
-    )
+        hermes_db.run_sync(hermes_db.init(dsn))
+
+    def _close_pool_atexit():
+        if hermes_db._pool is not None:
+            try:
+                hermes_db.run_sync(hermes_db.close())
+            except Exception:
+                # Interpreter teardown: the DB loop thread may already be
+                # gone. Postgres reaps the idle connections regardless.
+                pass
+
+    atexit.register(_close_pool_atexit)
     _db_initialized = True
 
 

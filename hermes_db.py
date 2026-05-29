@@ -13,7 +13,6 @@ Close at shutdown (`close()`). Pool size is tunable via env vars:
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
 import os
 import threading
@@ -27,42 +26,43 @@ T = TypeVar("T")
 _pool: Optional[asyncpg.Pool] = None
 _pool_lock = threading.Lock()
 
-# Persistent module-level event loop for sync bridging. The asyncpg pool
-# binds to whichever loop created it; reusing one loop across run_sync()
-# calls keeps the pool valid across pytest tests (otherwise a per-call
-# ``asyncio.new_event_loop`` leaves the pool bound to a closed loop and
-# every subsequent call raises ``RuntimeError: Event loop is closed``).
-# Mirrors the pattern in ``model_tools._get_tool_loop``.
+# The single, continuously-running event loop that owns all DB access for
+# this process ("the DB loop"). asyncpg pools bind to whichever loop creates
+# them, so Hermes keeps ONE loop, bound to the pool, running forever on its
+# own daemon thread. Every sync caller bridges to it via ``run_sync``
+# (``run_coroutine_threadsafe``); async callers on a *different* loop (e.g.
+# the gateway's main I/O loop) route to it via ``run_on_pool_loop``. Because
+# the loop runs continuously, long-lived DB tasks scheduled on it (the
+# substrate writer's recall-log drain) keep running instead of being orphaned
+# when a one-shot ``run_until_complete`` returns — the root cause of the
+# 2026-05-26/29 cross-loop pool incidents.
+#
+# The loop + thread start lazily on first use, so pure-async entry points
+# that own their own loop (the substrate worker subprocess, which binds the
+# pool to its ``asyncio.run`` loop) never start this thread.
 _sync_loop: Optional[asyncio.AbstractEventLoop] = None
+_db_thread: Optional[threading.Thread] = None
 _sync_loop_lock = threading.Lock()
-
-# Background single-thread executor used by ``run_sync`` when a different
-# asyncio event loop is already running in the caller's thread (typical
-# in pytest-asyncio tests that exercise sync wrappers around async DB
-# calls). Python forbids ``loop.run_until_complete`` while ANY loop is
-# running in the current thread, so we offload the call to this worker
-# thread where no loop is running. The thread is created lazily on first
-# need; ``max_workers=1`` keeps run_sync calls serialised on _sync_loop
-# (which is the only loop we ever run inside the worker).
-_sync_offload_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_sync_offload_lock = threading.Lock()
-
-
-def _get_sync_offload_executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _sync_offload_executor
-    with _sync_offload_lock:
-        if _sync_offload_executor is None:
-            _sync_offload_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="hermes-db-sync"
-            )
-        return _sync_offload_executor
 
 
 def _get_sync_loop() -> asyncio.AbstractEventLoop:
-    global _sync_loop
+    """Return the always-running DB loop, starting its thread on first call."""
+    global _sync_loop, _db_thread
     with _sync_loop_lock:
         if _sync_loop is None or _sync_loop.is_closed():
             _sync_loop = asyncio.new_event_loop()
+            _db_thread = None  # a fresh loop needs a fresh thread to drive it
+        if _db_thread is None or not _db_thread.is_alive():
+            loop = _sync_loop
+
+            def _run_db_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            _db_thread = threading.Thread(
+                target=_run_db_loop, name="hermes-db-loop", daemon=True
+            )
+            _db_thread.start()
         return _sync_loop
 
 
@@ -336,8 +336,8 @@ def pool() -> asyncpg.Pool:
             "any pool inherited from the sync bridge."
         )
 
-    # Pure-sync context: safe to drive the init on the persistent sync loop.
-    _get_sync_loop().run_until_complete(init(dsn))
+    # Pure-sync context: drive the init on the always-running DB loop.
+    run_sync(init(dsn))
     if _pool is None:
         raise RuntimeError("hermes_db.init() not called")
     return _pool
@@ -356,159 +356,102 @@ async def transaction() -> AsyncIterator[asyncpg.Connection]:
             yield conn
 
 
-_run_sync_local = threading.local()
-_sync_loop_mutex = threading.Lock()
+def _as_coroutine(awaitable: Awaitable[T]):
+    """Coerce any awaitable into a coroutine.
+
+    ``asyncio.run_coroutine_threadsafe`` (unlike ``loop.run_until_complete``,
+    which ``ensure_future``-wraps awaitables) rejects non-coroutine awaitables
+    such as asyncpg's ``PoolAcquireContext`` (``run_sync(pool().acquire())``).
+    Wrapping preserves the historical ``run_sync``/``run_on_pool_loop``
+    contract of accepting any awaitable.
+    """
+    if asyncio.iscoroutine(awaitable):
+        return awaitable
+
+    async def _await_it():
+        return await awaitable
+
+    return _await_it()
+
 
 def run_sync(coro: Awaitable[T]) -> T:
     """Bridge a sync caller to an async DB call.
 
-    Mirrors the proven pattern in `model_tools._run_async`. Uses a
-    persistent module-level event loop (``_get_sync_loop``) so the
-    asyncpg pool stays bound to a live loop across calls. Per-call
-    ``asyncio.new_event_loop()`` would orphan the pool against a closed
-    loop after the first call and surface as ``RuntimeError: Event loop
-    is closed`` on the next acquire.
+    Submits ``coro`` to the always-running DB loop (``_get_sync_loop``) via
+    ``asyncio.run_coroutine_threadsafe`` and blocks the calling thread until
+    it completes. Works uniformly from any thread and from inside any *other*
+    running loop (the gateway's main loop, pytest-asyncio test bodies, ACP
+    server callbacks): the coroutine always runs on the DB loop, where the
+    asyncpg pool is bound, so there is never a cross-loop operation.
 
-    Three calling contexts:
+    Calling this from *inside* the DB loop thread is a bug — the caller is
+    already on the pool's loop and must ``await`` the coroutine directly — so
+    we close the coroutine and raise rather than deadlock waiting on a loop
+    that is busy waiting on us.
 
-    1. **Pure sync caller** (CLI subcommand, gateway-runner sync entry,
-       smoke test): no asyncio loop is running in the current thread.
-       We drive ``_sync_loop.run_until_complete(coro)`` directly.
-    2. **Inside _sync_loop itself** (re-entrant call): ``_sync_loop`` is
-       already running. This is a true bug — the caller should ``await``
-       the coroutine — so we raise.
-    3. **Inside a *different* loop** (pytest-asyncio test body that calls
-       sync ``kb.*`` helpers, ACP server scheduled callbacks): another
-       loop is running in this thread but not ``_sync_loop``. Python's
-       asyncio still forbids running a second loop in the same thread,
-       so we offload the ``run_until_complete`` call to a dedicated
-       background thread where no loop is running. The pool stays on
-       ``_sync_loop`` (asyncpg cares about loop, not thread) so this is
-       safe.
-
-    NOTE: this function does NOT lazy-bootstrap the pool — auto-init
-    lives in ``pool()`` for sync code paths that touch the DB outside
-    an event loop, and ``ensure_pool_sync()`` for code that knows it's
-    about to acquire connections from inside ``run_sync``.
+    NOTE: this function does NOT lazy-bootstrap the pool — auto-init lives in
+    ``pool()`` for sync code paths that touch the DB outside an event loop,
+    and ``ensure_pool_sync()`` for code that knows it's about to acquire
+    connections. Mocked tests need nothing.
     """
-    if getattr(_run_sync_local, "in_run_sync", False):
-        # Case 2: true re-entrant into our own sync loop.
-        raise RuntimeError(
-            "hermes_db.run_sync called from inside its own sync loop; "
-            "refactor caller to `await` the coroutine directly."
-        )
-
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        current = None
-
     loop = _get_sync_loop()
-
-    if current is None:
-        # Case 1: pure sync context, run on this thread.
-        _run_sync_local.in_run_sync = True
-        try:
-            with _sync_loop_mutex:
-                # NB: this function intentionally does NOT lazy-bootstrap
-                # the pool. The eager-bootstrap path used to fire whenever
-                # ``HERMES_PG_DSN`` was set, even when the coro was a Mock
-                # / AsyncMock that didn't actually need a real connection.
-                # Under pytest, that drove ``asyncpg.create_pool(...)`` on
-                # every CLI unit test, which intermittently segfaulted on
-                # GitHub Actions runners during the asyncpg protocol-class
-                # init. Bootstrap is now the caller's responsibility: real
-                # entry points (CLI ``main``, daemons, scripts) call
-                # ``ensure_pool_sync()`` once up-front; tests use the
-                # ``hermes_db_initialized*`` fixtures; mocked tests need
-                # nothing.
-                return loop.run_until_complete(coro)
-        finally:
-            _run_sync_local.in_run_sync = False
-
-    # Case 3: a different loop is running in this thread (pytest-asyncio,
-    # ACP server callback, etc.). Offload to a worker thread so Python's
-    # one-loop-per-thread check doesn't reject us.
-    executor = _get_sync_offload_executor()
-
-    def _offload():
-        if getattr(_run_sync_local, "in_run_sync", False):
-            raise RuntimeError(
-                "hermes_db.run_sync called from inside its own sync loop; "
-                "refactor caller to `await` the coroutine directly."
-            )
-        _run_sync_local.in_run_sync = True
-        try:
-            with _sync_loop_mutex:
-                return loop.run_until_complete(coro)
-        finally:
-            _run_sync_local.in_run_sync = False
-
-    future = executor.submit(_offload)
-    return future.result()
-
-
-# Dedicated executor for routing cross-loop DB coroutines onto the pool's
-# loop (see ``run_on_pool_loop``). Kept separate from the gateway's agent-turn
-# executor so a long-running agent turn can't starve a quick handoff poll.
-_route_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_route_executor_lock = threading.Lock()
-
-
-def _get_route_executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _route_executor
-    with _route_executor_lock:
-        if _route_executor is None:
-            _route_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="hermes-db-route"
-            )
-        return _route_executor
+    if threading.current_thread() is _db_thread:
+        # Re-entrant: a coroutine already running on the DB loop called a
+        # sync DB helper. Blocking on the DB loop from the DB loop deadlocks.
+        if asyncio.iscoroutine(coro):
+            coro.close()
+        raise RuntimeError(
+            "hermes_db.run_sync called from inside the DB loop thread; "
+            "await the coroutine directly instead."
+        )
+    return asyncio.run_coroutine_threadsafe(_as_coroutine(coro), loop).result()
 
 
 async def run_on_pool_loop(coro: Awaitable[T]) -> T:
     """Await a DB coroutine on the asyncpg pool's event loop.
 
     asyncpg connections are loop-bound: a coroutine that does
-    ``async with hermes_db.connection() as conn: await conn.fetch(...)``
-    can only run on the loop the pool was created on. A process that hosts
-    DB access from TWO loops — e.g. the gateway runs its main loop
-    ``L_gw`` via ``asyncio.run(start_gateway())`` but the pool is bound to
-    ``_sync_loop`` (created by ``main()``'s ``ensure_pool_sync()`` before
-    ``L_gw`` exists) — would otherwise hit
-    ``ConnectionDoesNotExistError`` / ``cannot perform operation: another
-    operation is in progress`` whenever an async-native caller (the handoff
-    watcher, ``/title`` / ``/resume`` / ``/branch`` handlers, telegram-topic
-    ops) awaits the pool from the wrong loop.
+    ``async with hermes_db.connection() as conn: await conn.fetch(...)`` can
+    only run on the loop the pool was created on. In a process that hosts DB
+    access from more than one loop — e.g. the gateway runs its main loop
+    ``L_gw`` via ``asyncio.run(start_gateway())`` while the pool lives on the
+    always-running DB loop (``_get_sync_loop``) — an async-native caller on
+    ``L_gw`` (the handoff watcher, ``/title`` / ``/resume`` / ``/branch``
+    handlers, telegram-topic ops, the substrate-writer bootstrap) must not
+    ``await`` the pool directly or it hits ``ConnectionDoesNotExistError`` /
+    "another operation is in progress".
 
     This helper sends such a coroutine to the pool's loop:
 
-    * Already on the pool's loop (the common ``run_sync`` hot path, or a
-      single-loop process like the substrate worker): await it directly —
+    * Already on the pool's loop (a single-loop process like the substrate
+      worker, or code already running on the DB loop): await it directly —
       no thread hop, no overhead.
-    * On a different loop than the pool: drive it on the pool's loop via the
-      ``run_sync`` bridge, executed in a dedicated worker thread so the
-      caller's loop is never blocked.
-
-    Only the ``_sync_loop``-bound-pool topology can be driven on demand
-    (``run_sync`` runs ``_sync_loop`` via ``run_until_complete``); if the
-    pool is bound to some other, non-running loop we cannot safely route, so
-    we raise rather than silently issue a cross-loop operation.
+    * On a different loop: schedule it on the DB loop and await the result
+      via :func:`asyncio.wrap_future`, so the caller's loop is never blocked.
     """
     try:
         running = asyncio.get_running_loop()
     except RuntimeError:
         running = None
     pool_loop = getattr(_pool, "_loop", None)
-    if running is None or pool_loop is None or running is pool_loop:
+    # Single-loop topology, or already on the pool's loop: no hop needed.
+    if running is not None and pool_loop is not None and running is pool_loop:
         return await coro
-    if pool_loop is not _get_sync_loop():
+    loop = _get_sync_loop()
+    if pool_loop is not None and pool_loop is not loop:
+        # Pool is bound to a loop that is neither the caller's nor the DB
+        # loop — routing would still issue a cross-loop operation.
+        if asyncio.iscoroutine(coro):
+            coro.close()
         raise RuntimeError(
-            "run_on_pool_loop: the asyncpg pool is bound to a loop that is "
-            "neither the current running loop nor the sync-bridge loop; "
-            "cannot route the coroutine safely. This indicates a pool "
-            "created on an unexpected loop."
+            "run_on_pool_loop: the asyncpg pool is bound to an unexpected "
+            "loop (neither the running loop nor the DB loop); cannot route "
+            "the coroutine safely."
         )
-    return await running.run_in_executor(_get_route_executor(), run_sync, coro)
+    fut = asyncio.run_coroutine_threadsafe(_as_coroutine(coro), loop)
+    if running is None:
+        return fut.result()
+    return await asyncio.wrap_future(fut)
 
 
 def ensure_pool_sync() -> bool:
@@ -544,13 +487,7 @@ def ensure_pool_sync() -> bool:
             "hermes_db.ensure_pool_sync called from inside a running event "
             "loop; await hermes_db.init(dsn) directly instead."
         )
-    loop = _get_sync_loop()
-    coro = init(dsn)
-    try:
-        loop.run_until_complete(coro)
-    except BaseException:
-        # ``init`` may have set up partial state; close the coroutine
-        # explicitly so the leak warning doesn't fire.
-        coro.close()
-        raise
+    # Drive the init on the always-running DB loop; run_sync owns the
+    # coroutine's lifecycle (and closes it on the re-entrant guard path).
+    run_sync(init(dsn))
     return _pool is not None

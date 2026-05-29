@@ -17832,7 +17832,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _pg_dsn = _os.environ.get("HERMES_PG_DSN")
     if _pg_dsn:
         try:
-            await _hermes_db.init(_pg_dsn)
+            # Route init onto the DB loop (where the pool must live), not
+            # this gateway loop. main()'s ensure_pool_sync() has usually
+            # created the pool on the DB loop already, making this a no-op;
+            # routing keeps the binding correct even on a fresh start.
+            await _hermes_db.run_on_pool_loop(_hermes_db.init(_pg_dsn))
         except Exception as _e:
             logger.warning("PG pool init failed, continuing: %s", _e)
 
@@ -17849,7 +17853,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # gateway (spec §0). The helper itself logs the traceback.
     try:
         from hermes_bootstrap import bootstrap_substrate as _bootstrap_substrate
-        await _bootstrap_substrate(log=logger, mode="writer")
+        # Boot on the DB loop, where the asyncpg pool lives — awaiting it on
+        # this gateway loop hits the pool cross-loop (ConnectionDoesNotExist)
+        # AND orphans the writer's long-lived recall-log task. run_on_pool_loop
+        # runs the whole boot on the always-running DB loop so those tasks
+        # survive. (Was the recurring startup ConnectionDoesNotExistError.)
+        await _hermes_db.run_on_pool_loop(
+            _bootstrap_substrate(log=logger, mode="writer")
+        )
     except Exception as _se:  # noqa: BLE001 — defensive
         logger.warning("substrate bootstrap failed, continuing: %s", _se)
 
