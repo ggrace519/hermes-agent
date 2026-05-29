@@ -1,4 +1,4 @@
-# Hermes Agent - Development Guide
+# Thoth — Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
@@ -25,8 +25,8 @@ hermes-agent/
 ├── model_tools.py        # Tool orchestration, discover_builtin_tools(), handle_function_call()
 ├── toolsets.py           # Toolset definitions, _HERMES_CORE_TOOLS list
 ├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
-├── hermes_state.py       # SessionDB — async PG-backed session store (substrate edition; SQLite upstream)
-├── substrate/            # Cognitive substrate (perception sink + Curator + recall) — fork-only
+├── hermes_state.py       # SessionDB — async PG-backed session store (PostgreSQL, no SQLite)
+├── substrate/            # Cognitive substrate (perception sink + Curator + recall)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
 ├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
@@ -263,14 +263,14 @@ The dashboard embeds the real `hermes --tui` — **not** a rewrite.  See `hermes
 
 ## Adding New Tools
 
-For most custom or local-only tools, do **not** edit Hermes core. Use the plugin
+For most custom or local-only tools, do **not** edit Thoth core. Use the plugin
 route instead: create `~/.hermes/plugins/<name>/plugin.yaml` and
 `~/.hermes/plugins/<name>/__init__.py`, then register tools with
 `ctx.register_tool(...)`. Plugin toolsets are discovered automatically and can be
 enabled or disabled without touching `tools/` or `toolsets.py`.
 
 Use the built-in route below only when the user is explicitly contributing a new
-core Hermes tool that should ship in the base system.
+core Thoth tool that should ship in the base system.
 
 Built-in/core tools require changes in **2 files**:
 
@@ -436,7 +436,7 @@ hermes_cli/skin_engine.py    # SkinConfig dataclass, built-in skins, YAML loader
 
 ### Built-in skins
 
-- `default` — Classic Hermes gold/kawaii (the current look)
+- `default` — Classic Thoth gold/kawaii (the current look)
 - `ares` — Crimson/bronze war-god theme with custom spinner wings
 - `mono` — Clean grayscale monochrome
 - `slate` — Cool blue developer-focused theme
@@ -487,7 +487,7 @@ Activate with `/skin cyberpunk` or `display.skin: cyberpunk` in config.yaml.
 
 ## Plugins
 
-Hermes has two plugin surfaces. Both live under `plugins/` in the repo so
+Thoth has two plugin surfaces. Both live under `plugins/` in the repo so
 repo-shipped plugins can be discovered alongside user-installed ones in
 `~/.hermes/plugins/` and pip-installed entry points.
 
@@ -634,7 +634,7 @@ violate them.
    assert len(m.group(1)) <= 60, len(m.group(1))
    ```
 
-2. **Tools referenced in SKILL.md prose must be native Hermes tools or
+2. **Tools referenced in SKILL.md prose must be native Thoth tools or
    MCP servers the skill explicitly expects.** When the skill needs a
    capability, point at the proper tool by name in backticks
    (`` `terminal` ``, `` `web_extract` ``, `` `read_file` ``,
@@ -662,7 +662,7 @@ violate them.
    contributions, the contributor's real name + GitHub handle goes
    first; "Hermes Agent" is the secondary collaborator. If the
    contributor's commit shows "Hermes Agent" as author (because they
-   used Hermes to draft the skill), replace it with their actual name
+   used Thoth to draft the skill), replace it with their actual name
    — credit the human, not the tool.
 
 5. **SKILL.md body uses the modern section order.** `# <Skill> Skill`
@@ -859,7 +859,7 @@ Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 
 ---
 
-## Cognitive Substrate (this fork only)
+## Cognitive Substrate
 
 `substrate/` ships a PostgreSQL-backed perception + memory layer that runs
 alongside the conversation loop. Phases A–C are shipped:
@@ -877,7 +877,7 @@ alongside the conversation loop. Phases A–C are shipped:
 - **Phase C** — Recall API (`substrate/recall/api.py`) +
   `SubstrateMemoryProvider` (`agent/memory_providers/substrate.py`) +
   pgvector 1536-d embeddings backfilled by the Curator. Gated by
-  `HERMES_SUBSTRATE_RECALL` (default off in this fork). Composite score:
+  `HERMES_SUBSTRATE_RECALL` (default off). Composite score:
   similarity + keyword Jaccard + salience + recency, ranked under a token
   budget.
 
@@ -888,7 +888,7 @@ alongside the conversation loop. Phases A–C are shipped:
   try/except — slice writes and recall calls never propagate to the
   conversation loop. Recall returns an empty `RecallProjection` with
   `empty_reason` set rather than raising.
-- **No SQLite paths anywhere in this fork.** Session / kanban / substrate
+- **No SQLite paths anywhere.** Session / kanban / substrate
   state all live in PostgreSQL via `hermes_db`'s asyncpg pool. The
   `hermes_state.SessionDB` class is the async PG-backed store; the old
   `state.db` SQLite path is gone.
@@ -913,7 +913,7 @@ spec repo — do NOT write new substrate design docs in this repo.
 
 ### Prompt Caching Must Not Break
 
-Hermes-Agent ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
+Thoth ensures caching remains valid throughout a conversation. **Do NOT implement changes that would:**
 - Alter past context mid-conversation
 - Change toolsets mid-conversation
 - Reload memories or rebuild system prompts mid-conversation
@@ -941,7 +941,7 @@ in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 
 ## Profiles: Multi-Instance Support
 
-Hermes supports **profiles** — multiple fully isolated instances, each with its own
+Thoth supports **profiles** — multiple fully isolated instances, each with its own
 `HERMES_HOME` directory (config, API keys, memory, sessions, skills, gateway, etc.).
 
 The core mechanism: `_apply_profile_override()` in `hermes_cli/main.py` sets
