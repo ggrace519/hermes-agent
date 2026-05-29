@@ -187,3 +187,54 @@ async def test_jsonb_codec_returns_python_objects(initialized_db):
         finally:
             await conn.execute("DROP TABLE _jsonb_codec_probe")
     assert result == payload
+
+
+class TestPoolMaxInactiveLifetime:
+    """The pool recycles idle connections via ``max_inactive_connection_lifetime``
+    (env-tunable ``HERMES_PG_POOL_MAX_INACTIVE_S``) so connections severed while
+    idle — laptop suspend/resume, NAT idle-kill, a brief DB/network blip — get
+    dropped within ~2 min instead of lingering ~5 min and spamming
+    ``ConnectionDoesNotExistError`` each time a poller re-grabs a dead one."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_pool(self):
+        # init() is idempotent on a live _pool; clear it so each test exercises
+        # create_pool, and never leak a mock pool to later tests.
+        saved = hermes_db._pool
+        hermes_db._pool = None
+        yield
+        hermes_db._pool = saved if saved is not None else None
+        if saved is None:
+            hermes_db._pool = None
+
+    async def _capture_create_pool_kwargs(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        with patch("asyncpg.create_pool", AsyncMock(return_value=MagicMock())) as cp:
+            await hermes_db.init("postgresql://u:p@localhost:5432/db")
+        hermes_db._pool = None  # drop the mock pool
+        return cp.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_default_is_120s(self, monkeypatch):
+        monkeypatch.delenv("HERMES_PG_POOL_MAX_INACTIVE_S", raising=False)
+        kwargs = await self._capture_create_pool_kwargs()
+        assert kwargs["max_inactive_connection_lifetime"] == 120.0
+
+    @pytest.mark.asyncio
+    async def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PG_POOL_MAX_INACTIVE_S", "30")
+        kwargs = await self._capture_create_pool_kwargs()
+        assert kwargs["max_inactive_connection_lifetime"] == 30.0
+
+    @pytest.mark.asyncio
+    async def test_env_zero_disables(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PG_POOL_MAX_INACTIVE_S", "0")
+        kwargs = await self._capture_create_pool_kwargs()
+        assert kwargs["max_inactive_connection_lifetime"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_invalid_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("HERMES_PG_POOL_MAX_INACTIVE_S", "not-a-number")
+        kwargs = await self._capture_create_pool_kwargs()
+        assert kwargs["max_inactive_connection_lifetime"] == 120.0
