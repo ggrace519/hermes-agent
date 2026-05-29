@@ -101,6 +101,7 @@ USE_VENV=true
 RUN_SETUP=true
 SKIP_BROWSER=false
 SKIP_POSTGRES=false        # NEW: skip docker compose up + alembic upgrade
+RESET_DB=false             # NEW: drop the postgres data volume before compose-up
 SKIP_NODE=false            # NEW: skip ui-tui/web npm installs
 # Force-rewrite preserves nothing: HERMES_PG_DSN, browser env, etc. get
 # rewritten even if the user customized them. Existing values are backed
@@ -124,6 +125,7 @@ while [[ $# -gt 0 ]]; do
         --skip-browser|--no-playwright) SKIP_BROWSER=true; shift ;;
         --skip-node)       SKIP_NODE=true; shift ;;
         --skip-postgres|--no-postgres) SKIP_POSTGRES=true; shift ;;
+        --reset-db)        RESET_DB=true; shift ;;
         --branch)          BRANCH="$2"; shift 2 ;;
         --dir)             INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=true; shift 2 ;;
         --hermes-home)     HERMES_HOME="$2"; shift 2 ;;
@@ -144,6 +146,14 @@ Options:
   --skip-postgres     Skip docker compose up + Alembic migrations
                         Use this if you have your own PostgreSQL and will
                         set HERMES_PG_DSN + run 'alembic upgrade head' yourself
+  --reset-db          Destroy the existing PostgreSQL data volume before
+                        starting Postgres, so the install begins from a clean
+                        database. WITHOUT this flag the installer NEVER drops
+                        data — it reuses any existing volume (and warns loudly
+                        that it is doing so). Use --reset-db when a leftover
+                        volume from a previous install has a stale schema /
+                        alembic_version that breaks fresh migrations.
+                        DESTRUCTIVE: all substrate state in that volume is lost.
   --branch NAME       Git branch to install (default: main)
   --dir PATH          Installation directory
                         default (non-root): ~/.hermes/hermes-agent
@@ -845,6 +855,40 @@ install_deps() {
     fi
 }
 
+# Verify the dependency install actually produced an importable venv. An
+# interrupted `uv sync` / pip run can leave a venv that exists (so the
+# `[ -d venv ]` check passes) but is missing CORE deps — alembic, sqlalchemy
+# and asyncpg are declared in pyproject.toml's base dependencies (NOT extras),
+# and the very next step (`alembic upgrade head`) imports all three. If the
+# venv is half-built we must abort here with a clear message rather than fail
+# cryptically inside the migration step.
+verify_core_deps() {
+    if [ "$USE_VENV" = false ]; then
+        # No managed venv to check; deps live in the system/Termux interpreter
+        # and are validated by the install path itself.
+        return 0
+    fi
+    local venv_py="$INSTALL_DIR/venv/bin/python"
+    if [ ! -x "$venv_py" ]; then
+        log_error "Virtual environment python not found at $venv_py"
+        log_error "  Dependency install did not complete. Re-run the installer."
+        exit 1
+    fi
+    log_info "Verifying core dependencies are importable..."
+    if "$venv_py" -c "import alembic, sqlalchemy, asyncpg" >/dev/null 2>&1; then
+        log_success "Core dependencies present (alembic, sqlalchemy, asyncpg)"
+    else
+        log_error "Virtual environment is INCOMPLETE — core dependencies failed to import."
+        log_error "  Expected: alembic, sqlalchemy, asyncpg (base deps in pyproject.toml)."
+        log_error "  This usually means a previous dependency sync was interrupted."
+        log_info  "  Fix: re-run the installer. It will recreate the venv and re-sync:"
+        log_info  "    cd $INSTALL_DIR && rm -rf venv && \"$UV_CMD\" sync --extra all --locked"
+        log_info  "  (or re-run install.sh, which does the same.)"
+        log_error "Aborting before migrations — refusing to continue with a half-built venv."
+        exit 1
+    fi
+}
+
 # ── PostgreSQL via docker compose ──────────────────────────────────────────
 
 # Detect a non-substrate PostgreSQL listening on the chosen port. If a native
@@ -855,6 +899,71 @@ install_deps() {
 # with InvalidPasswordError. Probe first; if the port is taken by something
 # other than our container, bump to the next free port and pin everything
 # downstream to that port.
+# Inspect / optionally destroy the named postgres data volume that the
+# docker-compose `postgres` service mounts at /var/lib/postgresql/data
+# (declared as `hermes_pg_data` in docker-compose.yml; the actual docker
+# volume is prefixed with the compose project name, e.g.
+# `hermes-agent_hermes_pg_data`).
+#
+#   * Default (no --reset-db): NEVER deletes data. Logs LOUDLY that an
+#     existing database is being reused, and — when cheaply obtainable —
+#     prints its current alembic_version so the operator can see at a
+#     glance whether the inherited schema matches this checkout.
+#   * With --reset-db: drops the volume (via `docker compose down -v`,
+#     which is project-aware and removes the named volume even when the
+#     prefixed name varies) BEFORE compose-up, so the install starts from
+#     a genuinely clean database.
+_warn_or_reset_pg_volume() {
+    # $1 (optional): name of the existing, still-running Hermes pg container,
+    # used only to probe the inherited alembic_version before we tear it down.
+    local probe_container="${1:-}"
+    # Resolve the compose-prefixed volume name. `docker compose` knows the
+    # project; ask it for the volume's full name. Fall back to the common
+    # `hermes-agent_hermes_pg_data` if the lookup yields nothing.
+    local vol_name=""
+    if command -v docker >/dev/null 2>&1; then
+        vol_name=$(docker volume ls --format '{{.Name}}' 2>/dev/null \
+            | grep -E '_hermes_pg_data$' | head -n1)
+    fi
+
+    if [ "$RESET_DB" = true ]; then
+        log_warn "PostgreSQL: --reset-db given — DESTROYING the existing data volume"
+        log_warn "  (all substrate state in it will be lost) before compose-up."
+        # `down -v` is the project-aware, name-agnostic way to drop the
+        # named volume. Run it from the install dir so compose resolves the
+        # right project.
+        ( cd "$INSTALL_DIR" 2>/dev/null && $DOCKER_COMPOSE down -v >/dev/null 2>&1 ) || true
+        # Belt-and-suspenders: if a stray prefixed volume survived (e.g. the
+        # container was removed out-of-band so compose no longer tracks it),
+        # remove it directly.
+        if [ -n "$vol_name" ]; then
+            docker volume rm "$vol_name" >/dev/null 2>&1 || true
+        fi
+        log_info "PostgreSQL: data volume reset; install will start from a clean database."
+        return 0
+    fi
+
+    # Reuse path — do NOT delete anything. Warn loudly.
+    log_warn "PostgreSQL: REUSING existing database data (named volume '${vol_name:-hermes_pg_data}')."
+    log_warn "  The new container re-attaches the OLD volume, so its schema, rows,"
+    log_warn "  and alembic_version are inherited from the previous install."
+    # Try to surface the inherited alembic_version cheaply. Best-effort: only
+    # works if we were handed a still-running container to probe (the caller
+    # invokes us before tearing the old container down).
+    if [ -n "$probe_container" ] && command -v docker >/dev/null 2>&1; then
+        local av
+        av=$(docker exec "$probe_container" \
+            psql -U "${POSTGRES_USER:-hermes}" -d "${POSTGRES_DB:-hermes}" \
+            -tAc 'SELECT version_num FROM alembic_version' 2>/dev/null | head -n1 | tr -d '[:space:]')
+        if [ -n "$av" ]; then
+            log_warn "  Inherited alembic_version: $av"
+        fi
+    fi
+    log_warn "  If this database has a stale/incompatible schema and migrations"
+    log_warn "  fail, re-run the installer with --reset-db to start clean"
+    log_warn "  (DESTRUCTIVE: wipes the inherited database)."
+}
+
 choose_pg_port() {
     if [ "$SKIP_POSTGRES" = true ]; then
         return 0
@@ -925,6 +1034,17 @@ choose_pg_port() {
 
         if [ -n "$existing_port" ]; then
             log_info "PostgreSQL upgrade: found existing container '$existing_container' on port $existing_port"
+            # CRITICAL: removing the container does NOT remove its named data
+            # volume (hermes_pg_data). The new compose-up re-attaches that same
+            # volume, so the "fresh" install inherits the OLD database — schema,
+            # rows, and alembic_version included. If that alembic_version is
+            # ahead of (or inconsistent with) the migrations in this checkout,
+            # `alembic upgrade head` blows up mid-migration with a cryptic
+            # UndefinedTableError. Warn loudly that data is being reused (and
+            # surface the inherited alembic_version while the old container is
+            # still running, so the probe can reach it), and only ever drop
+            # the volume when the operator explicitly opts in via --reset-db.
+            _warn_or_reset_pg_volume "$existing_container"
             log_info "  Stopping + removing it so the new compose-up reuses the same port."
             docker rm -f "$existing_container" >/dev/null 2>&1 || true
             PG_PORT_DEFAULT="$existing_port"
@@ -938,8 +1058,24 @@ choose_pg_port() {
         docker rm -f "$existing_container" >/dev/null 2>&1 || true
     fi
 
-    # No existing container — fall back to the original collision-detection
-    # path. Probe the default port; bump if something else is holding it.
+    # No existing Hermes container found. A named data volume can still
+    # survive on its own (e.g. the container was removed out-of-band while
+    # the volume persisted). If --reset-db was passed, drop it now so the
+    # fresh compose-up starts clean; otherwise, if such a volume exists,
+    # warn that it will be reused. We cannot probe alembic_version here (no
+    # running server), hence no probe-container arg.
+    if command -v docker >/dev/null 2>&1; then
+        local orphan_vol
+        orphan_vol=$(docker volume ls --format '{{.Name}}' 2>/dev/null \
+            | grep -E '_hermes_pg_data$' | head -n1)
+        if [ -n "$orphan_vol" ]; then
+            # Reuses (warns) by default; drops only under --reset-db.
+            _warn_or_reset_pg_volume
+        fi
+    fi
+
+    # Fall back to the original collision-detection path. Probe the default
+    # port; bump if something else is holding it.
     local port="$PG_PORT_DEFAULT"
     if _port_in_use "$port"; then
         log_warn "PostgreSQL: port $port is taken by something else (likely a native"
@@ -1652,6 +1788,7 @@ main() {
     clone_repo
     setup_venv
     install_deps
+    verify_core_deps
     setup_postgres
     run_migrations
     install_node_deps
