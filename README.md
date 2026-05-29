@@ -1,73 +1,61 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
+  <img src="assets/thoth-banner.png" alt="Thoth" width="100%">
 </p>
 
-# Hermes Agent ☤
+<h1 align="center">Thoth</h1>
+
+<p align="center"><i>The self-improving AI agent with a memory that actually remembers.</i></p>
 
 <p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
+  <a href="https://github.com/ggrace519/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/PostgreSQL-17-336791?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL 17">
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11">
 </p>
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+**Thoth is an AI agent that learns.** Named for the scribe of the gods — keeper of knowledge, records, and judgment — it does what the name implies: it records what happens, distills it into lasting memory, and gets better with use. It creates skills from experience, improves them as it works, searches its own past conversations, and builds a deepening model of who you are across sessions — all on a PostgreSQL-backed cognitive substrate that is the source of truth for everything it knows.
 
-Use any model you want — [Nous Portal](https://portal.nousresearch.com), [OpenRouter](https://openrouter.ai) (200+ models), [NovitaAI](https://novita.ai) (AI-native cloud for Model API, Agent Sandbox, and GPU Cloud), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
+Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It isn't tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+
+Use any model you want — [OpenRouter](https://openrouter.ai) (200+ models), [NovitaAI](https://novita.ai), [NVIDIA NIM](https://build.nvidia.com) (Nemotron), [Xiaomi MiMo](https://platform.xiaomimimo.com), [z.ai/GLM](https://z.ai), [Kimi/Moonshot](https://platform.moonshot.ai), [MiniMax](https://www.minimax.io), [Hugging Face](https://huggingface.co), [Nous Portal](https://portal.nousresearch.com), OpenAI, or your own endpoint. Switch with `hermes model` — no code changes, no lock-in.
 
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. Full-text session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>A cognitive substrate</b></td><td>Every message, action, and event is recorded as a slice in PostgreSQL, decayed and curated over time, and recalled by semantic + keyword + salience + recency scoring. Memory that consolidates instead of just accumulating.</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
-<tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
+<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox. Daytona and Modal offer serverless persistence — the agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions.</td></tr>
+<tr><td><b>Research-ready</b></td><td>Batch trajectory generation and trajectory compression for training the next generation of tool-calling models.</td></tr>
 </table>
+
+> **A note on the name:** the project is **Thoth**, but the command-line tool is still invoked as `hermes` (and config lives under `~/.hermes`). The executable/namespace rename is in progress; every command in this README is current.
 
 ---
 
 ## Quick Install
 
-> **Substrate Edition fork (`ggrace519/hermes-agent`):** this fork ships an
-> additional PostgreSQL-backed cognitive substrate (Phases A–C) on top of
-> upstream Hermes, and replaces SQLite with PostgreSQL for all state. Defaults
-> match the upstream installer (`HERMES_HOME=~/.hermes`, CLI shim `hermes`)
-> and add a `docker compose` PostgreSQL service on port 5432 with database
-> `hermes`. If you already have an upstream Hermes install on the same machine
-> and want to coexist with it, pass
-> `--cli-name hermes-substrate --hermes-home ~/.hermes-substrate`.
->
-> The substrate-edition installer one-liner is:
->
-> ```bash
-> curl -fsSL https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.sh | bash
-> ```
-
 ### Linux, macOS, WSL2, Termux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.sh | bash
 ```
+
+The installer brings up everything you need, including a `docker compose` PostgreSQL 17 service (port 5432, database `hermes`) and runs the schema migrations. Pass `--reset-db` if you want it to start from a clean database, or `--skip-postgres` to point at your own PostgreSQL.
 
 ### Windows (native, PowerShell) — Early Beta
 
-> **Heads up:** Native Windows support is **early beta**. It installs and runs, but hasn't been road-tested as broadly as our Linux/macOS/WSL2 paths. Please [file issues](https://github.com/NousResearch/hermes-agent/issues) when you hit rough edges. For the most battle-tested Windows setup today, run the Linux/macOS one-liner above inside **WSL2**.
-
-Run this in PowerShell:
+> **Heads up:** Native Windows support is **early beta**. It installs and runs, but hasn't been road-tested as broadly as the Linux/macOS/WSL2 paths. Please [file issues](https://github.com/ggrace519/hermes-agent/issues) when you hit rough edges. For the most battle-tested Windows setup today, run the Linux/macOS one-liner above inside **WSL2**.
 
 ```powershell
-iex (irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1)
+iex (irm https://raw.githubusercontent.com/ggrace519/hermes-agent/main/scripts/install.ps1)
 ```
 
-The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, completely isolated from any system Git install).  Hermes uses this bundled Git Bash to run shell commands.
+The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, fully isolated from any system Git install) used to run shell commands. If you already have Git installed, it detects and uses that instead.
 
-If you already have Git installed, the installer detects it and uses that instead.  Otherwise a ~45MB MinGit download is all you need — it won't touch or interfere with any system Git.
-
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
+> **Android / Termux:** Termux installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
 >
-> **Windows:** Native Windows is supported as an **early beta** — the PowerShell one-liner above installs everything, but expect rough edges and please file issues when you hit them. If you'd rather use WSL2 (our most battle-tested Windows path), the Linux command works there too. Native Windows install lives under `%LOCALAPPDATA%\hermes`; WSL2 installs under `~/.hermes` as on Linux.  The only Hermes feature that currently needs WSL2 specifically is the browser-based dashboard chat pane (it uses a POSIX PTY — classic CLI and gateway both run natively).
+> **Windows paths:** Native Windows installs under `%LOCALAPPDATA%\hermes`; WSL2 installs under `~/.hermes` as on Linux. The only feature that currently needs WSL2 specifically is the browser-based dashboard chat pane (it uses a POSIX PTY — the classic CLI and gateway both run natively).
 
 After installation:
 
@@ -78,14 +66,9 @@ hermes              # start chatting!
 
 ---
 
-## Database setup (Phase 0+)
+## Database setup
 
-This fork uses PostgreSQL 17 (with the `vector` and `pg_trgm` extensions)
-as the single source of truth for session transcripts, kanban state, and
-the substrate's perception slices. No SQLite anywhere — `state.db` and
-the kanban SQLite DB from upstream are gone. The substrate-edition
-installer brings up a `docker compose` PG service automatically; the
-section below covers the manual / production paths.
+Thoth uses **PostgreSQL 17** (with the `vector` and `pg_trgm` extensions) as the single source of truth for session transcripts, kanban state, and the substrate's perception slices — there is no SQLite anywhere. The installer brings up a `docker compose` PostgreSQL service automatically; the manual / production paths are below.
 
 **For local development:**
 
@@ -95,75 +78,27 @@ export HERMES_PG_DSN=postgresql://hermes:hermes@localhost:5432/hermes
 uv run alembic -c migrations/alembic.ini upgrade head
 ```
 
-**For production deploys:** point `HERMES_PG_DSN` at any PostgreSQL 17+ instance with the `vector` and `pg_trgm` extensions installed. Run `alembic upgrade head` as part of your deploy.
+**For production deploys:** point `HERMES_PG_DSN` at any PostgreSQL 17+ instance with the `vector` and `pg_trgm` extensions installed, and run `alembic upgrade head` as part of your deploy.
 
-**Migrating from a SQLite Hermes (upstream):**
+**Coming from an older SQLite-based install?** A one-shot importer is provided:
 
 ```bash
-uv run hermes db migrate-from-sqlite --sqlite-path ~/.hermes/state.db
+uv run hermes db migrate-from-sqlite --sqlite-path ~/.hermes/state.db   # add --dry-run to preview
 ```
-
-(One-shot; safe to re-run with `--dry-run` to preview.)
 
 ---
 
-## Cognitive substrate (Phases A–C)
+## Cognitive substrate
 
-> **Heads up:** the substrate adds a `substrate_*` set of tables to your
-> Hermes Postgres database, plus four background asyncio workers (Sentinel,
-> Curator, force-reject, partition-maintenance). Hermes continues to behave
-> exactly as before — substrate failures are non-fatal and the recall path
-> is env-gated off by default — but the schema migration is permanent. Back
-> up your DB before the first run if you care.
+The substrate is what makes Thoth more than a stateless chat loop. It's a PostgreSQL-backed **perception sink and recall source**: every user message, assistant response, tool call/result, sub-agent spawn/return, session-lifecycle event, and cron dispatch is emitted as a *slice* on a named *stream* (`hermes.world.user_message.cli`, `hermes.self_action.assistant_response`, and so on). Slices are stored in `substrate_slices` (RANGE-partitioned monthly on ingest time), curated continuously, and recalled on demand.
 
-The substrate is a PostgreSQL-backed **L0 perception sink + recall source**
-that runs alongside Hermes. Every user message, assistant response, tool
-call/result, sub-agent spawn/return, session-lifecycle event, and cron
-dispatch is emitted as a *slice* on a named *stream*
-(`hermes.world.user_message.cli`, `hermes.self_action.assistant_response`,
-etc.). Slices are stored in `substrate_slices` (RANGE-partitioned monthly on
-ingest time) and decided by Sentinel.
+It runs alongside the agent via background workers and is designed to be safe: substrate failures are non-fatal, and the recall path is env-gated off by default. The schema migration is permanent, so back up your DB before the first run if you care about the data.
 
-### Phase A — perception sink
+**Perception sink.** Three core tables (`substrate_streams`, `substrate_slices`, `substrate_decay_profiles`), auto-registered streams, and monthly partition carving. Background workers tick on startup: **Sentinel** (slice triage), **force-reject** (drops pending slices past their decay-profile TTL), and **partition-maintenance** (keeps a rolling window of monthly partitions ahead of `now()`).
 
-- New schema via Alembic revision `20260523_0003_substrate_skeleton` —
-  three tables (`substrate_streams`, `substrate_slices`,
-  `substrate_decay_profiles`), 15 auto-registered streams, monthly partition
-  carving.
-- Background workers spawned on Hermes startup: Sentinel (200 ms tick,
-  pass-through stub in A; real defense Phase B+), force-reject (10 s tick,
-  drops pending slices past their decay-profile TTL), partition-maintenance
-  (24 h tick, keeps a rolling window of 3 monthly partitions ahead of
-  `now()`).
-- A `hermes substrate` CLI for poking at substrate state. (When
-  installed side-by-side as `hermes-substrate`, substitute the launcher name
-  accordingly.)
+**Curator.** A continuous decay + release loop. Slices fade per their decay profile's half-life; below the profile's `min_salience_to_retain` threshold they release per the tombstone policy (`thin` / `full` / `none`). Every decision is itself recorded as a self-state slice, so the system can reason about its own memory over time.
 
-### Phase B — Curator
-
-- The Curator sub-agent runs a continuous decay + release loop. Slices fade
-  per their decay profile's half-life; below the profile's
-  `min_salience_to_retain` threshold they release per the tombstone policy
-  (`thin` / `full` / `none`). Each decision emits a self-state slice on
-  `substrate.self_state` so Phase E's Reflector can develop calibration.
-- New inspect subtree: `hermes substrate curator [summary | histogram |
-  recent | pressure]`.
-
-### Phase C — recall API + pgvector embeddings
-
-- New tables: `substrate_recall_log` (append-only audit of every `recall()`
-  call) + the `embedding vector(1536)` column on `substrate_slices`.
-- The Curator backfills semantic embeddings asynchronously using
-  `text-embedding-3-small` (1536-d); recall against missing-embedding slices
-  falls back to keyword Jaccard.
-- A `SubstrateMemoryProvider` is registered into Hermes's `MemoryManager`.
-  Gated by `HERMES_SUBSTRATE_RECALL` (default `0`) — when enabled, the
-  per-turn `<memory-context>` block is composed from substrate slices using
-  a composite score (pgvector similarity + keyword Jaccard + salience +
-  recency, ranked under a 1500-token budget by default). The model also gets
-  a `substrate_recall_more` tool for explicit deeper-search asks.
-- New inspect subtree: `hermes substrate recall [summary | recent |
-  sample --session-id <id> | config]`.
+**Recall + embeddings.** An append-only `substrate_recall_log` audits every `recall()` call, and slices carry a pgvector `embedding` column. The Curator backfills semantic embeddings asynchronously; recall against not-yet-embedded slices falls back to keyword Jaccard. When enabled via `HERMES_SUBSTRATE_RECALL=1`, each turn's `<memory-context>` is composed from substrate slices using a composite score (vector similarity + keyword Jaccard + salience + recency, under a token budget), and the model gets a `substrate_recall_more` tool for explicit deeper searches.
 
 ### Inspecting substrate state
 
@@ -172,84 +107,12 @@ hermes substrate            # default summary (streams, slice counts, pending)
 hermes substrate streams    # per-stream slice counts
 hermes substrate slices --stream hermes.world.user_message.cli --limit 20
 hermes substrate pending    # current pending-queue depth + oldest age
-hermes substrate profiles   # the 4 seeded decay profiles
+hermes substrate profiles   # seeded decay profiles
 hermes substrate curator    # Curator decay/release activity
 hermes substrate recall     # recall coverage + recent calls
 ```
 
-If your DB is on an older Alembic revision when Hermes starts, the substrate
-boot raises a `RuntimeError` with the upgrade command to run; set
-`HERMES_AUTO_MIGRATE=1` to upgrade automatically on first boot.
-
-Procedural operator docs ship as a bundled skill — load with `/substrate` or
-`hermes -s substrate`. Design rationale + future-phase specs live
-in the [llm-cognitive-thought](https://github.com/ggrace519/llm-cognitive-thought)
-spec repo.
-
----
-
-## Development testing
-
-The test suite uses `pytest-postgresql` against a **separate** PostgreSQL
-container so the developer's real Hermes DB on port 5432 is never touched.
-
-**One-time setup:**
-
-```bash
-docker compose --profile test up -d postgres-test
-# Starts a dedicated PG on port 5433 with its own volume (hermes_pg_test_data).
-```
-
-**Running tests locally:**
-
-```bash
-# Per-file isolation runner (matches CI). Picks up the test DB via
-# tests/conftest.py:_TEST_PG_PORT which defaults to 5433.
-PYTEST_XDIST_WORKER=run_local uv run python scripts/run_tests_parallel.py tests/substrate/
-
-# Or a single file:
-PYTEST_XDIST_WORKER=run_local uv run python -m pytest tests/substrate/test_commit.py \
-    -o "addopts=" --timeout-method=thread --timeout=120
-```
-
-`PYTEST_XDIST_WORKER` must be set when running pytest directly (the parallel
-runner sets it per subprocess automatically). The value is just a unique label
-— `pytest-postgresql` uses it to derive per-worker DB names so concurrent
-subprocesses don't race on the shared template DB.
-
-**To target a different test PG** (e.g. an external test cluster), set
-`HERMES_TEST_POSTGRES_PORT` (or `POSTGRES_PORT`) before running pytest. CI
-sets `HERMES_TEST_POSTGRES_PORT=5432` to use the ephemeral GitHub Actions
-service container.
-
-**Running tests in a Linux container (matches CI exactly):**
-
-Windows hosts hit a class of pytest failures that are host-environment
-noise (POSIX file permissions, `/mnt/c` paths in acp_adapter tests,
-tilde expansion in cron_workdir tests) rather than real bugs. The
-`test-runner` docker-compose service runs the suite inside Debian +
-Python 3.11 + the `[all,dev]` extras — mirroring the GH Actions CI
-environment exactly — so failures reproduce locally and Windows-host
-noise disappears.
-
-```bash
-# First-time build (~3 min):
-docker compose --profile test up -d postgres-test
-docker compose --profile test build test-runner
-
-# Full suite (~15 min):
-scripts/run_tests_docker.sh
-
-# Single file:
-scripts/run_tests_docker.sh tests/substrate/test_commit.py
-
-# Subset + extra pytest args:
-scripts/run_tests_docker.sh tests/substrate/ -- -v -k 'reinforce'
-```
-
-Source is bind-mounted so test edits don't trigger an image rebuild;
-the venv lives at `/opt/venv` inside the image to survive the bind
-mount. The `postgres-test` container is shared with host-side runs.
+If your DB is on an older Alembic revision when Thoth starts, boot raises a `RuntimeError` with the upgrade command to run; set `HERMES_AUTO_MIGRATE=1` to upgrade automatically on first boot. Procedural operator docs ship as a bundled skill — load with `/substrate`.
 
 ---
 
@@ -262,20 +125,17 @@ hermes tools        # Configure which tools are enabled
 hermes config set   # Set individual config values
 hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
 hermes setup        # Run the full setup wizard (configures everything at once)
-hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
 hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+### CLI vs Messaging quick reference
 
-## CLI vs Messaging Quick Reference
-
-Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
+Thoth has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both.
 
 | Action | CLI | Messaging platforms |
 |---------|-----|---------------------|
-| Start chatting | `hermes` | Run `hermes gateway setup` + `hermes gateway start`, then send the bot a message |
+| Start chatting | `hermes` | `hermes gateway setup` + `hermes gateway start`, then message the bot |
 | Start fresh conversation | `/new` or `/reset` | `/new` or `/reset` |
 | Change model | `/model [provider:model]` | `/model [provider:model]` |
 | Set a personality | `/personality [name]` | `/personality [name]` |
@@ -285,41 +145,53 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Interrupt current work | `Ctrl+C` or send a new message | `/stop` or send a new message |
 | Platform-specific status | `/platforms` | `/status`, `/sethome` |
 
-For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
+Run `hermes --help` (or `hermes <command> --help`) for the full command surface.
 
 ---
 
-## Documentation
+## Development testing
 
-All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
+The test suite uses `pytest-postgresql` against a **separate** PostgreSQL container so your real database on port 5432 is never touched.
 
-| Section | What's Covered |
-|---------|---------------|
-| [Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart) | Install → setup → first conversation in 2 minutes |
-| [CLI Usage](https://hermes-agent.nousresearch.com/docs/user-guide/cli) | Commands, keybindings, personalities, sessions |
-| [Configuration](https://hermes-agent.nousresearch.com/docs/user-guide/configuration) | Config file, providers, models, all options |
-| [Messaging Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/messaging) | Telegram, Discord, Slack, WhatsApp, Signal, Home Assistant |
-| [Security](https://hermes-agent.nousresearch.com/docs/user-guide/security) | Command approval, DM pairing, container isolation |
-| [Tools & Toolsets](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools) | 40+ tools, toolset system, terminal backends |
-| [Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) | Procedural memory, Skills Hub, creating skills |
-| [Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory) | Persistent memory, user profiles, best practices |
-| [MCP Integration](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp) | Connect any MCP server for extended capabilities |
-| [Cron Scheduling](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron) | Scheduled tasks with platform delivery |
-| [Context Files](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files) | Project context that shapes every conversation |
-| [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture) | Project structure, agent loop, key classes |
-| [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) | Development setup, PR process, code style |
-| [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) | All commands and flags |
-| [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference |
+**One-time setup:**
+
+```bash
+docker compose --profile test up -d postgres-test    # dedicated PG on port 5433, own volume
+```
+
+**Running tests locally:**
+
+```bash
+# Per-file isolation runner (matches CI). Picks up the test DB via
+# tests/conftest.py:_TEST_PG_PORT (defaults to 5433).
+PYTEST_XDIST_WORKER=run_local uv run python scripts/run_tests_parallel.py tests/substrate/
+
+# Or a single file:
+PYTEST_XDIST_WORKER=run_local uv run python -m pytest tests/substrate/test_commit.py \
+    -o "addopts=" --timeout-method=thread --timeout=120
+```
+
+`PYTEST_XDIST_WORKER` must be set when running pytest directly (the parallel runner sets it per subprocess). The value is just a unique label — `pytest-postgresql` uses it to derive per-worker DB names so concurrent subprocesses don't race on the shared template DB. To target a different test PG, set `HERMES_TEST_POSTGRES_PORT` (or `POSTGRES_PORT`) before running pytest.
+
+**Running tests in a Linux container (matches CI exactly):**
+
+The `test-runner` docker-compose service runs the suite inside Debian + Python 3.11 + the `[all,dev]` extras — mirroring CI — so failures reproduce locally and Windows-host noise (POSIX permissions, `/mnt/c` paths, tilde expansion) disappears.
+
+```bash
+docker compose --profile test up -d postgres-test
+docker compose --profile test build test-runner       # first time, ~3 min
+scripts/run_tests_docker.sh                            # full suite
+scripts/run_tests_docker.sh tests/substrate/test_commit.py
+scripts/run_tests_docker.sh tests/substrate/ -- -v -k 'reinforce'
+```
+
+Source is bind-mounted so test edits don't trigger an image rebuild; the venv lives at `/opt/venv` inside the image to survive the bind mount.
 
 ---
 
 ## Migrating from OpenClaw
 
-If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
-
-**During first-time setup:** The setup wizard (`hermes setup`) automatically detects `~/.openclaw` and offers to migrate before configuration begins.
-
-**Anytime after install:**
+If you're coming from OpenClaw, Thoth can automatically import your settings, memories, skills, and API keys. The setup wizard (`hermes setup`) detects `~/.openclaw` and offers to migrate before configuration begins. Anytime after install:
 
 ```bash
 hermes claw migrate              # Interactive migration (full preset)
@@ -328,34 +200,22 @@ hermes claw migrate --preset user-data   # Migrate without secrets
 hermes claw migrate --overwrite  # Overwrite existing conflicts
 ```
 
-What gets imported:
-- **SOUL.md** — persona file
-- **Memories** — MEMORY.md and USER.md entries
-- **Skills** — user-created skills → `~/.hermes/skills/openclaw-imports/`
-- **Command allowlist** — approval patterns
-- **Messaging settings** — platform configs, allowed users, working directory
-- **API keys** — allowlisted secrets (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **TTS assets** — workspace audio files
-- **Workspace instructions** — AGENTS.md (with `--workspace-target`)
-
-See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
+What gets imported: persona file (**SOUL.md**), memories (MEMORY.md / USER.md), user-created skills, command allowlist, messaging settings, allowlisted API keys, TTS assets, and workspace instructions (AGENTS.md). See `hermes claw migrate --help` for all options.
 
 ---
 
 ## Contributing
 
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
-
-Quick start for contributors — clone and go with `setup-hermes.sh`:
+Contributions are welcome. Clone and go:
 
 ```bash
-git clone https://github.com/NousResearch/hermes-agent.git
+git clone https://github.com/ggrace519/hermes-agent.git
 cd hermes-agent
 ./setup-hermes.sh     # installs uv, creates venv, installs .[all], symlinks ~/.local/bin/hermes
 ./hermes              # auto-detects the venv, no need to `source` first
 ```
 
-Manual path (equivalent to the above):
+Manual path (equivalent):
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -365,20 +225,28 @@ uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
 
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and PR process, and [`AGENTS.md`](AGENTS.md) for the architecture and conventions agents (and humans) should follow.
+
 ---
 
 ## Community
 
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server for Hermes and other MCP hosts, with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting.
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
+- 📚 [Skills Hub](https://agentskills.io) — the `agentskills.io` open skill standard
+- 🐛 [Issues](https://github.com/ggrace519/hermes-agent/issues)
+- 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting
+
+---
+
+## Acknowledgments
+
+Thoth stands on the shoulders of **[Hermes](https://github.com/NousResearch/hermes-agent)**, the open-source agent created by **[Nous Research](https://nousresearch.com)**. The terminal interface, the messaging gateway, the skills system, the tool framework, the seven terminal backends — that foundation is their work, generously released under a permissive license so that others could build on it. Thoth exists because they chose to build in the open.
+
+To the Nous Research team and to every contributor who shaped Hermes over its many releases: **thank you.** This project carries your work forward with deep gratitude and respect. The renaming reflects a different direction and a memory-first architecture of our own — not a parting of ways with what you built, but a continuation of it.
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Released under the **MIT License** — see [LICENSE](LICENSE).
 
-Built by [Nous Research](https://nousresearch.com).
+The original Hermes copyright (© Nous Research) is retained in the license file, as MIT requires and as we're glad to do. New work in this project is contributed under the same MIT terms.
