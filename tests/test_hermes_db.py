@@ -215,6 +215,53 @@ async def test_pool_connections_have_tcp_keepalives_enabled(initialized_db):
             assert raw.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT) == 3
 
 
+@pytest.mark.asyncio
+async def test_run_on_pool_loop_direct_when_same_loop(initialized_db):
+    """When the caller's loop IS the pool's loop, run_on_pool_loop awaits the
+    coroutine directly (no thread hop)."""
+    async def _q():
+        async with hermes_db.connection() as conn:
+            return await conn.fetchval("SELECT 5")
+    assert await hermes_db.run_on_pool_loop(_q()) == 5
+
+
+def test_run_on_pool_loop_routes_across_loops(hermes_db_dsn):
+    """Regression for the gateway's recurring ConnectionDoesNotExistError.
+
+    The gateway's pool is bound to ``_sync_loop`` (main()'s ensure_pool_sync
+    creates it before the gateway's asyncio.run loop exists). Async-native
+    callers on the gateway's own loop — the handoff watcher,
+    /title /resume /branch handlers — would ``await connection()`` cross-loop
+    and hit ``ConnectionDoesNotExistError`` / "another operation is in
+    progress". ``run_on_pool_loop`` must route such a coroutine onto the
+    pool's loop and return the result.
+    """
+    import asyncio
+
+    # Clean slate, then bind the pool to _sync_loop exactly like the gateway.
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db.ensure_pool_sync() is True
+    try:
+        assert hermes_db._pool._loop is hermes_db._get_sync_loop()
+
+        async def on_other_loop():
+            running = asyncio.get_running_loop()
+            # Prove we're genuinely cross-loop before routing.
+            assert hermes_db._pool._loop is not running
+
+            async def _q():
+                async with hermes_db.connection() as conn:
+                    return await conn.fetchval("SELECT 7")
+
+            return await hermes_db.run_on_pool_loop(_q())
+
+        # asyncio.run builds a fresh loop — the L_gw analogue.
+        assert asyncio.run(on_other_loop()) == 7
+    finally:
+        hermes_db.run_sync(hermes_db.close())
+
+
 class TestPoolMaxInactiveLifetime:
     """The pool recycles idle connections via ``max_inactive_connection_lifetime``
     (env-tunable ``HERMES_PG_POOL_MAX_INACTIVE_S``) so connections severed while
