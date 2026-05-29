@@ -458,6 +458,21 @@ prompt_caching:
 #                           # reasoning controls:
 #                           # extra_body:
 #                           #   enable_thinking: false
+#
+#   # Self-improvement (substrate SkillScout, default OFF — see the substrate
+#   # skill). The scout drafts a skill from a recurring memory need; the
+#   # evaluator gives it a second-opinion safety/quality verdict before you
+#   # review it. Point the EVALUATOR at a different/stronger model than the
+#   # AUTHOR so their failure modes are uncorrelated. Both fall back to the
+#   # auto provider chain when unset.
+#   skill_author:
+#     provider: "auto"
+#     model: ""
+#     timeout: 30
+#   skill_evaluator:
+#     provider: "auto"
+#     model: ""              # e.g. a stronger judge: "anthropic/claude-opus-4-..."
+#     timeout: 30
 
 # =============================================================================
 # Persistent Memory
