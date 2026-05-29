@@ -262,6 +262,119 @@ def test_run_on_pool_loop_routes_across_loops(hermes_db_dsn):
         hermes_db.run_sync(hermes_db.close())
 
 
+def test_db_loop_runs_continuously_on_its_own_thread():
+    """The DB loop is driven forever by a dedicated daemon thread, so tasks
+    scheduled on it keep running between run_sync calls (vs. a one-shot
+    run_until_complete loop that stops the moment the call returns)."""
+    import threading
+
+    loop = hermes_db._get_sync_loop()
+    assert loop.is_running()
+    assert hermes_db._db_thread is not None
+    assert hermes_db._db_thread.is_alive()
+    assert hermes_db._db_thread.daemon is True
+    assert hermes_db._db_thread is not threading.current_thread()
+
+
+def test_run_sync_works_from_inside_a_different_running_loop(hermes_db_dsn):
+    """run_sync must work when the caller's thread already drives another
+    loop (the gateway's L_gw, pytest-asyncio). It submits to the DB loop
+    rather than raising "loop already running"."""
+    import asyncio
+
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db.ensure_pool_sync() is True
+    try:
+        async def _outer():
+            async def _q():
+                async with hermes_db.connection() as conn:
+                    return await conn.fetchval("SELECT 11")
+            # Called from within this running loop; routes to the DB loop.
+            return hermes_db.run_sync(_q())
+
+        assert asyncio.run(_outer()) == 11
+    finally:
+        hermes_db.run_sync(hermes_db.close())
+
+
+def test_run_sync_accepts_non_coroutine_awaitables(hermes_db_dsn):
+    """Regression: run_sync(pool().acquire()) — a PoolAcquireContext is an
+    awaitable but not a coroutine. run_coroutine_threadsafe rejects those,
+    so run_sync coerces awaitables into coroutines (matching the old
+    run_until_complete behavior). This is what the kanban DB layer relies on."""
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db.ensure_pool_sync() is True
+    try:
+        conn = hermes_db.run_sync(hermes_db.pool().acquire())
+        try:
+            assert hermes_db.run_sync(conn.fetchval("SELECT 3")) == 3
+        finally:
+            hermes_db.run_sync(hermes_db.pool().release(conn))
+    finally:
+        hermes_db.run_sync(hermes_db.close())
+
+
+def test_long_lived_task_survives_after_routed_boot_returns(hermes_db_dsn):
+    """Regression for the orphaned substrate RecallLogWriter task.
+
+    Phase A booted the substrate via a one-shot run on a loop that then
+    stopped, so the writer's long-lived recall-log drain task was destroyed
+    ("Task was destroyed but it is pending"). The DB loop now runs forever,
+    so a task spawned during a routed boot keeps ticking after the boot
+    call returns.
+    """
+    import asyncio
+    import time
+
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db.ensure_pool_sync() is True
+    ticks = {"n": 0}
+    try:
+        async def _boot_that_spawns_long_lived_task():
+            async def _drain():
+                while True:
+                    ticks["n"] += 1
+                    await asyncio.sleep(0.01)
+            # create_task on the DB loop, mimicking RecallLogWriter.start().
+            asyncio.get_running_loop().create_task(_drain())
+            return "booted"
+
+        assert hermes_db.run_sync(_boot_that_spawns_long_lived_task()) == "booted"
+        # The boot call has returned. A one-shot loop would freeze _drain;
+        # the always-running DB loop keeps it progressing.
+        first = ticks["n"]
+        deadline = time.monotonic() + 2.0
+        while ticks["n"] <= first and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ticks["n"] > first, "long-lived task did not progress after boot returned"
+    finally:
+        hermes_db.run_sync(hermes_db.close())
+
+
+def test_run_sync_reentrant_from_db_loop_raises(hermes_db_dsn):
+    """Calling run_sync from inside the DB loop thread would deadlock; it
+    must raise instead so the mis-wiring is loud rather than a hang."""
+    if hermes_db._pool is not None:
+        hermes_db.run_sync(hermes_db.close())
+    assert hermes_db.ensure_pool_sync() is True
+    try:
+        async def _on_db_loop():
+            async def _q():
+                return 1
+            with pytest.raises(RuntimeError, match="inside the DB loop"):
+                hermes_db.run_sync(_q())
+            return "ok"
+
+        # run_on_pool_loop routes _on_db_loop onto the DB loop, where the
+        # nested run_sync trips the re-entrant guard.
+        assert hermes_db.run_sync(_on_db_loop()) == "ok"
+    finally:
+        hermes_db.run_sync(hermes_db.close())
+
+
 class TestPoolMaxInactiveLifetime:
     """The pool recycles idle connections via ``max_inactive_connection_lifetime``
     (env-tunable ``HERMES_PG_POOL_MAX_INACTIVE_S``) so connections severed while
