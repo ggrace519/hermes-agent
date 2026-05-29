@@ -66,6 +66,53 @@ def _get_sync_loop() -> asyncio.AbstractEventLoop:
         return _sync_loop
 
 
+def _apply_tcp_keepalive(conn) -> None:
+    """Enable TCP keepalives on a freshly-created asyncpg pool connection.
+
+    asyncpg disables SO_KEEPALIVE by default.  Without keepalives, when the
+    remote end (postgres, docker bridge, NAT) closes a connection while it is
+    idle in the pool, the OS never sends a RST to the client — the socket
+    stays in CLOSE_WAIT with the FIN buffered but unread.  asyncpg's
+    ``is_closed()`` only checks its internal protocol state (not the OS
+    socket), so it returns False and the pool hands the dead connection out.
+    The next caller gets ``ConnectionDoesNotExistError: connection was closed
+    in the middle of operation`` and an orphaned "Future exception was never
+    retrieved" log line.
+
+    With keepalives enabled, the OS probes the peer after
+    ``TCP_KEEPIDLE`` seconds of silence.  If ``TCP_KEEPCNT`` consecutive
+    probes (``TCP_KEEPINTVL`` seconds apart) go unanswered, the OS closes the
+    socket, asyncpg's transport fires ``connection_lost``, and the pool evicts
+    the connection — all before any caller ever acquires it.
+
+    Called from the pool's ``init`` hook so every connection (including
+    replacements after recycling) gets keepalives.  Values are intentionally
+    aggressive for a local/LAN postgres: 10s idle, 5s interval, 3 probes =
+    dead connection detected in ≤25 seconds.  All tunable via env vars.
+    """
+    import socket as _socket
+
+    try:
+        raw = conn._transport.get_extra_info("socket")
+        if raw is None:
+            return
+        raw.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        keepidle = int(os.environ.get("HERMES_PG_KEEPIDLE_S", "10"))
+        keepintvl = int(os.environ.get("HERMES_PG_KEEPINTVL_S", "5"))
+        keepcnt = int(os.environ.get("HERMES_PG_KEEPCNT", "3"))
+        # TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT are Linux-specific;
+        # skip gracefully on macOS/Windows where they may not exist.
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            raw.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, keepidle)
+        if hasattr(_socket, "TCP_KEEPINTVL"):
+            raw.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, keepintvl)
+        if hasattr(_socket, "TCP_KEEPCNT"):
+            raw.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, keepcnt)
+    except Exception:
+        # Never crash pool creation over a keepalive failure.
+        pass
+
+
 async def _setup_jsonb_codec(conn):
     """Register JSONB codec so asyncpg returns Python objects for jsonb columns.
 
@@ -75,7 +122,12 @@ async def _setup_jsonb_codec(conn):
     be enabled yet on every database (pre-Phase-C deployments); we probe
     for it and skip registration silently if absent. This keeps the pool
     init path safe to run against older Alembic heads.
+
+    Also enables TCP keepalives on the connection's socket so dead connections
+    are detected by the OS and evicted from the pool before any caller
+    acquires them (see ``_apply_tcp_keepalive`` for rationale).
     """
+    _apply_tcp_keepalive(conn)
     await conn.set_type_codec(
         "jsonb",
         encoder=json.dumps,
@@ -189,16 +241,12 @@ async def init(
         ms = min_size if min_size is not None else int(os.environ.get("HERMES_PG_POOL_MIN", "4"))
         Ms = max_size if max_size is not None else int(os.environ.get("HERMES_PG_POOL_MAX", "64"))
     # Recycle connections that have sat idle in the pool longer than this.
-    # asyncpg's default is 300s, which is why a connection severed *while
-    # idle* — laptop suspend/resume, a NAT/conntrack idle-kill, or a brief
-    # DB/network blip — can linger up to ~5 min: TCP gives no FIN, so asyncpg
-    # only learns the socket is dead when a query fails mid-operation, and a
-    # poller (e.g. the gateway's 2s handoff watcher) re-grabs the same dead
-    # connection on every tick, raising ``ConnectionDoesNotExistError:
-    # connection was closed in the middle of operation`` and leaving a
-    # dangling "Future exception was never retrieved" until the 300s recycle.
-    # A shorter default drops stale idle connections within ~2 min and the
-    # pool refills with live ones. Env-tunable; 0 disables (asyncpg semantics).
+    # Primary dead-connection detection is via TCP keepalives (see
+    # ``_apply_tcp_keepalive``) — the OS detects a half-open socket within
+    # ~25 seconds and asyncpg evicts it automatically. This max_inactive
+    # lifetime is a belt-and-suspenders fallback for connections that go
+    # stale in other ways (e.g. postgres idle-session-timeout, server
+    # restart). Env-tunable; 0 disables (asyncpg semantics).
     try:
         max_inactive = float(os.environ.get("HERMES_PG_POOL_MAX_INACTIVE_S", "120"))
     except ValueError:
