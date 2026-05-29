@@ -8550,6 +8550,353 @@ def _cmd_update_pip(args):
     print(f"✓ Update complete! Restart {cli_name()} to use the new version.")
 
 
+# ---------------------------------------------------------------------------
+# Substrate-worker restart on update
+# ---------------------------------------------------------------------------
+#
+# ``hermes update`` historically restarted only ``hermes-gateway*`` units, so
+# the substrate worker (Sentinel / Curator / embedding sub-agents, run by
+# ``hermes-substrate-worker.service``) kept executing stale code after every
+# update.  Unlike the gateway, the worker unit ships graceful SIGTERM handling
+# with ``TimeoutStopSec=15`` + ``Restart=always``, so a plain ``systemctl
+# restart`` is correct here — no SIGUSR1 drain / handoff-preservation dance
+# is required.  Best-effort: a missing or stopped worker is not an error.
+
+def _venv_python() -> str:
+    """Absolute path to the project venv's Python interpreter.
+
+    The venv is uv-managed and may lack console scripts (e.g. the ``alembic``
+    entry point), so callers invoke modules via ``python -m`` instead.  Falls
+    back to ``sys.executable`` if the venv interpreter is absent.
+    """
+    bin_dir = PROJECT_ROOT / "venv" / ("Scripts" if _is_windows() else "bin")
+    candidate = bin_dir / ("python.exe" if _is_windows() else "python")
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+def _restart_substrate_workers() -> list:
+    """Discover and restart all ``hermes-substrate*`` systemd units.
+
+    Mirrors the gateway path's two-scope discovery (``--user`` then system),
+    but uses a blunt ``systemctl restart`` because the worker unit drains
+    gracefully on SIGTERM.  Returns the list of unit names that were
+    restarted.  Best-effort throughout: any missing ``systemctl``, missing
+    unit, or non-zero restart is logged and skipped, never raised.
+    """
+    restarted: list = []
+    try:
+        from hermes_cli.gateway import (
+            supports_systemd_services,
+            _ensure_user_systemd_env,
+        )
+    except Exception as e:  # pragma: no cover - gateway module always present
+        logger.debug("Substrate restart: gateway helpers unavailable: %s", e)
+        return restarted
+
+    if not supports_systemd_services():
+        return restarted
+
+    try:
+        _ensure_user_systemd_env()
+    except Exception:
+        pass
+
+    for scope, scope_cmd in [
+        ("user", ["systemctl", "--user"]),
+        ("system", ["systemctl"]),
+    ]:
+        try:
+            result = subprocess.run(
+                scope_cmd
+                + [
+                    "list-units",
+                    "hermes-substrate*",
+                    "--plain",
+                    "--no-legend",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            unit = parts[0]  # e.g. hermes-substrate-worker.service
+            if not unit.endswith(".service"):
+                continue
+            svc_name = unit.removesuffix(".service")
+
+            # Only restart units that are currently active — a stopped or
+            # disabled worker is left as-is (matches gateway behaviour).
+            try:
+                check = subprocess.run(
+                    scope_cmd + ["is-active", svc_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+            if check.stdout.strip() != "active":
+                continue
+
+            # reset-failed first so a parked failed state from systemd's own
+            # auto-restart backoff doesn't wedge our restart (mirrors the
+            # gateway recovery path).
+            try:
+                subprocess.run(
+                    scope_cmd + ["reset-failed", svc_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+            try:
+                restart = subprocess.run(
+                    scope_cmd + ["restart", svc_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+
+            if restart.returncode == 0:
+                # Success summary is printed by the caller's restart-summary
+                # block (alongside the gateway units), so we don't print here.
+                restarted.append(svc_name)
+            else:
+                _scope_flag = "--user " if scope == "user" else ""
+                print(
+                    f"  ⚠ Failed to restart {svc_name}: "
+                    f"{restart.stderr.strip()}\n"
+                    f"    Recover manually: "
+                    f"systemctl {_scope_flag}restart {svc_name}"
+                )
+
+    return restarted
+
+
+# ---------------------------------------------------------------------------
+# DB schema migration on update
+# ---------------------------------------------------------------------------
+#
+# ``hermes update`` never ran ``alembic upgrade head``, so schema migrations
+# only landed during ``install.sh``.  A user who pulled new agent code that
+# expected a new table would hit runtime errors until they manually migrated.
+#
+# Before upgrading we run a strictly READ-ONLY consistency check: if
+# ``alembic_version`` records a revision whose migration is supposed to have
+# created a table, but that table is absent, the DB is in a drifted state
+# (the exact llm-rig failure: version ``20260528_0022`` recorded but table
+# ``substrate_skill_proposals`` missing).  Blindly running ``upgrade head``
+# against drift crashes mid-ALTER, so we detect it and print the exact
+# recovery command instead of attempting the upgrade.
+
+# Map of alembic revisions to a table their migration is expected to have
+# created/populated.  Used by the read-only drift check.  Only revisions
+# whose absence-of-table is a meaningful drift signal need listing; the
+# check verifies the *recorded* head against this map.
+_ALEMBIC_REV_REQUIRED_TABLE = {
+    "20260528_0023": "substrate_skill_proposals",
+    "20260528_0022": "substrate_skill_proposals",
+}
+
+
+def _check_alembic_consistency(dsn: str) -> dict:
+    """Read-only schema-drift check before ``alembic upgrade head``.
+
+    Returns a dict::
+
+        {
+          "status": "ok" | "drift" | "fresh" | "unknown",
+          "recorded": <recorded version_num or None>,
+          "missing_table": <table name or None>,
+        }
+
+    * ``ok``      — recorded version's expected table is present (or the
+                    recorded version is not in our map → nothing to assert).
+    * ``drift``   — recorded version implies a table that is absent.
+    * ``fresh``   — no ``alembic_version`` table / no row yet (clean install
+                    or pre-alembic DB); a normal upgrade is safe.
+    * ``unknown`` — the check itself could not run (driver/connection error);
+                    callers should proceed with the upgrade but surface the
+                    note (the upgrade has its own error handling).
+
+    Never mutates the database — issues only SELECT / ``to_regclass`` queries.
+    """
+    result = {
+        "status": "unknown",
+        "recorded": None,
+        "missing_table": None,
+    }
+    try:
+        import asyncio
+        import asyncpg
+    except Exception as e:  # pragma: no cover - asyncpg is a hard dep
+        logger.debug("Consistency check: asyncpg unavailable: %s", e)
+        return result
+
+    async def _probe() -> dict:
+        conn = await asyncpg.connect(dsn=dsn, timeout=10)
+        try:
+            # Is alembic even initialised on this DB?
+            has_version_tbl = await conn.fetchval(
+                "SELECT to_regclass('public.alembic_version')"
+            )
+            if not has_version_tbl:
+                return {"status": "fresh", "recorded": None, "missing_table": None}
+
+            recorded = await conn.fetchval(
+                "SELECT version_num FROM alembic_version LIMIT 1"
+            )
+            if not recorded:
+                return {"status": "fresh", "recorded": None, "missing_table": None}
+
+            required_table = _ALEMBIC_REV_REQUIRED_TABLE.get(recorded)
+            if not required_table:
+                # We don't assert anything about this revision — treat as ok.
+                return {"status": "ok", "recorded": recorded, "missing_table": None}
+
+            tbl = await conn.fetchval(
+                "SELECT to_regclass($1)", f"public.{required_table}"
+            )
+            if tbl:
+                return {"status": "ok", "recorded": recorded, "missing_table": None}
+            return {
+                "status": "drift",
+                "recorded": recorded,
+                "missing_table": required_table,
+            }
+        finally:
+            await conn.close()
+
+    try:
+        return asyncio.run(_probe())
+    except Exception as e:
+        logger.debug("Consistency check probe failed: %s", e)
+        return result
+
+
+def _run_db_migration_on_update() -> None:
+    """Run ``alembic upgrade head`` during ``hermes update``.
+
+    No-op unless ``HERMES_PG_DSN`` is configured.  Performs a read-only
+    drift check first (:func:`_check_alembic_consistency`); on detected
+    drift it prints the exact recovery command and does NOT attempt the
+    upgrade (which would crash mid-ALTER).  On upgrade failure it prints a
+    clear, actionable error but does not hard-crash the rest of the update.
+    """
+    dsn = os.environ.get("HERMES_PG_DSN")
+    if not dsn:
+        return  # SQLite / no-Postgres install — nothing to migrate.
+
+    print()
+    print("→ Checking database schema migrations...")
+
+    py = _venv_python()
+    alembic_cmd = [
+        py,
+        "-m",
+        "alembic",
+        "-c",
+        "migrations/alembic.ini",
+        "upgrade",
+        "head",
+    ]
+
+    # --- Read-only drift check ------------------------------------------
+    check = _check_alembic_consistency(dsn)
+    if check["status"] == "drift":
+        recorded = check["recorded"]
+        missing = check["missing_table"]
+        downgrade_cmd = (
+            f"{py} -m alembic -c migrations/alembic.ini downgrade -1"
+        )
+        upgrade_cmd = (
+            f"{py} -m alembic -c migrations/alembic.ini upgrade head"
+        )
+        print()
+        print(
+            f"  ✗ Database schema drift detected — refusing to auto-migrate."
+        )
+        print(
+            f"    alembic_version records '{recorded}', but the table "
+            f"'{missing}' that revision should have created is missing."
+        )
+        print(
+            "    Running 'upgrade head' now would crash mid-migration. "
+            "Recover with ONE of:"
+        )
+        print()
+        print("    1) Re-apply the recorded revision cleanly, then upgrade:")
+        print(f"         {downgrade_cmd} \\")
+        print(f"           && {upgrade_cmd}")
+        print()
+        print(
+            "    2) If this DB is disposable (dev / throwaway), recreate it:"
+        )
+        print("         docker compose down -v && <reinstall>")
+        print()
+        return
+
+    if check["status"] == "unknown":
+        print(
+            "  ℹ Could not verify schema consistency (read-only check "
+            "unavailable); attempting upgrade anyway."
+        )
+
+    # --- alembic upgrade head -------------------------------------------
+    try:
+        proc = subprocess.run(
+            alembic_cmd,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        print(
+            f"  ✗ Could not run alembic — interpreter not found: {py}\n"
+            f"    Run manually: {' '.join(alembic_cmd)}"
+        )
+        return
+    except subprocess.TimeoutExpired:
+        print(
+            "  ✗ Database migration timed out after 300s.\n"
+            f"    Run manually and watch for blocking locks: {' '.join(alembic_cmd)}"
+        )
+        return
+
+    if proc.returncode == 0:
+        out = (proc.stdout or "").strip()
+        if "Running upgrade" in out:
+            print("  ✓ Database schema migrated")
+        else:
+            print("  ✓ Database schema is up to date")
+    else:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        snippet = "\n".join(f"      {ln}" for ln in tail[-8:])
+        print(
+            "  ✗ Database migration failed (the rest of the update "
+            "completed).\n"
+            f"    Re-run manually after resolving the error:\n"
+            f"      {' '.join(alembic_cmd)}"
+        )
+        if snippet:
+            print("    alembic output:")
+            print(snippet)
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -9080,6 +9427,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print("  ✓ Configuration is up to date")
 
+        # Auto-run DB schema migrations (alembic upgrade head). No-op unless
+        # HERMES_PG_DSN is set. Best-effort: a migration failure prints an
+        # actionable error but does not abort the rest of the update.
+        try:
+            _run_db_migration_on_update()
+        except Exception as e:
+            logger.debug("DB migration during update failed: %s", e)
+            print(
+                "  ⚠ Database migration step errored unexpectedly "
+                f"(continuing): {e}"
+            )
+
         print()
         print("✓ Update complete!")
 
@@ -9522,6 +9881,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                 )
                     except (FileNotFoundError, subprocess.TimeoutExpired):
                         pass
+
+                # --- Substrate worker (Linux) ---
+                # Restart hermes-substrate* units so substrate sub-agents
+                # (Sentinel / Curator / embedding) pick up the new code too.
+                # The worker drains gracefully on SIGTERM, so a plain restart
+                # is correct — no SIGUSR1 handoff dance needed. Best-effort.
+                try:
+                    restarted_services.extend(_restart_substrate_workers())
+                except Exception as e:
+                    logger.debug("Substrate worker restart failed: %s", e)
 
             # --- Launchd services (macOS) ---
             if is_macos():
