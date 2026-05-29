@@ -1993,10 +1993,11 @@ class GatewayRunner:
         if session_db is None:
             return False
         try:
-            raw = session_db.is_telegram_topic_mode_enabled(
+            import hermes_db as _hermes_db
+            raw = _hermes_db.run_sync(session_db.is_telegram_topic_mode_enabled(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
-            )
+            ))
         except Exception:
             logger.debug("Failed to read Telegram topic mode state", exc_info=True)
             return False
@@ -2089,13 +2090,14 @@ class GatewayRunner:
         session_db = getattr(self, "_session_db", None)
         if session_db is None or not source.chat_id or not source.thread_id:
             return
-        session_db.bind_telegram_topic(
+        import hermes_db as _hermes_db
+        _hermes_db.run_sync(session_db.bind_telegram_topic(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
             user_id=str(source.user_id or ""),
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
-        )
+        ))
 
     def _recover_telegram_topic_thread_id(
         self,
@@ -2123,9 +2125,10 @@ class GatewayRunner:
         if session_db is None:
             return None
         try:
-            bindings = session_db.list_telegram_topic_bindings_for_chat(
+            import hermes_db as _hermes_db
+            bindings = _hermes_db.run_sync(session_db.list_telegram_topic_bindings_for_chat(
                 chat_id=str(source.chat_id),
-            )
+            ))
         except Exception:
             logger.debug("topic-recover: read failed", exc_info=True)
             return None
@@ -12186,7 +12189,7 @@ class GatewayRunner:
         session_db = getattr(self, "_session_db", None)
         if session_db is not None:
             try:
-                binding = session_db.get_telegram_topic_binding(
+                binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                 )
