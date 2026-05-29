@@ -448,6 +448,69 @@ def run_sync(coro: Awaitable[T]) -> T:
     return future.result()
 
 
+# Dedicated executor for routing cross-loop DB coroutines onto the pool's
+# loop (see ``run_on_pool_loop``). Kept separate from the gateway's agent-turn
+# executor so a long-running agent turn can't starve a quick handoff poll.
+_route_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_route_executor_lock = threading.Lock()
+
+
+def _get_route_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _route_executor
+    with _route_executor_lock:
+        if _route_executor is None:
+            _route_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="hermes-db-route"
+            )
+        return _route_executor
+
+
+async def run_on_pool_loop(coro: Awaitable[T]) -> T:
+    """Await a DB coroutine on the asyncpg pool's event loop.
+
+    asyncpg connections are loop-bound: a coroutine that does
+    ``async with hermes_db.connection() as conn: await conn.fetch(...)``
+    can only run on the loop the pool was created on. A process that hosts
+    DB access from TWO loops — e.g. the gateway runs its main loop
+    ``L_gw`` via ``asyncio.run(start_gateway())`` but the pool is bound to
+    ``_sync_loop`` (created by ``main()``'s ``ensure_pool_sync()`` before
+    ``L_gw`` exists) — would otherwise hit
+    ``ConnectionDoesNotExistError`` / ``cannot perform operation: another
+    operation is in progress`` whenever an async-native caller (the handoff
+    watcher, ``/title`` / ``/resume`` / ``/branch`` handlers, telegram-topic
+    ops) awaits the pool from the wrong loop.
+
+    This helper sends such a coroutine to the pool's loop:
+
+    * Already on the pool's loop (the common ``run_sync`` hot path, or a
+      single-loop process like the substrate worker): await it directly —
+      no thread hop, no overhead.
+    * On a different loop than the pool: drive it on the pool's loop via the
+      ``run_sync`` bridge, executed in a dedicated worker thread so the
+      caller's loop is never blocked.
+
+    Only the ``_sync_loop``-bound-pool topology can be driven on demand
+    (``run_sync`` runs ``_sync_loop`` via ``run_until_complete``); if the
+    pool is bound to some other, non-running loop we cannot safely route, so
+    we raise rather than silently issue a cross-loop operation.
+    """
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    pool_loop = getattr(_pool, "_loop", None)
+    if running is None or pool_loop is None or running is pool_loop:
+        return await coro
+    if pool_loop is not _get_sync_loop():
+        raise RuntimeError(
+            "run_on_pool_loop: the asyncpg pool is bound to a loop that is "
+            "neither the current running loop nor the sync-bridge loop; "
+            "cannot route the coroutine safely. This indicates a pool "
+            "created on an unexpected loop."
+        )
+    return await running.run_in_executor(_get_route_executor(), run_sync, coro)
+
+
 def ensure_pool_sync() -> bool:
     """Initialise the pool from ``HERMES_PG_DSN`` if it hasn't been already.
 

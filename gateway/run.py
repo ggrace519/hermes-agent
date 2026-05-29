@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -131,6 +132,51 @@ _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}\b"),
     re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]{20,}\b"),
 )
+
+
+class _PoolLoopRoutedSessionDB:
+    """Routes a SessionDB's async methods onto the asyncpg pool's loop.
+
+    The gateway runs its main asyncio loop (``L_gw``) via
+    ``asyncio.run(start_gateway())``, but the shared asyncpg pool is bound
+    to ``hermes_db._sync_loop`` (created by ``main()``'s
+    ``ensure_pool_sync()`` before ``L_gw`` exists; the gateway's later
+    ``await hermes_db.init()`` is an idempotent no-op). asyncpg connections
+    are loop-bound, so async-native callers on ``L_gw`` — the handoff
+    watcher and the ``/title`` / ``/resume`` / ``/branch`` + telegram-topic
+    handlers, which ``await self._session_db.X()`` — would acquire from the
+    ``_sync_loop`` pool on the wrong loop and raise
+    ``ConnectionDoesNotExistError`` / ``cannot perform operation: another
+    operation is in progress`` (the orphaned-future spam every ~2s).
+
+    Wrapping the SessionDB at the single assignment point fixes every
+    call site at once: each async method's coroutine is sent through
+    :func:`hermes_db.run_on_pool_loop`, which awaits it directly when the
+    caller is already on the pool's loop (the ``run_sync`` hot path — zero
+    overhead) and otherwise drives it on the pool's loop via the
+    ``run_sync`` bridge in a worker thread (never blocking ``L_gw``).
+    Sync attributes/methods (``close``, static helpers) pass through.
+    """
+
+    __slots__ = ("_real",)
+
+    def __init__(self, real: Any) -> None:
+        object.__setattr__(self, "_real", real)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._real, name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = attr(*args, **kwargs)
+            if asyncio.iscoroutine(result):
+                import hermes_db
+                return hermes_db.run_on_pool_loop(result)
+            return result
+
+        return _wrapped
 
 
 def _gateway_platform_value(platform: Any) -> str:
@@ -1549,7 +1595,17 @@ class GatewayRunner:
         self._session_db = None
         try:
             from hermes_state import SessionDB
-            self._session_db = SessionDB()
+            # Wrap in a pool-loop router. The shared asyncpg pool is bound to
+            # hermes_db._sync_loop (created by main()'s ensure_pool_sync before
+            # this gateway's asyncio.run loop existed). The hot path reaches it
+            # correctly via hermes_db.run_sync, but async-native callers on the
+            # gateway's own loop — the handoff watcher and /title /resume
+            # /branch + telegram-topic handlers — would `await self._session_db.X()`
+            # cross-loop and hit ConnectionDoesNotExistError / "another operation
+            # is in progress". The proxy routes every coroutine onto the pool's
+            # loop; calls already on that loop (run_sync callers) are awaited
+            # directly with no overhead. See hermes_db.run_on_pool_loop.
+            self._session_db = _PoolLoopRoutedSessionDB(SessionDB())
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
