@@ -40,6 +40,10 @@ def _row(r) -> SkillProposal:
         created_at=r["created_at"],
         decided_at=r["decided_at"],
         decided_by=r["decided_by"],
+        eval_verdict=r["eval_verdict"],
+        eval_reasons=[str(x) for x in (r["eval_reasons"] or [])],
+        eval_model=r["eval_model"],
+        evaluated_at=r["evaluated_at"],
     )
 
 
@@ -52,18 +56,27 @@ async def insert_proposal(
     source_l3_ids: Optional[list[str]] = None,
     source_l4_ids: Optional[list[str]] = None,
     salience: float = 0.0,
+    eval_verdict: Optional[str] = None,
+    eval_reasons: Optional[list[str]] = None,
+    eval_model: Optional[str] = None,
     conn=None,
 ) -> Optional[UUID]:
     """Stage a new pending proposal. ``slug`` is unique — if one already exists
     (pending or decided) this is a no-op returning ``None``, so the SkillScout
-    never re-proposes a need it already raised. Returns the new id on insert."""
+    never re-proposes a need it already raised. Returns the new id on insert.
+
+    The Phase-2 evaluator runs before insert, so its verdict is written at
+    creation time; ``evaluated_at`` is stamped when a verdict is supplied."""
     async with _acquire(conn) as c:
         row = await c.fetchrow(
             """
             INSERT INTO substrate_skill_proposals
                 (slug, title, draft_content, rationale,
-                 source_l3_ids, source_l4_ids, salience)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 source_l3_ids, source_l4_ids, salience,
+                 eval_verdict, eval_reasons, eval_model,
+                 evaluated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    CASE WHEN $8::text IS NULL THEN NULL ELSE now() END)
             ON CONFLICT (slug) DO NOTHING
             RETURNING id
             """,
@@ -74,6 +87,9 @@ async def insert_proposal(
             [str(x) for x in (source_l3_ids or [])],
             [str(x) for x in (source_l4_ids or [])],
             float(salience),
+            eval_verdict,
+            [str(x) for x in (eval_reasons or [])],
+            eval_model,
         )
     return row["id"] if row else None
 

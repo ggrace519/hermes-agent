@@ -31,6 +31,12 @@ class SkillProposal:
     created_at: datetime
     decided_at: Optional[datetime]
     decided_by: Optional[str]
+    # Phase 2 — frontier-model evaluator verdict (advisory by default; None when
+    # unevaluated). See substrate.skill_proposals.evaluator.
+    eval_verdict: Optional[str] = None        # pass | flag | reject | None
+    eval_reasons: Optional[list[str]] = None  # short justifications from the judge
+    eval_model: Optional[str] = None          # which model produced the verdict
+    evaluated_at: Optional[datetime] = None
 
 
 __all__ = ["PROPOSAL_STATUSES", "SkillProposal"]

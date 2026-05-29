@@ -209,6 +209,10 @@ _EXPECTED_REVISIONS = frozenset(
         #   the SkillScout drafts skills from L3/L4 needs; drafts stage here as
         #   pending proposals until the user approves them in chat).
         "20260528_0022",
+        # - ``20260528_0023`` — skill-proposal evaluator verdict (Phase 2: a
+        #   frontier model judges each draft against a guardrail/design/intent
+        #   rubric; verdict stored for review + gate-mode auto-reject).
+        "20260528_0023",
     }
 )
 
