@@ -785,18 +785,30 @@ class _CodexCompletionsAdapter:
                 pass
 
         try:
-            # Collect output items and text deltas during streaming —
-            # the Codex backend can return empty response.output from
-            # get_final_response() even when items were streamed.
+            # Collect output items, text deltas, and usage during streaming.
+            #
+            # We iterate the low-level ``responses.create(stream=True)`` event
+            # stream rather than the high-level ``responses.stream()`` helper.
+            # The ChatGPT-account Codex backend (e.g. gpt-5.5) returns
+            # ``output=None`` on the *final* response object, which makes the
+            # helper's internal ``parse_response()`` accumulator raise
+            # ``TypeError: 'NoneType' object is not iterable`` mid-stream —
+            # before we can read the text it already streamed (and
+            # ``get_final_response()`` / ``response.output_text`` hit the same
+            # ``output=None``). Raw event iteration never touches that
+            # accumulator, so we reconstruct the result from the streamed
+            # ``output_text.delta`` / ``output_item.done`` events and read usage
+            # off the ``response.completed`` event without ever touching
+            # ``.output``.
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
-            has_function_calls = False
+            completed_usage = None
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
+            with self._client.responses.create(stream=True, **resp_kwargs) as stream:
                 for _event in stream:
                     _check_cancelled()
                     _etype = getattr(_event, "type", "")
@@ -808,35 +820,13 @@ class _CodexCompletionsAdapter:
                         _delta = getattr(_event, "delta", "")
                         if _delta:
                             collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
+                    elif _etype == "response.completed":
+                        _resp = getattr(_event, "response", None)
+                        if _resp is not None:
+                            completed_usage = getattr(_resp, "usage", None)
+            _check_cancelled()
 
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
-                if collected_output_items:
-                    final.output = list(collected_output_items)
-                    logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
-                    )
-                elif collected_text_deltas and not has_function_calls:
-                    # Only synthesize text when no tool calls were streamed —
-                    # a function_call response with incidental text should not
-                    # be collapsed into a plain-text message.
-                    assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
-                    logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
-                    )
-
-            # Extract text and tool calls from the Responses output.
+            # Extract text and tool calls from the streamed output items.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),
             # so use a helper that handles both shapes.
             def _item_get(obj: Any, key: str, default: Any = None) -> Any:
@@ -845,7 +835,8 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            has_function_calls = False
+            for item in collected_output_items:
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
@@ -853,6 +844,7 @@ class _CodexCompletionsAdapter:
                         if ptype in {"output_text", "text"}:
                             text_parts.append(_item_get(part, "text", ""))
                 elif item_type == "function_call":
+                    has_function_calls = True
                     tool_calls_raw.append(SimpleNamespace(
                         id=_item_get(item, "call_id", ""),
                         type="function",
@@ -862,12 +854,17 @@ class _CodexCompletionsAdapter:
                         ),
                     ))
 
-            resp_usage = getattr(final, "usage", None)
-            if resp_usage:
+            # Fallback: if the items carried no text but text was streamed as
+            # deltas (and it wasn't a tool-call response), use the deltas.
+            # This covers the gpt-5.5 case where the final output is None.
+            if not "".join(text_parts).strip() and collected_text_deltas and not has_function_calls:
+                text_parts = ["".join(collected_text_deltas)]
+
+            if completed_usage:
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0),
+                    prompt_tokens=getattr(completed_usage, "input_tokens", 0),
+                    completion_tokens=getattr(completed_usage, "output_tokens", 0),
+                    total_tokens=getattr(completed_usage, "total_tokens", 0),
                 )
         except Exception as exc:
             if timed_out.is_set():
