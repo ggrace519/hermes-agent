@@ -2140,9 +2140,70 @@ def delegate_task(
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
+        # Single task -- still run inside a worker thread (not directly on the
+        # caller's thread).  Running _run_single_child here means its SYNC
+        # substrate facades (on_subagent_spawn / on_subagent_return ->
+        # hermes_db.run_sync) execute on a thread that has NO live asyncio
+        # loop, so run_sync takes its pure-sync Case 1 path.  Calling directly
+        # on an async caller (e.g. the pytest-asyncio loop thread driving
+        # acp_agent.prompt) drives run_sync onto the shared _sync_loop, which
+        # collides with substrate sub-agent tasks ticking on that same loop and
+        # raises "run_sync called from inside its own sync loop" (issue #92).
+        # The batch path below already gets this isolation for free via its
+        # ThreadPoolExecutor; here we mirror it with a single worker and the
+        # same interrupt-aware future polling so single-task interrupt
+        # responsiveness is at least as good as the previous direct call.
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        # Managed manually (no `with`) so an interrupt can abandon a wedged
+        # worker via shutdown(wait=False) without __exit__ re-joining it.
+        _single_executor = ThreadPoolExecutor(max_workers=1)
+        _single_future = _single_executor.submit(
+            _run_single_child,
+            task_index=0,
+            goal=_t["goal"],
+            child=child,
+            parent_agent=parent_agent,
+        )
+
+        from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
+
+        while not _single_future.done():
+            if getattr(parent_agent, "_interrupt_requested", False) is True:
+                # Parent interrupted.  The child has already received the
+                # interrupt signal via _active_children propagation; we just
+                # can't block the parent forever waiting on it.
+                break
+            _cf_wait({_single_future}, timeout=0.5, return_when=FIRST_COMPLETED)
+
+        if _single_future.done():
+            try:
+                result = _single_future.result()
+            except Exception as exc:
+                result = {
+                    "task_index": 0,
+                    "status": "error",
+                    "summary": None,
+                    "error": str(exc),
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                    "_child_role": getattr(child, "_delegate_role", None),
+                }
+            # Worker finished — let its thread retire without blocking.
+            _single_executor.shutdown(wait=False)
+        else:
+            # Interrupted while still running: abandon the (possibly wedged)
+            # worker rather than join it.  Mirrors the batch path, which
+            # fabricates an interrupted entry for unfinished futures.
+            result = {
+                "task_index": 0,
+                "status": "interrupted",
+                "summary": None,
+                "error": "Parent agent interrupted — child did not finish in time",
+                "api_calls": 0,
+                "duration_seconds": 0,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
+            _single_executor.shutdown(wait=False)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
