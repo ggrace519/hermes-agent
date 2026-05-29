@@ -188,11 +188,27 @@ async def init(
             return
         ms = min_size if min_size is not None else int(os.environ.get("HERMES_PG_POOL_MIN", "4"))
         Ms = max_size if max_size is not None else int(os.environ.get("HERMES_PG_POOL_MAX", "64"))
+    # Recycle connections that have sat idle in the pool longer than this.
+    # asyncpg's default is 300s, which is why a connection severed *while
+    # idle* — laptop suspend/resume, a NAT/conntrack idle-kill, or a brief
+    # DB/network blip — can linger up to ~5 min: TCP gives no FIN, so asyncpg
+    # only learns the socket is dead when a query fails mid-operation, and a
+    # poller (e.g. the gateway's 2s handoff watcher) re-grabs the same dead
+    # connection on every tick, raising ``ConnectionDoesNotExistError:
+    # connection was closed in the middle of operation`` and leaving a
+    # dangling "Future exception was never retrieved" until the 300s recycle.
+    # A shorter default drops stale idle connections within ~2 min and the
+    # pool refills with live ones. Env-tunable; 0 disables (asyncpg semantics).
+    try:
+        max_inactive = float(os.environ.get("HERMES_PG_POOL_MAX_INACTIVE_S", "120"))
+    except ValueError:
+        max_inactive = 120.0
     pool = await asyncpg.create_pool(
         dsn,
         min_size=ms,
         max_size=Ms,
         command_timeout=command_timeout,
+        max_inactive_connection_lifetime=max_inactive,
         init=_setup_jsonb_codec,
         **_ssl_kwarg_for_dsn(dsn),
     )
