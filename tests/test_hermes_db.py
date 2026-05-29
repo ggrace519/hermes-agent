@@ -189,6 +189,32 @@ async def test_jsonb_codec_returns_python_objects(initialized_db):
     assert result == payload
 
 
+@pytest.mark.asyncio
+async def test_pool_connections_have_tcp_keepalives_enabled(initialized_db):
+    """Every pool connection must have SO_KEEPALIVE=1 so the OS can detect
+    dead connections (server-initiated FIN buffered but unread) and evict
+    them before any caller acquires a broken socket.
+
+    Regression test for the bug where a docker-network event closed postgres
+    connections server-side; the gateway pool handed them out and got
+    ``ConnectionDoesNotExistError: connection was closed in the middle of
+    operation`` with an orphaned "Future exception was never retrieved" every
+    ~5 seconds.
+    """
+    import socket as _socket
+
+    async with hermes_db.connection() as conn:
+        raw = conn._transport.get_extra_info("socket")
+        assert raw is not None, "no raw socket on transport"
+        assert raw.getsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE) == 1
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            assert raw.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE) == 10
+        if hasattr(_socket, "TCP_KEEPINTVL"):
+            assert raw.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL) == 5
+        if hasattr(_socket, "TCP_KEEPCNT"):
+            assert raw.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT) == 3
+
+
 class TestPoolMaxInactiveLifetime:
     """The pool recycles idle connections via ``max_inactive_connection_lifetime``
     (env-tunable ``HERMES_PG_POOL_MAX_INACTIVE_S``) so connections severed while
