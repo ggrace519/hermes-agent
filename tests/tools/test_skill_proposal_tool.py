@@ -18,7 +18,8 @@ from substrate.skill_proposals import store
 from tools import skill_proposal_tool as tool
 
 
-def _seed(slug, *, content=None, salience=0.8, l3_ids=None):
+def _seed(slug, *, content=None, salience=0.8, l3_ids=None,
+          eval_verdict=None, eval_reasons=None, eval_model=None):
     content = content or (
         f"---\nname: {slug}\ndescription: A test skill for {slug}\n---\n"
         f"# {slug}\n\n1. Do the thing.\n"
@@ -31,6 +32,9 @@ def _seed(slug, *, content=None, salience=0.8, l3_ids=None):
             rationale="recurring need",
             source_l3_ids=l3_ids or ["11111111-1111-1111-1111-111111111111"],
             salience=salience,
+            eval_verdict=eval_verdict,
+            eval_reasons=eval_reasons,
+            eval_model=eval_model,
         )
     )
 
@@ -113,3 +117,37 @@ def test_reject_flips_and_blocks_reproposal(hermes_db_initialized_sync, _skill_s
 def test_unknown_action_and_missing_slug(hermes_db_initialized_sync, _skill_sandbox):
     assert json.loads(tool.skill_proposal("frobnicate"))["success"] is False
     assert json.loads(tool.skill_proposal("approve"))["success"] is False
+
+
+# --- Phase 2: evaluator verdict surfacing ---------------------------------
+
+def test_show_and_list_render_verdict(hermes_db_initialized_sync, _skill_sandbox):
+    _seed("flagged-skill", eval_verdict="flag",
+          eval_reasons=["scope creep"], eval_model="judge-x")
+
+    shown = json.loads(tool.skill_proposal("show", "flagged-skill"))
+    assert shown["evaluation"]["verdict"] == "flag"
+    assert shown["evaluation"]["reasons"] == ["scope creep"]
+    assert shown["evaluation"]["model"] == "judge-x"
+
+    listed = json.loads(tool.skill_proposal("list"))
+    item = next(i for i in listed["proposals"] if i["slug"] == "flagged-skill")
+    assert item["eval_verdict"] == "flag"
+
+
+def test_approve_flagged_installs_but_warns(hermes_db_initialized_sync, _skill_sandbox):
+    """The evaluator is defense-in-depth, not a hard gate: a flagged proposal
+    still installs on human approval, but the result carries a warning."""
+    sandbox, _ = _skill_sandbox
+    _seed("flagged-but-ok", eval_verdict="flag", eval_reasons=["minor concern"])
+
+    res = json.loads(tool.skill_proposal("approve", "flagged-but-ok"))
+    assert res["success"] is True
+    assert (sandbox / "flagged-but-ok" / "SKILL.md").exists()
+    assert "warning" in res and "flag" in res["warning"]
+
+
+def test_show_without_verdict_omits_evaluation(hermes_db_initialized_sync, _skill_sandbox):
+    _seed("plain-skill")  # no verdict
+    shown = json.loads(tool.skill_proposal("show", "plain-skill"))
+    assert "evaluation" not in shown

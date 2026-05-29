@@ -85,3 +85,30 @@ async def test_set_status_and_listing(_db):
 @pytest.mark.asyncio
 async def test_set_status_unknown_slug_returns_false(_db):
     assert await store.set_status("ghost", "approved", by="x") is False
+
+
+@pytest.mark.asyncio
+async def test_eval_fields_round_trip(_db):
+    """Phase 2: an evaluator verdict supplied at insert time round-trips, and
+    evaluated_at is stamped only when a verdict is present."""
+    await store.insert_proposal(
+        slug="judged",
+        title="J",
+        draft_content="x",
+        salience=0.6,
+        eval_verdict="flag",
+        eval_reasons=["vague design", "scope creep"],
+        eval_model="judge-x",
+    )
+    p = await store.get_proposal("judged")
+    assert p.eval_verdict == "flag"
+    assert p.eval_reasons == ["vague design", "scope creep"]
+    assert p.eval_model == "judge-x"
+    assert p.evaluated_at is not None
+
+    # No verdict supplied → null verdict, no evaluated_at (Phase-1 / un-vetted path).
+    await store.insert_proposal(slug="unjudged", title="U", draft_content="x", salience=0.5)
+    u = await store.get_proposal("unjudged")
+    assert u.eval_verdict is None
+    assert u.eval_reasons == []
+    assert u.evaluated_at is None

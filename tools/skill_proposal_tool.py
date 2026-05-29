@@ -80,6 +80,7 @@ def _do_list() -> str:
             "status": p.status,
             "salience": round(p.salience, 2),
             "rationale": p.rationale,
+            "eval_verdict": p.eval_verdict,  # pass | flag | reject | null
         }
         for p in proposals
     ]
@@ -96,18 +97,24 @@ def _do_show(slug: str) -> str:
     p = _run(store.get_proposal(slug))
     if p is None:
         return json.dumps({"success": False, "error": f"No proposal '{slug}'."})
-    return json.dumps(
-        {
-            "success": True,
-            "slug": p.slug,
-            "title": p.title,
-            "rationale": p.rationale,
-            "provenance": _provenance_lines(p),
-            "status": p.status,
-            "skill_md": p.draft_content,
-        },
-        ensure_ascii=False,
-    )
+    out = {
+        "success": True,
+        "slug": p.slug,
+        "title": p.title,
+        "rationale": p.rationale,
+        "provenance": _provenance_lines(p),
+        "status": p.status,
+        "skill_md": p.draft_content,
+    }
+    if p.eval_verdict:
+        # The evaluator's second-opinion verdict (advisory). Surface it so the
+        # user can weigh it before approving — but it never blocks approval.
+        out["evaluation"] = {
+            "verdict": p.eval_verdict,           # pass | flag | reject
+            "reasons": p.eval_reasons or [],
+            "model": p.eval_model,
+        }
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _do_approve(slug: str) -> str:
@@ -160,14 +167,21 @@ def _do_approve(slug: str) -> str:
     except Exception:
         logger.debug("skill_proposal: telemetry failed", exc_info=True)
 
-    return json.dumps(
-        {
-            "success": True,
-            "message": f"Approved and installed skill '{p.slug}'. Use /{p.slug}.",
-            "path": result.get("path"),
-        },
-        ensure_ascii=False,
-    )
+    out = {
+        "success": True,
+        "message": f"Approved and installed skill '{p.slug}'. Use /{p.slug}.",
+        "path": result.get("path"),
+    }
+    # The evaluator is defense-in-depth, not a hard gate: a flagged/rejected
+    # verdict doesn't block a human-approved install, but we surface it so the
+    # agent can confirm the override was intentional.
+    if p.eval_verdict in {"flag", "reject"}:
+        why = f" ({'; '.join(p.eval_reasons)})" if p.eval_reasons else ""
+        out["warning"] = (
+            f"The evaluator returned '{p.eval_verdict}'{why}. Installed anyway "
+            f"per your approval — double-check this was intended."
+        )
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _do_reject(slug: str) -> str:

@@ -49,6 +49,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_choice(name: str, choices: tuple[str, ...], default: str) -> str:
+    raw = (os.environ.get(name) or "").strip().lower()
+    return raw if raw in choices else default
+
+
 class SkillScout(SubAgent):
     """L3 need → drafted skill proposal. Floor intensity LOW (deep-cycle work)."""
 
@@ -109,6 +114,23 @@ class SkillScout(SubAgent):
             self._declined.add(candidate["key"])
             return
 
+        # Phase 2 — frontier-model evaluator (advisory by default). Judge the
+        # draft before the user sees it; defense-in-depth, never auto-approves.
+        # `None` (no model configured / call failed) → un-vetted, Phase-1 path.
+        mode = _env_choice("SKILL_EVALUATOR_MODE", ("off", "advisory", "gate"), "advisory")
+        verdict = None
+        if mode != "off":
+            verdict = await self._evaluate(drafted, candidate["need_text"], timeout_s)
+
+        ev_kwargs = (
+            {} if verdict is None
+            else dict(
+                eval_verdict=verdict.verdict,
+                eval_reasons=verdict.reasons,
+                eval_model=verdict.model,
+            )
+        )
+
         # Slug already proposed/decided? insert is a no-op then (unique slug).
         proposal_id = await store.insert_proposal(
             slug=drafted.slug,
@@ -118,13 +140,36 @@ class SkillScout(SubAgent):
             source_l3_ids=candidate["l3_ids"],
             source_l4_ids=candidate["l4_ids"],
             salience=candidate["salience"],
+            **ev_kwargs,
         )
         if proposal_id is None:
             self._declined.add(candidate["key"])  # covered already; stop re-picking
             return
 
-        await self._emit_proposed(drafted, candidate, time.monotonic() - started)
-        await self._notify(drafted)
+        await self._emit_proposed(drafted, candidate, time.monotonic() - started, verdict)
+
+        # gate mode: a `reject` verdict auto-rejects the proposal and stays
+        # silent — the user only hears about pass/flag drafts. The row is kept
+        # (flipped to rejected) for audit + dedup.
+        if mode == "gate" and verdict is not None and verdict.verdict == "reject":
+            await store.set_status(drafted.slug, "rejected", by="evaluator")
+            await self._emit_eval_rejected(drafted, verdict)
+            self._declined.add(candidate["key"])
+            return
+
+        await self._notify(drafted, verdict)
+
+    async def _evaluate(self, drafted, need_text, timeout_s):
+        """Run the evaluator, timeout-guarded; ``None`` on any failure."""
+        from substrate.skill_proposals import evaluator
+
+        try:
+            return await asyncio.wait_for(
+                evaluator.evaluate_skill(drafted.skill_md, need_text), timeout=timeout_s
+            )
+        except (asyncio.TimeoutError, Exception):
+            self._log.debug("skill_scout.evaluate.degraded", exc_info=True)
+            return None
 
     async def _should_run(self) -> bool:
         """Interval throttle AND a check that L3 gained/updated patterns since
@@ -217,7 +262,7 @@ class SkillScout(SubAgent):
             self._log.debug("skill_scout.dedup.unavailable", exc_info=True)
             return False
 
-    async def _emit_proposed(self, drafted, candidate, elapsed_s) -> None:
+    async def _emit_proposed(self, drafted, candidate, elapsed_s, verdict=None) -> None:
         from substrate.telemetry import write as telemetry_write
 
         try:
@@ -231,18 +276,46 @@ class SkillScout(SubAgent):
                     "salience": candidate["salience"],
                     "source_l3_ids": candidate["l3_ids"],
                     "latency_ms": int(elapsed_s * 1000),
+                    "eval_verdict": verdict.verdict if verdict else None,
+                    "eval_model": verdict.model if verdict else None,
                 },
             )
         except Exception:
             self._log.debug("skill_scout.telemetry.emit_failed", exc_info=True)
 
-    async def _notify(self, drafted) -> None:
+    async def _emit_eval_rejected(self, drafted, verdict) -> None:
+        """Telemetry-only audit trail for a gate-mode auto-reject (no user notify)."""
+        from substrate.telemetry import write as telemetry_write
+
+        try:
+            await telemetry_write(
+                self._substrate,
+                agent="skill-scout",
+                event="skill_scout.eval_rejected",
+                payload={
+                    "slug": drafted.slug,
+                    "reasons": verdict.reasons,
+                    "model": verdict.model,
+                },
+            )
+        except Exception:
+            self._log.debug("skill_scout.telemetry.emit_failed", exc_info=True)
+
+    async def _notify(self, drafted, verdict=None) -> None:
         from substrate.notify import notify_user
+
+        verdict_line = ""
+        if verdict is not None:
+            if verdict.verdict == "pass":
+                verdict_line = "\n✓ evaluator: pass"
+            else:  # flag (reject in advisory mode still surfaces for your call)
+                why = f" — {verdict.reasons[0]}" if verdict.reasons else ""
+                verdict_line = f"\n⚠️ evaluator: {verdict.verdict}{why}"
 
         msg = (
             f"💡 I drafted a skill from a recurring need in my memory: "
             f"*{drafted.title}* (`{drafted.slug}`).\n\n"
-            f"Why: {drafted.rationale}\n\n"
+            f"Why: {drafted.rationale}{verdict_line}\n\n"
             f"Review it with `skill_proposal show {drafted.slug}`, then "
             f"`approve {drafted.slug}` to install or `reject {drafted.slug}` to discard."
         )

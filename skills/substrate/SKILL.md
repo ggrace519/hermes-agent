@@ -476,8 +476,22 @@ Curator (`agent/curator.py`) maintains it. See
 | `SKILL_SCOUT_SALIENCE_FLOOR` | `0.7` | Min L3 salience for a candidate need |
 | `SKILL_SCOUT_MAX_PENDING` | `3` | Cap on open proposals (don't flood the user) |
 | `SKILL_SCOUT_DEDUP_MIN_OVERLAP` | `3` | Keyword overlap that counts as "already covered by a skill" |
-| `SKILL_SCOUT_TIMEOUT_S` | `40` | Drafting LLM call timeout |
+| `SKILL_SCOUT_TIMEOUT_S` | `40` | Drafting (and evaluator) LLM call timeout |
 | `auxiliary.skill_author.{provider,model}` | auto | Drafting model (config; falls back to the auto provider chain) |
+
+**Phase 2 — the evaluator (defense-in-depth):** when the scout drafts a skill, a
+*frontier-model evaluator* (`substrate/skill_proposals/evaluator.py`) judges it
+against a guardrail + design + intent rubric before you see it, attaching a
+`pass`/`flag`/`reject` verdict to the proposal (shown in `skill_proposal show`).
+It complements — never replaces — the deterministic install-time scan
+(`tools/skills_guard.py`) and your approval: it can flag or auto-reject, but never
+auto-installs. Treats the draft as untrusted input (injection-resistant).
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `SKILL_EVALUATOR_MODE` | `advisory` | `off` (skip) / `advisory` (verdict attached + shown, never blocks) / `gate` (a `reject` verdict silently auto-rejects the draft + logs telemetry; `pass`/`flag` still notify you) |
+| `auxiliary.skill_evaluator.{provider,model}` | auto | Evaluator model — point at a **different/stronger** model than `skill_author` (uncorrelated failure modes) |
+| `SKILL_EVALUATOR_TEMPERATURE` | `0.0` | Judge temperature (deterministic by default) |
 
 **Refinements still deferred (flagged in the phase PRs):** the L2-grounding
 coherence signal (needs L1/L2 decay), per-stream-family Sentinel trust +
