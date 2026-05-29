@@ -205,6 +205,10 @@ _EXPECTED_REVISIONS = frozenset(
         #   (fixes the 1536-vs-768 mismatch when HERMES_EMBEDDING_DIM was unset
         #   at 0020 apply time, which stalled the upper-layer embed backfill).
         "20260527_0021",
+        # - ``20260528_0022`` — substrate_skill_proposals (self-improvement Tier 1:
+        #   the SkillScout drafts skills from L3/L4 needs; drafts stage here as
+        #   pending proposals until the user approves them in chat).
+        "20260528_0022",
     }
 )
 
@@ -583,6 +587,7 @@ class Substrate:
         )
         from substrate.agents.reflector import Reflector
         from substrate.agents.sentinel import StubSentinel
+        from substrate.agents.skill_scout import SkillScout
         from substrate.agents.summarizer import Summarizer
 
         self._conductor = StubConductor(self)
@@ -597,6 +602,7 @@ class Substrate:
         reflector = Reflector(self)      # Phase F  — gated HERMES_SUBSTRATE_REFLECTOR
         dreamer = Dreamer(self)          # Phase F  — gated HERMES_SUBSTRATE_DREAMER
         summarizer = Summarizer(self)    # gated HERMES_SUBSTRATE_SUMMARIZER
+        skill_scout = SkillScout(self)   # self-improvement Tier 1 — gated HERMES_SUBSTRATE_SKILL_SCOUT
         # Adaptive Conductor policy loop (Phase F). Drives the StubConductor
         # (self._conductor) when HERMES_SUBSTRATE_CONDUCTOR=1; no-op otherwise.
         conductor_policy = AdaptiveConductor(self)
@@ -604,7 +610,7 @@ class Substrate:
         for agent in (
             partition, force_reject, curator, parser, associator,
             pattern_finder, critic, reflector, dreamer, summarizer,
-            conductor_policy, sentinel,
+            skill_scout, conductor_policy, sentinel,
         ):
             agent.start()
             self._subagents[agent.name] = agent

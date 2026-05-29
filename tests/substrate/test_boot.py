@@ -133,6 +133,7 @@ async def test_subagents_running(booted_with_subagents):
         "reflector",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_REFLECTOR=1)
         "dreamer",  # Phase F (tick no-ops unless HERMES_SUBSTRATE_DREAMER=1)
         "summarizer",  # polish (retrospective summarization)
+        "skill-scout",  # self-improvement Tier 1 (tick no-ops unless HERMES_SUBSTRATE_SKILL_SCOUT=1)
     }
     for name, agent in agents.items():
         task = agent.task
