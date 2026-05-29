@@ -195,6 +195,34 @@ class _PgRow:
         return self._d.get(key, default)
 
 
+def _connection_lost_errors() -> tuple[type[BaseException], ...]:
+    """Exception types that mean the underlying asyncpg connection is dead.
+
+    A half-open-severed TCP connection (no FIN observed; asyncpg's
+    ``is_closed()`` still returns ``False``) gets handed back out by the
+    pool and the next query raises one of these. When that happens the
+    connection must NOT be returned to the pool — it must be ``terminate``d
+    so the pool drops and replaces it.
+
+    Defined lazily so the module can import in SQLite mode without asyncpg
+    installed. ``ConnectionResetError`` is a builtin and always included.
+    """
+    errs: list[type[BaseException]] = [ConnectionResetError]
+    try:
+        import asyncpg
+
+        errs.append(asyncpg.exceptions.ConnectionDoesNotExistError)
+        errs.append(asyncpg.exceptions.InterfaceError)
+    except Exception:  # pragma: no cover - asyncpg always present in PG mode
+        pass
+    return tuple(errs)
+
+
+def _is_connection_lost(exc: BaseException) -> bool:
+    """True if ``exc`` indicates the asyncpg connection was severed."""
+    return isinstance(exc, _connection_lost_errors())
+
+
 def _wrap_rows(rows) -> list[_PgRow]:
     if rows is None:
         return []
@@ -226,6 +254,13 @@ class _PgConnection:
         self._txn = None           # asyncpg Transaction object when active
         self.row_factory = None    # compat; ignored
         self._last_lastrowid: Optional[int] = None  # sqlite last_insert_rowid() compat
+        # Set True when an operation hit a connection-lost error and the raw
+        # connection was terminated. Signals _PgConnectionHandle.close() to
+        # NOT release the original (dead) connection back into the pool.
+        self._conn_lost = False
+        # When recovery rebinds to a fresh connection, this holds that fresh
+        # asyncpg.Connection so the handle can release the LIVE one on close.
+        self._fresh_after_loss = None
 
     # ------------------------------------------------------------------ #
     # Sync execution bridge                                                #
@@ -235,6 +270,37 @@ class _PgConnection:
         """Run a coroutine on the pool's event loop synchronously."""
         import hermes_db
         return hermes_db.run_sync(coro)
+
+    def _terminate_and_reacquire(self) -> None:
+        """Evict the dead raw connection and rebind a fresh one.
+
+        Called when an operation raised a connection-lost error. The dead
+        connection is ``terminate``d (forcing the pool to drop and replace
+        it rather than recycling the broken socket) and a brand-new
+        connection is acquired from the pool. The fresh connection is bound
+        to ``self._conn`` so the failed operation can be retried.
+
+        All pool/connection work runs through ``hermes_db.run_sync`` so it
+        executes on the pool's owning loop (asyncpg connections must only be
+        used from the loop that created them).
+        """
+        import hermes_db
+
+        dead = self._conn
+        # terminate() is synchronous and idempotent-ish; guard so a second
+        # failure here can't mask the original error.
+        try:
+            dead.terminate()
+        except Exception:  # pragma: no cover - terminate rarely raises
+            _log.debug("kanban_db: terminate() on dead PG conn raised", exc_info=True)
+        # Acquire a fresh connection on the pool's owning loop.
+        fresh = hermes_db.run_sync(hermes_db.pool().acquire())
+        self._conn = fresh
+        # The handle still holds the OLD raw conn in _raw_conn; mark it dead
+        # so close() terminates (never releases) the original, and rebind the
+        # handle's raw ref to the fresh conn so close() releases the live one.
+        self._conn_lost = True
+        self._fresh_after_loss = fresh
 
     # ------------------------------------------------------------------ #
     # Core execute interface                                               #
@@ -249,7 +315,28 @@ class _PgConnection:
         if re.match(r"(?i)^SELECT\s+last_insert_rowid\s*\(\s*\)\s*$", sql_stripped):
             rid = self._last_lastrowid
             return _PgCursor([_PgRow({"last_insert_rowid": rid})], 1)
-        cursor = self._run(self._async_execute(sql, params))
+        try:
+            cursor = self._run(self._async_execute(sql, params))
+        except BaseException as exc:
+            if not _is_connection_lost(exc):
+                raise
+            # A pooled connection that was half-open-severed got handed back
+            # out; the query failed. Never let this dead connection return to
+            # the pool (that's the recycle-forever bug). Terminate it.
+            if self._in_txn:
+                # A half-open connection mid-transaction cannot be safely
+                # replayed (partial writes, lost BEGIN). Evict + surface the
+                # error so the caller's transaction aborts.
+                self._terminate_and_reacquire()
+                raise
+            # Plain statement (the kanban notifier hot-poll path): evict the
+            # dead connection, rebind a fresh one, and retry exactly ONCE.
+            _log.warning(
+                "kanban_db: PG connection lost (%s); terminating dead conn and "
+                "retrying on a fresh one", type(exc).__name__,
+            )
+            self._terminate_and_reacquire()
+            cursor = self._run(self._async_execute(sql, params))
         if cursor.lastrowid is not None:
             self._last_lastrowid = cursor.lastrowid
         return cursor
@@ -543,12 +630,39 @@ class _PgConnectionHandle:
         return False
 
     def close(self) -> None:
-        """Release the underlying asyncpg connection back to the pool.
-        Idempotent — safe to call from both the ``__exit__`` path and
-        from explicit pre-Phase-0 ``conn.close()`` test code."""
+        """Return the underlying asyncpg connection to the pool.
+
+        Healthy connections are ``release``d back to the pool (unchanged
+        behaviour). If the connection hit a connection-lost error during its
+        lifetime, the ORIGINAL raw connection is dead — it was already
+        ``terminate``d during recovery, so it must never be released back into
+        the pool (releasing a dead socket is the recycle-forever bug). In that
+        case we release the FRESH replacement connection the recovery path
+        acquired (and defensively terminate the original).
+
+        Idempotent — safe to call from both the ``__exit__`` path and from
+        explicit pre-Phase-0 ``conn.close()`` test code."""
         if self._closed:
             return
         self._closed = True
+
+        if getattr(self._inner, "_conn_lost", False):
+            # Original connection is dead. Ensure it's terminated (never
+            # released) and release the live replacement instead.
+            try:
+                self._raw_conn.terminate()
+            except Exception:
+                pass
+            fresh = getattr(self._inner, "_fresh_after_loss", None)
+            if fresh is not None and fresh is not self._raw_conn:
+                try:
+                    self._hermes_db.run_sync(
+                        self._hermes_db.pool().release(fresh)
+                    )
+                except Exception:
+                    pass
+            return
+
         try:
             self._hermes_db.run_sync(
                 self._hermes_db.pool().release(self._raw_conn)
