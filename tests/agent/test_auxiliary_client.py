@@ -2090,17 +2090,28 @@ class TestCodexAdapterReasoningTranslation:
         class _FakeStream:
             def __enter__(self): return self
             def __exit__(self, *a): return False
-            def __iter__(self): return iter([])
-            def get_final_response(self): return fake_final
+            def __iter__(self):
+                # One message item + a completed event whose final output is
+                # None (the gpt-5.x Codex shape the adapter must tolerate).
+                return iter([
+                    SimpleNamespace(
+                        type="response.output_item.done",
+                        item=fake_final.output[0],
+                    ),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(output=None, usage=fake_final.usage),
+                    ),
+                ])
 
         captured_kwargs = {}
 
-        def _stream(**kwargs):
+        def _create(**kwargs):
             captured_kwargs.update(kwargs)
             return _FakeStream()
 
         real_client = MagicMock()
-        real_client.responses.stream = _stream
+        real_client.responses.create = _create
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
         return adapter, captured_kwargs
 
@@ -2327,7 +2338,7 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
-    def test_forwards_timeout_to_responses_stream(self):
+    def test_forwards_timeout_to_responses_create(self):
         class FakeStream:
             def __enter__(self):
                 return self
@@ -2336,22 +2347,26 @@ class TestCodexAuxiliaryAdapterTimeout:
                 return False
 
             def __iter__(self):
-                return iter(())
-
-            def get_final_response(self):
-                return SimpleNamespace(
-                    output=[SimpleNamespace(
-                        type="message",
-                        content=[SimpleNamespace(type="output_text", text="summary")],
-                    )],
-                    usage=None,
-                )
+                # Text via a streamed message item; final response output=None.
+                return iter([
+                    SimpleNamespace(
+                        type="response.output_item.done",
+                        item=SimpleNamespace(
+                            type="message",
+                            content=[SimpleNamespace(type="output_text", text="summary")],
+                        ),
+                    ),
+                    SimpleNamespace(
+                        type="response.completed",
+                        response=SimpleNamespace(output=None, usage=None),
+                    ),
+                ])
 
         class FakeResponses:
             def __init__(self):
                 self.kwargs = None
 
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
                 self.kwargs = kwargs
                 return FakeStream()
 
@@ -2364,6 +2379,7 @@ class TestCodexAuxiliaryAdapterTimeout:
         )
 
         assert fake_client.responses.kwargs["timeout"] == 12.5
+        assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
@@ -2379,17 +2395,8 @@ class TestCodexAuxiliaryAdapterTimeout:
                     time.sleep(0.03)
                     yield SimpleNamespace(type="response.in_progress")
 
-            def get_final_response(self):
-                return SimpleNamespace(
-                    output=[SimpleNamespace(
-                        type="message",
-                        content=[SimpleNamespace(type="output_text", text="late")],
-                    )],
-                    usage=None,
-                )
-
         class FakeResponses:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
                 return SlowAliveStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
@@ -2520,14 +2527,11 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                     time.sleep(0.01)
                     yield SimpleNamespace(type="response.in_progress")
 
-            def get_final_response(self):  # pragma: no cover — timeout fires first
-                return SimpleNamespace(output=[], usage=None)
-
         closed = {"flag": False}
 
         class FakeClient:
             def __init__(self):
-                self.responses = SimpleNamespace(stream=lambda **k: SlowAliveStream())
+                self.responses = SimpleNamespace(create=lambda **k: SlowAliveStream())
                 self.api_key = "k"
                 self.base_url = "https://chatgpt.com/backend-api/codex"
 
@@ -3026,3 +3030,105 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+
+class TestCodexAdapterNoneFinalOutput:
+    """Regression: the ChatGPT-account Codex backend (e.g. gpt-5.5) returns
+    ``output=None`` on the final streamed response. The adapter must read the
+    text/tool-calls from the streamed events and never touch ``.output`` (the
+    old ``responses.stream()`` helper crashed with
+    ``TypeError: 'NoneType' object is not iterable`` mid-stream)."""
+
+    @staticmethod
+    def _ev(type_, **kw):
+        return SimpleNamespace(type=type_, **kw)
+
+    class _FakeStream:
+        def __init__(self, events):
+            self._events = events
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return iter(self._events)
+
+    class _FakeResponses:
+        def __init__(self, events):
+            self._events = events
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return TestCodexAdapterNoneFinalOutput._FakeStream(self._events)
+
+    class _FakeClient:
+        def __init__(self, events):
+            self.responses = TestCodexAdapterNoneFinalOutput._FakeResponses(events)
+            self.api_key = "sk-test"
+            self.base_url = "https://chatgpt.com/backend-api/codex/"
+
+        def close(self):
+            pass
+
+    def _adapter(self, events):
+        client = self._FakeClient(events)
+        return _CodexCompletionsAdapter(client, "gpt-5.5"), client
+
+    def test_text_via_deltas_with_none_final_output(self):
+        events = [
+            self._ev("response.created"),
+            self._ev("response.output_text.delta", delta="o"),
+            self._ev("response.output_text.delta", delta="k"),
+            self._ev("response.completed", response=SimpleNamespace(
+                output=None,
+                usage=SimpleNamespace(input_tokens=5, output_tokens=1, total_tokens=6),
+            )),
+        ]
+        adapter, client = self._adapter(events)
+        resp = adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.choices[0].message.content == "ok"
+        assert resp.choices[0].message.tool_calls is None
+        assert resp.choices[0].finish_reason == "stop"
+        assert resp.usage.total_tokens == 6
+        # The Codex endpoint requires streaming.
+        assert client.responses.calls[0]["stream"] is True
+
+    def test_text_via_message_item_with_none_final_output(self):
+        msg_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="hello world")],
+        )
+        events = [
+            self._ev("response.output_item.done", item=msg_item),
+            self._ev("response.completed", response=SimpleNamespace(output=None, usage=None)),
+        ]
+        adapter, _ = self._adapter(events)
+        resp = adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.choices[0].message.content == "hello world"
+
+    def test_tool_call_item_with_none_final_output(self):
+        fn_item = SimpleNamespace(
+            type="function_call", call_id="c1", name="do_thing", arguments='{"x": 1}',
+        )
+        events = [
+            self._ev("response.output_item.done", item=fn_item),
+            self._ev("response.completed", response=SimpleNamespace(output=None, usage=None)),
+        ]
+        adapter, _ = self._adapter(events)
+        resp = adapter.create(messages=[{"role": "user", "content": "hi"}])
+        tcs = resp.choices[0].message.tool_calls
+        assert tcs and tcs[0].function.name == "do_thing"
+        assert tcs[0].function.arguments == '{"x": 1}'
+        assert resp.choices[0].finish_reason == "tool_calls"
+
+    def test_does_not_raise_on_none_output_and_no_events(self):
+        # Pathological: only a completed event with output=None, nothing streamed.
+        events = [self._ev("response.completed", response=SimpleNamespace(output=None, usage=None))]
+        adapter, _ = self._adapter(events)
+        resp = adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.choices[0].message.content is None
+        assert resp.choices[0].message.tool_calls is None
