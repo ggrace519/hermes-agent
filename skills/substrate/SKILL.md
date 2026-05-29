@@ -456,6 +456,29 @@ of suspected prompt-injection) is the one feature still **default OFF**: a
 false-positive silently drops a slice from recall, so enable + tune it
 against your own traffic during local testing.
 
+### SkillScout — self-authored skills (Tier 1, default OFF)
+
+`HERMES_SUBSTRATE_SKILL_SCOUT` (default **OFF**) enables the SkillScout: it
+mines the upper layers for a recurring, high-salience need, asks the auxiliary
+model to draft a `SKILL.md` for it, stages it as a **pending proposal**
+(`substrate_skill_proposals`), and messages the user to review it in chat. It
+**never installs a skill** — approval via the `skill_proposal` tool
+(`list` / `show` / `approve` / `reject`) is the human gate; `approve` promotes
+the draft through the normal `skill_manage create` path (frontmatter validation
++ security scan + collision check) and marks it agent-created so the skills
+Curator (`agent/curator.py`) maintains it. See
+`docs/plans/2026-05-28-substrate-self-improvement-forge.md`.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `HERMES_SUBSTRATE_SKILL_SCOUT` | `0` | Master toggle (opt-in) |
+| `SKILL_SCOUT_INTERVAL_S` | `3600` | Min seconds between runs (also change-gated on L3) |
+| `SKILL_SCOUT_SALIENCE_FLOOR` | `0.7` | Min L3 salience for a candidate need |
+| `SKILL_SCOUT_MAX_PENDING` | `3` | Cap on open proposals (don't flood the user) |
+| `SKILL_SCOUT_DEDUP_MIN_OVERLAP` | `3` | Keyword overlap that counts as "already covered by a skill" |
+| `SKILL_SCOUT_TIMEOUT_S` | `40` | Drafting LLM call timeout |
+| `auxiliary.skill_author.{provider,model}` | auto | Drafting model (config; falls back to the auto provider chain) |
+
 **Refinements still deferred (flagged in the phase PRs):** the L2-grounding
 coherence signal (needs L1/L2 decay), per-stream-family Sentinel trust +
 embedding/LLM detection + re-Sentineling, multi-horizon Conductor
