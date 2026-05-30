@@ -40,10 +40,34 @@ def get_hermes_home_override() -> str | None:
     return str(override)
 
 
-def get_hermes_home() -> Path:
-    """Return the Hermes home directory (default: ~/.hermes).
+def _disk_default_home() -> Path:
+    """Default home from on-disk presence, with NO env input (rename Phase 3).
 
-    Reads HERMES_HOME env var, falls back to ~/.hermes.
+    Order: ``~/.thoth`` if it exists (real dir OR a symlink to ``~/.hermes``)
+    → ``~/.hermes`` if it exists → ``~/.thoth`` (the new-install canonical
+    name). Import-safe: only ``stat()``s, never mutates/creates anything (the
+    accessor is called at module scope in 30+ files). On Windows the home is
+    env-driven (the installer sets HERMES_HOME/THOTH_HOME), so the env branch
+    in the callers wins before this probe runs.
+    """
+    home = Path.home()
+    thoth = home / ".thoth"
+    if thoth.exists():
+        return thoth
+    hermes = home / ".hermes"
+    if hermes.exists():
+        return hermes
+    return thoth
+
+
+def get_hermes_home() -> Path:
+    """Return the Hermes/Thoth home directory.
+
+    Resolution (rename Phase 3): context override → ``THOTH_HOME`` env →
+    ``HERMES_HOME`` env → ``~/.thoth`` if present → ``~/.hermes`` if present →
+    ``~/.thoth`` (new-install default). ``THOTH_HOME`` is canonical; both env
+    spellings are kept in sync by ``hermes_env.normalize_thoth_home_env`` at
+    startup, so reading either here returns the same value.
     This is the single source of truth — all other copies should import this.
 
     When ``HERMES_HOME`` is unset but an ``active_profile`` file indicates
@@ -60,7 +84,11 @@ def get_hermes_home() -> Path:
     if override:
         return Path(override)
 
-    val = os.environ.get("HERMES_HOME", "").strip()
+    # THOTH_HOME is canonical; fall back to the legacy HERMES_HOME spelling.
+    val = (
+        os.environ.get("THOTH_HOME", "").strip()
+        or os.environ.get("HERMES_HOME", "").strip()
+    )
     if val:
         return Path(val)
 
@@ -72,7 +100,7 @@ def get_hermes_home() -> Path:
             # Inline the default-root resolution from get_default_hermes_root()
             # to stay import-safe (this function is called from module scope
             # in 30+ files; we cannot afford to trigger logging setup here).
-            active_path = (Path.home() / ".hermes" / "active_profile")
+            active_path = _disk_default_home() / "active_profile"
             active = active_path.read_text().strip() if active_path.exists() else ""
         except (UnicodeDecodeError, OSError):
             active = ""
@@ -98,7 +126,7 @@ def get_hermes_home() -> Path:
             except Exception:
                 pass
 
-    return Path.home() / ".hermes"
+    return _disk_default_home()
 
 
 def get_default_hermes_root() -> Path:
@@ -117,17 +145,22 @@ def get_default_hermes_root() -> Path:
 
     Import-safe — no dependencies beyond stdlib.
     """
-    native_home = Path.home() / ".hermes"
-    env_home = os.environ.get("HERMES_HOME", "")
+    native_home = _disk_default_home()
+    env_home = (
+        os.environ.get("THOTH_HOME", "") or os.environ.get("HERMES_HOME", "")
+    )
     if not env_home:
         return native_home
     env_path = Path(env_home)
-    try:
-        env_path.resolve().relative_to(native_home.resolve())
-        # HERMES_HOME is under ~/.hermes (normal or profile mode)
-        return native_home
-    except ValueError:
-        pass
+    # Recognize either native spelling — ~/.thoth may be a symlink to
+    # ~/.hermes, so both resolve to the same inode. Report the canonical
+    # disk-default name for stability across processes.
+    for native in (native_home, Path.home() / ".hermes", Path.home() / ".thoth"):
+        try:
+            env_path.resolve().relative_to(native.resolve())
+            return native_home
+        except (ValueError, OSError):
+            continue
 
     # Docker / custom deployment.
     # Check if this is a profile path: <root>/profiles/<name>
@@ -272,7 +305,11 @@ def get_subprocess_home() -> str | None:
     Activation is directory-based: if the ``home/`` subdirectory doesn't
     exist, returns ``None`` and behavior is unchanged.
     """
-    hermes_home = get_hermes_home_override() or os.getenv("HERMES_HOME")
+    hermes_home = (
+        get_hermes_home_override()
+        or os.getenv("THOTH_HOME")
+        or os.getenv("HERMES_HOME")
+    )
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")
