@@ -136,7 +136,12 @@ apply_windows_utf8_bootstrap()
 # after the .env is loaded; see hermes_cli/env_loader.py.)
 try:
     from hermes_env import normalize_thoth_env as _normalize_thoth_env
+    from hermes_env import normalize_thoth_home_env as _normalize_thoth_home_env
 
+    # Home keys first (rename Phase 3) so HERMES_HOME/THOTH_HOME agree before
+    # any home read; then the general env mirror (Phase 2). Both are pure env
+    # ops (no filesystem) — symlink/migration happens only in install/update.
+    _normalize_thoth_home_env()
     _normalize_thoth_env()
 except Exception:
     pass

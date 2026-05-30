@@ -15,7 +15,10 @@ from utils import atomic_replace
 # just-loaded value authoritative for the keys a source set (so a rotated
 # value on reload isn't reverted by a stale mirror); ``normalize_thoth_env``
 # mirrors everything else (shell-set vars).
-from hermes_env import normalize_thoth_env, sync_thoth_aliases
+from hermes_env import (
+    normalize_thoth_env,
+    sync_thoth_aliases,
+)
 
 
 def _dotenv_key_names(path) -> set:
@@ -243,7 +246,17 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
-    home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    # Resolve the home dir for the .env path. Phase 3: THOTH_HOME is canonical,
+    # HERMES_HOME is the legacy fallback. get_hermes_home() already checks
+    # THOTH_HOME → HERMES_HOME → disk default, so no explicit normalization call
+    # is needed here (and calling normalize_thoth_home_env() would write THOTH_HOME
+    # to os.environ as a side-effect that pollutes test env isolation).
+    if hermes_home is not None:
+        home_path = Path(hermes_home)
+    else:
+        from hermes_constants import get_hermes_home
+
+        home_path = get_hermes_home()
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
