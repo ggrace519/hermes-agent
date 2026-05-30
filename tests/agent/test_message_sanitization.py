@@ -51,10 +51,11 @@ class TestSanitizeStructureSurrogates:
         }
         found = _sanitize_structure_surrogates(payload)
         assert found is True
-        assert payload["a"] == "x�"
-        assert payload["nested"]["b"] == "y�"
-        assert payload["items"][0] == "z�"
-        assert payload["items"][1]["c"] == "clean"
+        assert payload == {
+            "a": "x�",
+            "nested": {"b": "y�"},
+            "items": ["z�", {"c": "clean"}],
+        }
 
     def test_returns_false_when_nothing_to_fix(self):
         payload = {"a": "clean", "items": ["also clean"]}
@@ -68,7 +69,7 @@ class TestSanitizeMessagesSurrogates:
         assert messages[0]["content"] == "hello�"
 
     def test_list_content_parts(self):
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "user",
                 "content": [{"type": "text", "text": f"part{LONE_SURROGATE}"}],
@@ -78,7 +79,7 @@ class TestSanitizeMessagesSurrogates:
         assert messages[0]["content"][0]["text"] == "part�"
 
     def test_tool_call_arguments_and_name(self):
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "assistant",
                 "content": None,
@@ -102,7 +103,7 @@ class TestSanitizeMessagesSurrogates:
     def test_extra_reasoning_field_is_walked(self):
         # Byte-level reasoning models stash surrogates in reasoning_content /
         # reasoning_details that the per-field checks above don't reach.
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "assistant",
                 "content": "ok",
@@ -189,7 +190,7 @@ class TestStripNonAscii:
         assert _sanitize_messages_non_ascii(messages) is False
 
     def test_sanitize_messages_non_ascii_covers_all_fields(self):
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "tool",
                 "content": [{"type": "text", "text": "rés"}],
@@ -208,7 +209,7 @@ class TestStripNonAscii:
         assert msg["tool_calls"][0]["function"]["arguments"] == '{"q":"nave"}'
 
     def test_sanitize_tools_non_ascii(self):
-        tools = [
+        tools: list[dict] = [
             {"function": {"name": "lookup", "description": "find a café nearby"}}
         ]
         assert _sanitize_tools_non_ascii(tools) is True
@@ -217,9 +218,7 @@ class TestStripNonAscii:
     def test_sanitize_structure_non_ascii_nested_list_and_dict(self):
         payload = {"a": ["nö", {"b": "yés"}], "c": "clean"}
         assert _sanitize_structure_non_ascii(payload) is True
-        assert payload["a"][0] == "n"
-        assert payload["a"][1]["b"] == "ys"
-        assert payload["c"] == "clean"
+        assert payload == {"a": ["n", {"b": "ys"}], "c": "clean"}
 
     def test_sanitize_structure_non_ascii_no_change(self):
         assert _sanitize_structure_non_ascii({"a": "clean", "b": ["also"]}) is False
@@ -227,7 +226,7 @@ class TestStripNonAscii:
 
 class TestStripImagesFromMessages:
     def test_image_part_removed_keeps_text(self):
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "user",
                 "content": [
@@ -241,7 +240,7 @@ class TestStripImagesFromMessages:
 
     def test_tool_message_of_only_images_gets_placeholder_not_deleted(self):
         # Deleting it would orphan the assistant tool_call_id -> HTTP 400.
-        messages = [
+        messages: list[dict] = [
             {
                 "role": "tool",
                 "tool_call_id": "abc",
@@ -255,7 +254,7 @@ class TestStripImagesFromMessages:
         assert messages[0]["tool_call_id"] == "abc"
 
     def test_image_only_user_message_is_dropped(self):
-        messages = [
+        messages: list[dict] = [
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]},
             {"role": "user", "content": "keep me"},
         ]
