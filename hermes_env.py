@@ -137,3 +137,53 @@ def sync_thoth_aliases(
             env[twin] = value
             changed += 1
     return changed
+
+
+# ── Home dir (rename Phase 3) ──────────────────────────────────────────────
+# normalize_thoth_env (above) DEFERS the home keys (_HOME_DEFERRED) because the
+# home dir has migration/subprocess hazards specific to Phase 3. Phase 3 owns
+# HERMES_HOME <-> THOTH_HOME here, with the same THOTH-wins + empty-guard rules.
+
+def normalize_thoth_home_env(env: Optional[MutableMapping[str, str]] = None) -> int:
+    """Mirror HERMES_HOME <-> THOTH_HOME (THOTH_HOME wins; empty never clobbers).
+
+    Pure env, idempotent, no filesystem I/O — safe to call at startup before any
+    home read. Returns the number of keys written. Symlink creation / data
+    migration is NOT done here (it belongs in explicit install/update paths).
+    """
+    if env is None:
+        env = os.environ
+    legacy = env.get("HERMES_HOME")
+    canon = env.get("THOTH_HOME")
+    if canon is not None and not (canon == "" and legacy not in (None, "")):
+        authoritative = canon
+    elif legacy is not None:
+        authoritative = legacy
+    else:
+        return 0
+    changed = 0
+    if env.get("HERMES_HOME") != authoritative:
+        env["HERMES_HOME"] = authoritative
+        changed += 1
+    if env.get("THOTH_HOME") != authoritative:
+        env["THOTH_HOME"] = authoritative
+        changed += 1
+    return changed
+
+
+def propagate_hermes_home_into(env: MutableMapping[str, str], value: str) -> None:
+    """Set BOTH HERMES_HOME and THOTH_HOME in *env* to *value*.
+
+    MANDATORY at every subprocess-spawn site that overrides the child's home:
+    setting only one spelling lets a stale inherited twin (e.g. systemd's
+    THOTH_HOME=/old) win under normalize and clobber the intended home.
+    """
+    env["HERMES_HOME"] = value
+    env["THOTH_HOME"] = value
+
+
+def propagate_hermes_home(base, value: str) -> dict:
+    """Return a copy of *base* with both home spellings set to *value*."""
+    env = dict(base)
+    propagate_hermes_home_into(env, value)
+    return env

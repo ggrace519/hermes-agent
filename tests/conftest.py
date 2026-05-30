@@ -333,6 +333,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # 2b. Clear THOTH_* (rename Phase 3). get_hermes_home() reads THOTH_HOME
+    #     before HERMES_HOME, and normalize_thoth_home_env() can write THOTH_HOME
+    #     into the real os.environ during a test (monkeypatch won't revert it).
+    #     Clear (don't pin) so tests that set only HERMES_HOME aren't shadowed;
+    #     the per-test HERMES_HOME below is then authoritative.
+    for name in list(os.environ.keys()):
+        if name.startswith("THOTH_"):
+            monkeypatch.delenv(name, raising=False)
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
