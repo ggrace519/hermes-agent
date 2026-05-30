@@ -897,6 +897,16 @@ alongside the conversation loop. Phases A–C are shipped:
   per-worker DB names derived from `PYTEST_XDIST_WORKER`. Direct `pytest`
   invocations must set `PYTEST_XDIST_WORKER=run_<unique-id>` and point at
   the test container. See `tests/conftest.py:_TEST_PG_PORT`.
+- **The asyncpg pool lives on ONE event loop — never `await` it from another.**
+  `hermes_db` runs a single continuously-running "DB loop" on a daemon thread
+  and the pool is bound to it. Sync code bridges via `hermes_db.run_sync(coro)`;
+  async code on a *different* loop (the gateway's I/O loop) routes via `await
+  hermes_db.run_on_pool_loop(coro)`; the gateway's `self._session_db` is already
+  proxied to do this. Awaiting a pooled connection / a `SessionDB` async method
+  from the wrong loop is the cross-loop bug that produced the recurring
+  `ConnectionDoesNotExistError` (#117/#120/#123/#124/#126) — an error here is
+  real mis-wiring, never log noise. Rules + failure mode:
+  [`docs/architecture/database-event-loop.md`](docs/architecture/database-event-loop.md).
 
 CLI surface: `hermes substrate [streams | slices | pending |
 profiles | curator | recall]` (substitute the launcher name for a
