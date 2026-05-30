@@ -3234,7 +3234,9 @@ def _notification_poller_loop(
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown).
-    while not process_registry.completion_queue.empty():
+    # Skip if the session was finalized (closed by user) — a finalized
+    # session should not consume queue events meant for other sessions.
+    while not process_registry.completion_queue.empty() and not session.get("_finalized"):
         try:
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
