@@ -52,11 +52,17 @@ def _disk_default_home() -> Path:
     """
     home = Path.home()
     thoth = home / ".thoth"
-    if thoth.exists():
-        return thoth
+    try:
+        if thoth.exists():
+            return thoth
+    except OSError:
+        pass
     hermes = home / ".hermes"
-    if hermes.exists():
-        return hermes
+    try:
+        if hermes.exists():
+            return hermes
+    except OSError:
+        pass
     return thoth
 
 
