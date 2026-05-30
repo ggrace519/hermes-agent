@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 from utils import atomic_replace
 
 # hermes→thoth env bridge (rename Phase 2). After a .env load / secret-source
@@ -17,9 +17,44 @@ from utils import atomic_replace
 # mirrors everything else (shell-set vars).
 from hermes_env import (
     normalize_thoth_env,
-    normalize_thoth_home_env,
     sync_thoth_aliases,
 )
+
+
+def _dotenv_key_names(path) -> set:
+    """Return the variable NAMES defined in a .env file.
+
+    We only need key names (to make a just-loaded source authoritative over a
+    stale mirrored twin); values are already in os.environ via load_dotenv.
+    Avoids importing ``dotenv.dotenv_values`` because in some installs
+    ``dotenv`` resolves as a namespace package without that symbol
+    (ImportError: cannot import name 'dotenv_values' ... unknown location).
+    Best-effort parse of ``KEY=...`` / ``export KEY=...`` lines.
+    """
+    keys: set = set()
+    try:
+        for enc in ("utf-8", "latin-1"):
+            try:
+                text = open(path, "r", encoding=enc).read()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return keys
+    except OSError:
+        return keys
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        name = line.split("=", 1)[0].strip()
+        if name and name.replace("_", "").isalnum() and not name[0].isdigit():
+            keys.add(name)
+    return keys
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -134,10 +169,10 @@ def _sanitize_loaded_credentials() -> None:
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-        file_keys = set(dotenv_values(dotenv_path=path, encoding="utf-8"))
+        file_keys = _dotenv_key_names(path)
     except UnicodeDecodeError:
         load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
-        file_keys = set(dotenv_values(dotenv_path=path, encoding="latin-1"))
+        file_keys = _dotenv_key_names(path)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
@@ -212,13 +247,13 @@ def load_hermes_dotenv(
     loaded: list[Path] = []
 
     # Resolve the home dir for the .env path. Phase 3: THOTH_HOME is canonical,
-    # HERMES_HOME is the legacy fallback. normalize_thoth_home_env() (run at
-    # bootstrap) keeps them in sync, but resolve defensively here too so a
-    # THOTH_HOME-only shell finds the right .env even without the bootstrap hook.
+    # HERMES_HOME is the legacy fallback. get_hermes_home() already checks
+    # THOTH_HOME → HERMES_HOME → disk default, so no explicit normalization call
+    # is needed here (and calling normalize_thoth_home_env() would write THOTH_HOME
+    # to os.environ as a side-effect that pollutes test env isolation).
     if hermes_home is not None:
         home_path = Path(hermes_home)
     else:
-        normalize_thoth_home_env()
         from hermes_constants import get_hermes_home
 
         home_path = get_hermes_home()

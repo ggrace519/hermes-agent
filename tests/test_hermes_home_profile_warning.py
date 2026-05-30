@@ -26,6 +26,7 @@ def fresh_constants(monkeypatch, tmp_path):
     importlib.reload(hermes_constants)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("THOTH_HOME", raising=False)
     return hermes_constants
 
 
@@ -33,9 +34,9 @@ class TestGetHermesHomeProfileWarning:
     def test_classic_mode_no_active_profile_no_warning(
         self, fresh_constants, tmp_path, capsys
     ):
-        """Classic mode: no active_profile file → silent, returns ~/.hermes."""
+        """Classic mode: no active_profile file → silent, returns ~/.thoth."""
         result = fresh_constants.get_hermes_home()
-        assert result == tmp_path / ".hermes"
+        assert result == tmp_path / ".thoth"
         assert "HERMES_HOME fallback" not in capsys.readouterr().err
 
     def test_default_active_profile_no_warning(

@@ -2085,25 +2085,39 @@ def _hermes_home_for_target_user(target_home_dir: str) -> str:
 
     When installing a system service via sudo, get_hermes_home() resolves to
     root's home.  This translates it to the target user's equivalent path:
+      /root/.thoth                     → /home/alice/.thoth
       /root/.hermes                    → /home/alice/.hermes
       /root/.hermes/profiles/coder     → /home/alice/.hermes/profiles/coder
       /opt/custom-hermes               → /opt/custom-hermes  (kept as-is)
+    Checks both .thoth (Phase-3 canonical) and .hermes (legacy) so that
+    explicit HERMES_HOME=/root/.hermes paths still remap correctly.
+    PermissionError from resolve() (e.g. /root unreachable) falls back to
+    the unresolved absolute path for comparison purposes.
     """
-    current_hermes = get_hermes_home().resolve()
-    current_default = (Path.home() / ".hermes").resolve()
-    target_default = Path(target_home_dir) / ".hermes"
-
-    # Default ~/.hermes → remap to target user's default
-    if current_hermes == current_default:
-        return str(target_default)
-
-    # Profile or subdir of ~/.hermes → preserve the relative structure
+    current_hermes_path = get_hermes_home()
     try:
-        relative = current_hermes.relative_to(current_default)
-        return str(target_default / relative)
-    except ValueError:
-        # Completely custom path (not under ~/.hermes) — keep as-is
-        return str(current_hermes)
+        current_hermes = current_hermes_path.resolve()
+    except OSError:
+        current_hermes = current_hermes_path.absolute()
+
+    caller_home = Path.home()
+    for dirname in (".thoth", ".hermes"):
+        candidate_raw = caller_home / dirname
+        try:
+            candidate = candidate_raw.resolve()
+        except OSError:
+            candidate = candidate_raw.absolute()
+
+        if current_hermes == candidate:
+            return str(Path(target_home_dir) / dirname)
+        try:
+            relative = current_hermes.relative_to(candidate)
+            return str(Path(target_home_dir) / dirname / relative)
+        except ValueError:
+            continue
+
+    # Completely custom path — keep as-is
+    return str(current_hermes)
 
 
 def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
