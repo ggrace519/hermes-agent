@@ -4677,6 +4677,12 @@ def _sanitize_env_lines(lines: list) -> list:
     # Build the known keys set lazily from OPTIONAL_ENV_VARS + extras.
     # Done inside the function so OPTIONAL_ENV_VARS is guaranteed to be defined.
     known_keys = set(OPTIONAL_ENV_VARS.keys()) | _EXTRA_ENV_KEYS
+    # hermes→thoth (rename Phase 2): recognize the THOTH_ alias of every known
+    # HERMES_ key so corrupted .env lines using the new spelling are repaired
+    # the same way as the legacy spelling.
+    known_keys |= {
+        "THOTH_" + k[len("HERMES_"):] for k in known_keys if k.startswith("HERMES_")
+    }
 
     sanitized: list[str] = []
     for line in lines:
