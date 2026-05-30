@@ -2263,6 +2263,18 @@ StandardError=journal
 WantedBy=default.target
 """
 
+def _systemd_unit_content(hermes_home: str) -> str:
+    """Return the system-scope unit snippet containing HERMES_HOME and THOTH_HOME."""
+    home = hermes_home or str(get_hermes_home())
+    return f'Environment="HERMES_HOME={home}"\nEnvironment="THOTH_HOME={home}"\n'
+
+
+def _user_systemd_unit_content(hermes_home: str) -> str:
+    """Return the user-scope unit snippet containing HERMES_HOME and THOTH_HOME."""
+    home = hermes_home or str(get_hermes_home())
+    return f'Environment="HERMES_HOME={home}"\nEnvironment="THOTH_HOME={home}"\n'
+
+
 def _normalize_service_definition(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.strip().splitlines())
 
@@ -2862,6 +2874,8 @@ def generate_launchd_plist() -> str:
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
+        <string>{hermes_home}</string>
+        <key>THOTH_HOME</key>
         <string>{hermes_home}</string>
     </dict>
     
