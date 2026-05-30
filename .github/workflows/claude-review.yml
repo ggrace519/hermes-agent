@@ -12,13 +12,13 @@ on:
     types: [labeled]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
   id-token: write
   # actions: read lets the action load its github_ci MCP server so reviews can
   # reference CI status. Was `write` previously — read is sufficient.
-  actions: read
+  actions: write
 
 concurrency:
   # One review per PR at a time. Re-labeling (or autolabel firing on a new
