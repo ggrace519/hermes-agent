@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 from utils import atomic_replace
 
 # hermes→thoth env bridge (rename Phase 2). After a .env load / secret-source
@@ -16,6 +16,42 @@ from utils import atomic_replace
 # value on reload isn't reverted by a stale mirror); ``normalize_thoth_env``
 # mirrors everything else (shell-set vars).
 from hermes_env import normalize_thoth_env, sync_thoth_aliases
+
+
+def _dotenv_key_names(path) -> set:
+    """Return the variable NAMES defined in a .env file.
+
+    We only need key names (to make a just-loaded source authoritative over a
+    stale mirrored twin); values are already in os.environ via load_dotenv.
+    Avoids importing ``dotenv.dotenv_values`` because in some installs
+    ``dotenv`` resolves as a namespace package without that symbol
+    (ImportError: cannot import name 'dotenv_values' ... unknown location).
+    Best-effort parse of ``KEY=...`` / ``export KEY=...`` lines.
+    """
+    keys: set = set()
+    try:
+        for enc in ("utf-8", "latin-1"):
+            try:
+                text = open(path, "r", encoding=enc).read()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return keys
+    except OSError:
+        return keys
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        name = line.split("=", 1)[0].strip()
+        if name and name.replace("_", "").isalnum() and not name[0].isdigit():
+            keys.add(name)
+    return keys
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -130,10 +166,10 @@ def _sanitize_loaded_credentials() -> None:
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-        file_keys = set(dotenv_values(dotenv_path=path, encoding="utf-8"))
+        file_keys = _dotenv_key_names(path)
     except UnicodeDecodeError:
         load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
-        file_keys = set(dotenv_values(dotenv_path=path, encoding="latin-1"))
+        file_keys = _dotenv_key_names(path)
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
