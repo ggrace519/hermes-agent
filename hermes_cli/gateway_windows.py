@@ -314,6 +314,7 @@ def _build_gateway_cmd_script(
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     lines.append(f'set "HERMES_HOME={hermes_home}"')
+    lines.append(f'set "THOTH_HOME={hermes_home}"')
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
     # VIRTUAL_ENV lets the gateway's own python detection find the venv
@@ -535,6 +536,7 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
 
     env_overlay = {
         "HERMES_HOME": hermes_home,
+        "THOTH_HOME": hermes_home,
         "PYTHONIOENCODING": "utf-8",
         "HERMES_GATEWAY_DETACHED": "1",
         "VIRTUAL_ENV": str(venv_dir),
