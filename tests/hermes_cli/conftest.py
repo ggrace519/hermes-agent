@@ -41,6 +41,11 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
         from hermes_cli import main as _cli_main
     except Exception:
         return
+    # hermes_bootstrap (imported via hermes_cli.main) calls normalize_thoth_home_env()
+    # at module-load time, which sets THOTH_HOME = HERMES_HOME. On the first import
+    # inside a test this runs AFTER the root conftest cleared THOTH_HOME, undoing the
+    # clear. Re-clear so tests that only patch HERMES_HOME are not shadowed by THOTH_HOME.
+    monkeypatch.delenv("THOTH_HOME", raising=False)
     monkeypatch.setattr(
         _cli_main, "_detect_concurrent_hermes_instances", lambda *_a, **_k: []
     )
