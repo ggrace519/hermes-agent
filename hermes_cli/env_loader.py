@@ -6,8 +6,16 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from utils import atomic_replace
+
+# hermes→thoth env bridge (rename Phase 2). After a .env load / secret-source
+# injection populates os.environ, mirror HERMES_* <-> THOTH_* so either
+# spelling resolves for every reader. ``sync_thoth_aliases`` makes the
+# just-loaded value authoritative for the keys a source set (so a rotated
+# value on reload isn't reverted by a stale mirror); ``normalize_thoth_env``
+# mirrors everything else (shell-set vars).
+from hermes_env import normalize_thoth_env, sync_thoth_aliases
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -122,14 +130,21 @@ def _sanitize_loaded_credentials() -> None:
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        file_keys = set(dotenv_values(dotenv_path=path, encoding="utf-8"))
     except UnicodeDecodeError:
         load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        file_keys = set(dotenv_values(dotenv_path=path, encoding="latin-1"))
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+    # Make THIS file's keys authoritative for their twins FIRST — a value just
+    # (re)loaded from .env wins over a stale mirrored alias (rotated key on a
+    # gateway hot-reload). Then mirror the remaining shell-only vars.
+    sync_thoth_aliases(file_keys)
+    normalize_thoth_env()
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -251,6 +266,9 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         # and might have the same copy-paste corruption as a manually
         # edited .env (see #6843).
         _sanitize_loaded_credentials()
+        # Bitwarden-injected secrets are authoritative for the names applied.
+        sync_thoth_aliases(result.applied)
+        normalize_thoth_env()
         # Remember where these came from so the setup / `hermes model`
         # flows can label detected credentials with "(from Bitwarden)" —
         # otherwise users see "credentials ✓" with no hint that the value

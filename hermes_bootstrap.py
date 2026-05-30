@@ -128,6 +128,19 @@ def apply_windows_utf8_bootstrap() -> bool:
 # import side effect does the right thing.
 apply_windows_utf8_bootstrap()
 
+# hermes→thoth env bridge (rename Phase 2): mirror HERMES_* <-> THOTH_* in
+# os.environ so either spelling works, BEFORE any HERMES_*/THOTH_* read. This
+# is the universal hook — every shipped entry point imports hermes_bootstrap
+# first (same invariant the Windows bootstrap relies on). Pure-stdlib + guarded
+# so a partial install can never brick startup. (load_hermes_dotenv re-runs it
+# after the .env is loaded; see hermes_cli/env_loader.py.)
+try:
+    from hermes_env import normalize_thoth_env as _normalize_thoth_env
+
+    _normalize_thoth_env()
+except Exception:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # PG pool bootstrap helper (Phase 0 Task 22)
