@@ -19,6 +19,7 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import contextlib
 import json
 import os
 import re
@@ -1468,3 +1469,24 @@ def resolve_profile_env(profile_name: str) -> str:
         )
 
     return str(profile_dir)
+
+
+@contextlib.contextmanager
+def profile_env_context(profile_dir):
+    """Context manager: set HERMES_HOME and THOTH_HOME to profile_dir, restore on exit."""
+    profile_str = str(profile_dir)
+    old_hermes = os.environ.get("HERMES_HOME")
+    old_thoth = os.environ.get("THOTH_HOME")
+    try:
+        os.environ["HERMES_HOME"] = profile_str
+        os.environ["THOTH_HOME"] = profile_str
+        yield
+    finally:
+        if old_hermes is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_hermes
+        if old_thoth is None:
+            os.environ.pop("THOTH_HOME", None)
+        else:
+            os.environ["THOTH_HOME"] = old_thoth
